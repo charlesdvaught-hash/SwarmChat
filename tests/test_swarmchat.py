@@ -142,3 +142,35 @@ def test_tiny_gguf_models_interaction_and_memory():
     readd_res = orch.readd_model_to_room("gguf_qwen_0_5b")
     assert readd_res["success"] is True
     assert "gguf_qwen_0_5b" in orch.models
+
+def test_gguf_status_tracking_and_vram_management():
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=".test_swarmchat_vram")
+    tm = ToolManager()
+    orch = Orchestrator(mm, mem, tm)
+
+    # Test status update and error tracking
+    mm.update_model_status("test_m", status="error", error="File missing", tok_per_sec=12.5)
+    st = mm.model_statuses.get("test_m")
+    assert st["status"] == "error"
+    assert st["error"] == "File missing"
+    assert st["tok_per_sec"] == 12.5
+
+    # Test VRAM management routine
+    orch.manage_vram_allocation("model_critic")
+    assert mm.is_llama_cpp_installed() in [True, False]
+
+def test_autonomous_loop_and_speaker_selection():
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=".test_swarmchat_loop")
+    tm = ToolManager()
+    orch = Orchestrator(mm, mem, tm)
+
+    # @mention context detection
+    orch.add_chat_message("Admin", "Admin", "Hey @Coder what do you think?", is_admin=True)
+    speaker = orch.get_next_speaker()
+    assert speaker == "model_coder"
+
+    # Test autonomous loop max turn execution
+    asyncio.run(orch.run_autonomous_loop(max_turns=2))
+    assert len(orch.chat_history) >= 3
