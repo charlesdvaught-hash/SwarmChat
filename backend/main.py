@@ -77,8 +77,14 @@ def get_dependencies():
     return {
         "ollama": model_mgr.check_ollama_status(),
         "ollama_models": model_mgr.list_ollama_models(),
+        "llama_cpp_installed": model_mgr.is_llama_cpp_installed(),
         "memory_status": "healthy"
     }
+
+@app.post("/api/engine/install")
+def install_engine():
+    res = model_mgr.install_llama_cpp()
+    return res
 
 @app.get("/api/state")
 def get_full_state():
@@ -88,6 +94,7 @@ def get_full_state():
         "moderator_model_id": orchestrator.moderator_model_id,
         "models": orchestrator.models,
         "known_models": orchestrator.known_models,
+        "model_statuses": model_mgr.model_statuses,
         "pending_votes": orchestrator.pending_tool_votes,
         "chat_history": orchestrator.chat_history,
         "shared_memory": memory_mgr.state.get("shared_entries", []),
@@ -143,6 +150,8 @@ async def send_chat_message(req: ChatMsgReq):
         content=req.content,
         is_admin=req.is_admin
     )
+    # Automatically launch conversation loop in background
+    asyncio.create_task(orchestrator.run_autonomous_loop(max_turns=5))
     return {"success": True, "message": msg}
 
 @app.post("/api/chat/step")
