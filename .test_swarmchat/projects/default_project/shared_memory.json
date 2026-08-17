@@ -1,7 +1,7 @@
 {
   "project_id": "default_project",
   "phase": "execution",
-  "phase_last_changed": 1786995622.9914875,
+  "phase_last_changed": 1786997323.5122387,
   "shared_entries": [
     {
       "id": "mem_1786995622988",
@@ -20,6 +20,24 @@
       "timestamp": 1786995622.9914927,
       "author": "System State Machine",
       "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1786997323509",
+      "timestamp": 1786997323.5099776,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1786997323511",
+      "timestamp": 1786997323.511837,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1786997323512",
+      "timestamp": 1786997323.5122435,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
     }
   ],
   "model_journals": {},
@@ -33,17 +51,25 @@
       "author": "model_coder",
       "action": "write",
       "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1786997323608",
+      "timestamp": 1786997323.6084058,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
     }
   ],
   "active_file_locks": {
     "test.txt": {
       "last_edited_by": "model_coder",
-      "last_edited_at": 1786995623.1024404,
+      "last_edited_at": 1786997323.60841,
       "status": "edited"
     }
   },
   "tokens_used": {
-    "model_architect": 7
+    "model_architect": 14
   },
   "session_id": "default_session"
 }
