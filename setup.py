@@ -12,32 +12,39 @@ def check_system_resources():
     available_gb = mem.available / (1024 ** 3)
     print(f"RAM Total: {total_gb:.2f} GB | Available: {available_gb:.2f} GB")
 
+    cuda_available = False
     vram_gb = 0
     if shutil.which("nvidia-smi"):
         try:
             res = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,nounits,noheader"],
+                ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,nounits,noheader"],
                 text=True
             )
-            total_v, free_v = res.strip().split("\n")[0].split(",")
-            vram_gb = float(free_v.strip()) / 1024.0
-            print(f"NVIDIA GPU Detected! Total VRAM: {float(total_v)/1024:.2f} GB | Free VRAM: {vram_gb:.2f} GB")
+            parts = res.strip().split("\n")[0].split(",")
+            gpu_name = parts[0].strip()
+            total_v, free_v = parts[1].strip(), parts[2].strip()
+            vram_gb = float(free_v) / 1024.0
+            cuda_available = True
+            print(f"⚡ NVIDIA GPU Detected: {gpu_name}")
+            print(f"   Total VRAM: {float(total_v)/1024:.2f} GB | Free VRAM: {vram_gb:.2f} GB")
         except Exception as e:
-            print(f"NVIDIA GPU check failed: {e}")
+            print(f"NVIDIA GPU check note: {e}")
     else:
-        print("No nvidia-smi detected. Running on CPU / integrated memory mode.")
+        print("No nvidia-smi detected. SwarmChat will run in pure CPU mode.")
 
     return {
         "ram_total_gb": total_gb,
         "ram_available_gb": available_gb,
-        "vram_free_gb": vram_gb
+        "vram_free_gb": vram_gb,
+        "cuda_available": cuda_available
     }
 
 def check_dependencies():
-    print("\n=== Checking System Dependencies ===")
+    print("\n=== Checking System Runtimes & GPU Accelerators ===")
     deps = {
         "python": sys.version.split()[0],
         "ollama": shutil.which("ollama") is not None,
+        "nvcc (CUDA Toolkit)": shutil.which("nvcc") is not None,
         "git": shutil.which("git") is not None,
         "node": shutil.which("node") is not None,
         "npm": shutil.which("npm") is not None
@@ -45,10 +52,17 @@ def check_dependencies():
 
     for dep, status in deps.items():
         if isinstance(status, bool):
-            symbol = "✓" if status else "✗ (Optional/Missing)"
+            symbol = "✓" if status else "✗ (Optional)"
             print(f"  [{symbol}] {dep}")
         else:
             print(f"  [✓] {dep}: {status}")
+
+    # Display GPU acceleration hint if CUDA is available
+    if deps.get("nvcc (CUDA Toolkit)") or shutil.which("nvidia-smi"):
+        print("\n💡 GPU Acceleration Hint:")
+        print("   If you want GGUF model acceleration via CUDA with llama-cpp-python, run:")
+        print("   CMAKE_ARGS='-DGGML_CUDA=on' pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir")
+        print("   Ollama automatically detects and utilizes CUDA/ROCm GPUs if available.")
 
     return deps
 
