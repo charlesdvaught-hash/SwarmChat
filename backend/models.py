@@ -274,7 +274,8 @@ class ModelManager:
         model_name = model_config.get("model_name", "llama3.2:1b")
         api_key = model_config.get("api_key", "")
 
-        full_messages = [{"role": "system", "content": system_prompt}] + messages
+        from backend.sanitizer import normalize_messages_for_gguf, sanitize_message_content
+        full_messages = normalize_messages_for_gguf(system_prompt, messages)
 
         if provider == "ollama":
             if not self.check_ollama_status():
@@ -291,17 +292,18 @@ class ModelManager:
                         }
                     )
                     if resp.status_code == 200:
-                        return resp.json()["message"]["content"]
+                        raw_res = resp.json()["message"]["content"]
+                        return sanitize_message_content(raw_res)
                     else:
                         return f"Ollama API Error ({resp.status_code}): {resp.text}"
             except Exception as e:
-                return f"[{model_config.get('name', 'Model')} ({model_name})]: Simulated response due to connection issue ({str(e)})."
+                return f"Simulated response due to connection issue ({str(e)})."
 
         elif provider in ["claude", "groq", "gemini"]:
             if not api_key:
-                return f"[{model_config.get('name', 'Model')} ({provider})]: API key missing. Please configure key in model settings."
+                return f"API key missing for provider {provider}. Please configure key in model settings."
             last_user_msg = messages[-1]["content"] if messages else ""
-            return f"[{model_config.get('name', 'Model')} via Cloud-{provider}]: Processed context for '{last_user_msg[:40]}...'."
+            return f"Processed context for '{last_user_msg[:40]}...' via Cloud-{provider}."
 
         elif provider == "gguf_local":
             import time
@@ -336,11 +338,11 @@ class ModelManager:
                     error=None,
                     tok_per_sec=tok_per_sec
                 )
-                return content
+                return sanitize_message_content(content)
             except Exception as e:
                 err_str = f"GGUF inference error: {str(e)}"
                 self.update_model_status(model_id, status="error", error=err_str)
-                return f"[{model_config.get('name', 'Model')} GGUF Error]: {err_str}"
+                return f"GGUF Error: {err_str}"
 
         else:
-            return f"[{model_config.get('name', 'Model')}]: Prepared perspective based on shared context."
+            return "Prepared perspective based on shared context."

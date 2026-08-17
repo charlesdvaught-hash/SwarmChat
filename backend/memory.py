@@ -4,13 +4,17 @@ import time
 from typing import Dict, Any, List, Optional
 
 class MemoryManager:
-    def __init__(self, storage_dir: str = ".swarmchat"):
-        self.storage_dir = storage_dir
-        os.makedirs(self.storage_dir, exist_ok=True)
-        self.json_path = os.path.join(self.storage_dir, "shared_memory.json")
-        self.md_path = os.path.join(self.storage_dir, "shared_memory.md")
+    def __init__(self, storage_dir: str = ".swarmchat", project_id: str = "default_project"):
+        self.base_storage_dir = storage_dir
+        self.project_id = project_id
+        self.project_dir = os.path.join(self.base_storage_dir, "projects", self.project_id)
+        os.makedirs(self.project_dir, exist_ok=True)
+
+        self.json_path = os.path.join(self.project_dir, "shared_memory.json")
+        self.md_path = os.path.join(self.project_dir, "shared_memory.md")
 
         self.state: Dict[str, Any] = {
+            "project_id": self.project_id,
             "phase": "discussion",
             "phase_last_changed": time.time(),
             "shared_entries": [],
@@ -23,6 +27,19 @@ class MemoryManager:
             "session_id": "default_session"
         }
         self.load_memory()
+
+    def get_project_id(self) -> str:
+        return self.project_id
+
+    def set_project_id(self, project_id: str):
+        if project_id and project_id != self.project_id:
+            self.save_memory()
+            self.project_id = project_id
+            self.project_dir = os.path.join(self.base_storage_dir, "projects", self.project_id)
+            os.makedirs(self.project_dir, exist_ok=True)
+            self.json_path = os.path.join(self.project_dir, "shared_memory.json")
+            self.md_path = os.path.join(self.project_dir, "shared_memory.md")
+            self.load_memory()
 
     def load_memory(self):
         if os.path.exists(self.json_path):
@@ -44,7 +61,7 @@ class MemoryManager:
     def _render_markdown_archive(self):
         try:
             lines = [
-                "# 🧠 SwarmChat Continuous Shared Memory Archive",
+                f"# 🧠 SwarmChat Continuous Shared Memory Archive — Project: `{self.project_id}`",
                 f"**Session ID:** `{self.state.get('session_id', 'default_session')}`",
                 f"**Current Phase:** `{self.state.get('phase', 'discussion').upper()}`",
                 f"**Last Phase Switch:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.state.get('phase_last_changed', time.time())))}",
@@ -153,6 +170,16 @@ class MemoryManager:
         }
         self.state.setdefault("model_journals", {}).setdefault(model_id, []).append(log)
         
+        # Save model-isolated journal in project models folder
+        model_dir = os.path.join(self.project_dir, "models", model_id)
+        os.makedirs(model_dir, exist_ok=True)
+        journal_path = os.path.join(model_dir, "journal.json")
+        try:
+            with open(journal_path, "w", encoding="utf-8") as f:
+                json.dump(self.state["model_journals"][model_id], f, indent=2)
+        except Exception:
+            pass
+
         # Automatically generate a NAC-style Episode checkpoint on Nap
         self.record_episode(
             author=f"Model ({model_id})",

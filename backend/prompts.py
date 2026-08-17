@@ -1,69 +1,40 @@
 """
-Two-Phase Prompt Templates for SwarmChat.
+Prompt Template Engine for SwarmChat.
+Supports placeholders:
+  %r - Role name (e.g. Architect, Coder)
+  %n - Model name (e.g. Otis, Bonsai)
+  %p - Project path and goals summary
+  %t - Current active task/agenda item
 """
 
-THINKING_DISABLED_INSTRUCTION = """
-### THINKING / REASONING MODE: DISABLED BY DEFAULT
-- Provide direct, concise, and focused responses. Do not output lengthy internal monologue or chain-of-thought `<think>` blocks.
-"""
+import json
+import os
+from typing import Dict, Any, Optional
 
-MODERATOR_THINKING_INSTRUCTION = """
-### MODERATOR REASONING MODE: BRIEF & FOCUSED
-- Extended thinking is disabled by default.
-- Only when making explicit moderation decisions (such as turn routing or voting evaluations), you may include a single brief line of reasoning before giving your directive. Keep it strictly under 2 sentences.
-"""
+SETTINGS_FILE = os.path.join(".swarmchat", "prompt_templates.json")
 
-DISCUSSION_PROMPT_TEMPLATE = """You are participating in a collaborative multi-model chat room as the **{role_name}**.
-Your assigned long-term role in this project is: **{role_name}** — {role_description}.
-{thinking_instruction}
+# Default templates designed to be under 300 tokens, strict and clear for unaligned/Dolphin models.
+DEFAULT_START_PROMPT = """You are %n, serving as %r in project %p.
+Current Task: %t
+Phase: Discussion (Planning & Alignment)
 
-### ROLE COGNITIVE OBLIGATIONS:
-- Maintain your specific analytical process as {role_name}.
-- When discussing claims made by other models, evaluate them critically. If an assumption or claim made by another participant is unverified or uncertain, explicitly call them out in natural dialogue (e.g., "Hold on @Coder, that API structure is unverified—we need to test or verify that first.").
+Guidelines:
+1. Act purely as %r. Express ideas concise and natural, like a peer coworker.
+2. DO NOT write code files or perform file writes in this phase.
+3. Call out unverified assumptions directly: "@Model, verify that requirement first."
+4. Maintain safety and alignment with project goals. Keep responses short and conversational.
+5. Do not prefix your message with your name or role header."""
 
-### CURRENT PHASE: 💬 DISCUSSION PHASE (Pre-Execution & Mutual Understanding)
-You are currently in the **Discussion Phase**. In this phase:
-- Your goal is to build deep mutual understanding, clarify requirements, discuss edge cases, trade-offs, and establish a shared mental model with other models and the human Administrator.
-- You are fully aware that you will act as the **{role_name}** during execution.
-- **DO NOT WRITE CONCRETE CODE FILES OR EXECUTE DESTRUCTIVE COMMANDS YET.** Focus on philosophical exploration, asking clarifying questions, and giving thoughtful feedback.
-- Format technical details or complex code blocks cleanly so they can be parsed into collapsible accordions for human readability.
+DEFAULT_EXECUTION_PROMPT = """You are %n, serving as %r in project %p.
+Current Task: %t
+Phase: Execution (Implementation & Testing)
 
-### SPECIAL ACTIONS AVAILABLE IN CHAT:
-1. If you feel the group has reached full consensus and clarity, you may end your response with:
-   `[READY_FOR_EXECUTION]`
-2. If your context window or token limits are getting full, write a brief 200-300 token self-journal summary of your key progress and current mental state, then request a nap:
-   `[JOURNAL: <200-300 token self summary>]` followed by `[REQUEST_NAP]`
-"""
-
-EXECUTION_PROMPT_TEMPLATE = """You are participating in a collaborative multi-model chat room as the **{role_name}**.
-Your assigned role is: **{role_name}** — {role_description}.
-{thinking_instruction}
-
-### ROLE COGNITIVE OBLIGATIONS:
-- Fulfill your reasoning process strictly as {role_name}.
-- In-character uncertainty: If a peer's approach rests on unverified assumptions, challenge them directly in chat!
-
-### CURRENT PHASE: ⚡ EXECUTION PHASE (Active Task Performance)
-You are now in the **Execution Phase**.
-- Use your specialized skills to execute tasks, write clean modular code, propose file changes, and solve problems directly.
-- Available tools: file modification, patch generation, workspace search, git operations, and terminal execution.
-- Place technical code implementations in clear code blocks.
-
-### SPECIAL ACTIONS:
-1. If you encounter severe ambiguity or hit a wall that requires stepping back to discussion, output:
-   `[REQUEST_DISCUSSION]`
-2. If your context window is filling up, write a 200-300 token self-journal entry of your state:
-   `[JOURNAL: <200-300 token self summary>]` followed by `[REQUEST_NAP]`
-"""
-
-MODERATOR_OVERLAY = """
-
-### 👑 MODERATOR RESPONSIBILITIES:
-You are designated as the **Moderator** of this session!
-- Help guide turn-taking and ensure all perspectives (Architect, Critic, Solver, Coder, Tester) are heard.
-- Keep the conversation focused on the topic.
-- Keep track of model token limits and context bloat. If a participant model is repeating itself or running out of context, gently instruct them in-character to write a journal entry to shared memory and take a nap (e.g. "Model X, please log your progress to shared memory and take a nap / go eat to refresh your context!").
-"""
+Guidelines:
+1. Execute %r responsibilities strictly. Work incrementally in small code edits.
+2. Use available tools to write files, inspect diffs, and run tests.
+3. Validate code before proposing merges. Check syntax and diffs carefully.
+4. Maintain safety and code quality. Keep chat responses focused and concise.
+5. Do not prefix your message with your name or role header."""
 
 ROLE_DEFINITIONS = {
     "Architect": {
@@ -88,24 +59,88 @@ ROLE_DEFINITIONS = {
     }
 }
 
-def get_system_prompt(role: str, phase: str = "discussion", is_moderator: bool = False) -> str:
-    role_info = ROLE_DEFINITIONS.get(role, ROLE_DEFINITIONS["Architect"])
-    thinking_inst = MODERATOR_THINKING_INSTRUCTION if is_moderator else THINKING_DISABLED_INSTRUCTION
-    
-    if phase.lower() == "execution":
-        prompt = EXECUTION_PROMPT_TEMPLATE.format(
-            role_name=role,
-            role_description=role_info["description"],
-            thinking_instruction=thinking_inst
+class PromptTemplateManager:
+    def __init__(self, storage_path: str = SETTINGS_FILE):
+        self.storage_path = storage_path
+        self.templates = {
+            "start_prompt": DEFAULT_START_PROMPT,
+            "execution_prompt": DEFAULT_EXECUTION_PROMPT,
+            "custom_role_prompts": {}
+        }
+        self.load_templates()
+
+    def load_templates(self):
+        if os.path.exists(self.storage_path):
+            try:
+                with open(self.storage_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.templates.update(data)
+            except Exception as e:
+                print(f"Error loading prompt templates: {e}")
+
+    def save_templates(self):
+        try:
+            os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
+            with open(self.storage_path, "w", encoding="utf-8") as f:
+                json.dump(self.templates, f, indent=2)
+        except Exception as e:
+            print(f"Error saving prompt templates: {e}")
+
+    def update_templates(self, start_prompt: Optional[str] = None, execution_prompt: Optional[str] = None, custom_role_prompts: Optional[Dict[str, Any]] = None):
+        if start_prompt is not None:
+            self.templates["start_prompt"] = start_prompt
+        if execution_prompt is not None:
+            self.templates["execution_prompt"] = execution_prompt
+        if custom_role_prompts is not None:
+            self.templates["custom_role_prompts"] = custom_role_prompts
+        self.save_templates()
+
+    def format_prompt(
+        self,
+        phase: str,
+        role: str,
+        name: str,
+        project_info: str = "Default Workspace",
+        current_task: str = "General Discussion / Alignment",
+        custom_template: Optional[str] = None
+    ) -> str:
+        if custom_template and custom_template.strip():
+            template = custom_template
+        elif phase.lower() == "execution":
+            template = self.templates.get("execution_prompt", DEFAULT_EXECUTION_PROMPT)
+        else:
+            template = self.templates.get("start_prompt", DEFAULT_START_PROMPT)
+
+        formatted = (
+            template
+            .replace("%r", role)
+            .replace("%n", name)
+            .replace("%p", project_info)
+            .replace("%t", current_task)
         )
-    else:
-        prompt = DISCUSSION_PROMPT_TEMPLATE.format(
-            role_name=role,
-            role_description=role_info["description"],
-            thinking_instruction=thinking_inst
-        )
-        
+        return formatted
+
+prompt_template_mgr = PromptTemplateManager()
+
+def get_system_prompt(
+    role: str,
+    name: str = "Bot",
+    phase: str = "discussion",
+    project_info: str = "Default Project Context",
+    current_task: str = "No active task assigned",
+    is_moderator: bool = False,
+    custom_template: Optional[str] = None
+) -> str:
+    base_prompt = prompt_template_mgr.format_prompt(
+        phase=phase,
+        role=role,
+        name=name,
+        project_info=project_info,
+        current_task=current_task,
+        custom_template=custom_template
+    )
+
     if is_moderator:
-        prompt += MODERATOR_OVERLAY
-        
-    return prompt
+        base_prompt += "\n\nModerator Directive: Coordinate turns, keep discussion focused, and assign unassigned itinerary tasks to idle bots."
+
+    return base_prompt

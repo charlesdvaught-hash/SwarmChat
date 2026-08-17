@@ -170,11 +170,6 @@ class Orchestrator:
             return {"error": "Model not available"}
 
         current_phase = self.memory_manager.get_phase()
-        sys_prompt = get_system_prompt(
-            role=model_cfg["role"],
-            phase=current_phase,
-            is_moderator=model_cfg.get("is_moderator", False)
-        )
 
         memory_summary = self.memory_manager.get_memory_summary()
         latest_journal = self.memory_manager.get_model_latest_journal(model_id)
@@ -188,6 +183,16 @@ class Orchestrator:
 
         # Retrieve Active Task / Itinerary Item for Meetings
         active_task = self.memory_manager.get_active_task()
+
+        sys_prompt = get_system_prompt(
+            role=model_cfg["role"],
+            name=model_cfg["name"],
+            phase=current_phase,
+            project_info=self.memory_manager.get_project_id(),
+            current_task=active_task["title"] if active_task else "General Discussion / Alignment",
+            is_moderator=model_cfg.get("is_moderator", False),
+            custom_template=model_cfg.get("custom_start_prompt") if current_phase == "discussion" else model_cfg.get("custom_execution_prompt")
+        )
         task_context = ""
         if active_task:
             task_context = f"\n\n### 🎯 ACTIVE ITINERARY ITEM / MEETING AGENDA:\nTitle: {active_task['title']}\nDescription: {active_task['description']}\nPriority: {active_task['priority'].upper()}\nStatus: {active_task['status'].upper()}"
@@ -221,6 +226,17 @@ class Orchestrator:
 
         if "[READY_FOR_EXECUTION]" in response_text:
             self.memory_manager.add_entry(model_cfg["name"], "Declared readiness for Execution Phase.")
+            if self.memory_manager.get_phase() == "discussion":
+                self.memory_manager.set_phase("execution")
+                # Auto-select or create first itinerary task if none in progress
+                active_t = self.memory_manager.get_active_task()
+                if not active_t:
+                    self.memory_manager.add_itinerary_task(
+                        title="Execute Project Requirements",
+                        description="Implement codebase updates based on discussion phase consensus.",
+                        priority="high",
+                        assigned_model=model_id
+                    )
         elif "[REQUEST_DISCUSSION]" in response_text:
             self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
 
@@ -352,10 +368,18 @@ class Orchestrator:
             return asyncio.run(self._execute_tool_async(tool_name, args, caller_id))
 
     async def _execute_tool_async(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
+        # Lock write tools during discussion phase
+        current_phase = self.memory_manager.get_phase()
+        if current_phase == "discussion" and tool_name in ["write_file", "patch_file", "bot_workspace_write", "bot_workspace_merge"]:
+            return {
+                "success": False,
+                "error": "File write tools are locked during Discussion Phase. Declare readiness with [READY_FOR_EXECUTION] first."
+            }
+
         if tool_name == "read_file":
-            return self.tool_manager.read_file(args.get("filepath", ""))
+            return self.tool_manager.read_file(args.get("filepath", ""), bot_id=caller_id)
         elif tool_name == "list_files":
-            return self.tool_manager.list_files(args.get("dir", "."))
+            return self.tool_manager.list_files(args.get("dir", "."), bot_id=caller_id)
         elif tool_name == "search_workspace":
             return self.tool_manager.search_workspace(args.get("query", ""))
         elif tool_name == "internet_search":
@@ -365,7 +389,7 @@ class Orchestrator:
         elif tool_name == "write_file":
             filepath = args.get("filepath", "")
             content = args.get("content", "")
-            res = self.tool_manager.write_file(filepath, content)
+            res = self.tool_manager.write_file(filepath, content, bot_id=caller_id)
             if res.get("success"):
                 # Track file modification attribution
                 self.memory_manager.log_file_edit(
@@ -373,6 +397,18 @@ class Orchestrator:
                     author=caller_id,
                     action="write",
                     diff_snippet=f"Written {res.get('bytes_written', 0)} bytes"
+                )
+            return res
+        elif tool_name == "bot_workspace_write":
+            return self.tool_manager.bot_workspace_write(bot_id=caller_id, filepath=args.get("filepath", ""), content=args.get("content", ""))
+        elif tool_name == "bot_workspace_merge":
+            res = self.tool_manager.bot_workspace_merge_to_main(bot_id=caller_id, filepath=args.get("filepath", ""))
+            if res.get("success"):
+                self.memory_manager.log_file_edit(
+                    filepath=args.get("filepath", ""),
+                    author=caller_id,
+                    action="merge",
+                    diff_snippet=f"Merged from workspace {caller_id}"
                 )
             return res
         elif tool_name == "run_terminal_cmd":
