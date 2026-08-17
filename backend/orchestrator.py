@@ -33,7 +33,11 @@ class Orchestrator:
                 "enabled": True,
                 "is_moderator": True,
                 "status": "active",
-                "max_context_tokens": 4096
+                "max_context_tokens": 4096,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "repeat_penalty": 1.1
             },
             "model_critic": {
                 "id": "model_critic",
@@ -44,7 +48,11 @@ class Orchestrator:
                 "enabled": True,
                 "is_moderator": False,
                 "status": "active",
-                "max_context_tokens": 4096
+                "max_context_tokens": 4096,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "repeat_penalty": 1.1
             },
             "model_coder": {
                 "id": "model_coder",
@@ -55,13 +63,17 @@ class Orchestrator:
                 "enabled": True,
                 "is_moderator": False,
                 "status": "active",
-                "max_context_tokens": 4096
+                "max_context_tokens": 4096,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "repeat_penalty": 1.1
             }
         }
 
         # Active chatroom models (subset of known models currently in the room)
         self.models: Dict[str, Dict[str, Any]] = {
-            m_id: dict(cfg) for m_id, cfg in self.known_models.items()
+            m_id: {**cfg, "live_status": "Idle / Live in Chat"} for m_id, cfg in self.known_models.items()
         }
 
         self.pending_tool_votes: List[Dict[str, Any]] = []
@@ -81,10 +93,18 @@ class Orchestrator:
 
     def add_or_update_known_model(self, model_cfg: Dict[str, Any]):
         m_id = model_cfg["id"]
+        if "live_status" not in model_cfg:
+            model_cfg["live_status"] = "Idle / Live in Chat"
         self.known_models[m_id] = model_cfg
         self.models[m_id] = dict(model_cfg)
         if model_cfg.get("is_moderator"):
             self.set_moderator(m_id)
+
+    def set_model_live_status(self, model_id: str, status: str):
+        if model_id in self.models:
+            self.models[model_id]["live_status"] = status
+        if model_id in self.known_models:
+            self.known_models[model_id]["live_status"] = status
 
     def kick_model_from_room(self, model_id: str) -> Dict[str, Any]:
         was_moderator = False
@@ -202,7 +222,10 @@ class Orchestrator:
         if latest_journal:
             journal_context = f"\n\n### YOUR LATEST TIMESTAMPED SELF-JOURNAL (PRE-NAP PERSPECTIVE):\n{latest_journal}"
 
-        context_prompt = f"{sys_prompt}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{task_context}{journal_context}"
+        own_spec = self.memory_manager.get_spec_file(model_id)
+        spec_context = f"\n\n### YOUR PERSONAL SPEC NOTEBOOK:\n{own_spec if own_spec else '(Empty - use [UPDATE_SPEC: <content>] to record research or notes)'}"
+
+        context_prompt = f"{sys_prompt}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{task_context}{journal_context}{spec_context}"
 
         # Check model token usage against limits
         tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)
@@ -239,11 +262,15 @@ class Orchestrator:
             if not recent_msgs:
                 recent_msgs = [{"role": "user", "content": "Please introduce your perspective on the current project."}]
 
-        response_text = await self.model_manager.generate_response(
-            model_config=model_cfg,
-            system_prompt=context_prompt,
-            messages=recent_msgs
-        )
+        self.set_model_live_status(model_id, f"Formulating response as {model_cfg.get('role', 'Participant')}")
+        try:
+            response_text = await self.model_manager.generate_response(
+                model_config=model_cfg,
+                system_prompt=context_prompt,
+                messages=recent_msgs
+            )
+        finally:
+            self.set_model_live_status(model_id, "Idle / Live in Chat")
 
         self.memory_manager.update_token_usage(model_id, len(response_text.split()))
 
@@ -262,6 +289,46 @@ class Orchestrator:
                     )
         elif "[REQUEST_DISCUSSION]" in response_text:
             self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
+
+        if "[UPDATE_CONFIG:" in response_text:
+            try:
+                start = response_text.find("[UPDATE_CONFIG:") + len("[UPDATE_CONFIG:")
+                end = response_text.find("]", start)
+                if end != -1:
+                    raw_cfg = response_text[start:end].strip()
+                    parts = [p.strip() for p in raw_cfg.split(",")]
+                    updates = {}
+                    target_id = model_id
+                    for p in parts:
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            k, v = k.strip(), v.strip()
+                            if k == "model_id":
+                                target_id = v
+                            elif k in ["top_p", "temperature", "repeat_penalty"]:
+                                updates[k] = float(v)
+                            elif k == "top_k":
+                                updates[k] = int(v)
+                    if updates and target_id in self.models:
+                        self.models[target_id].update(updates)
+                        if target_id in self.known_models:
+                            self.known_models[target_id].update(updates)
+                        self.memory_manager.add_entry(
+                            author=model_cfg["name"],
+                            content=f"Updated sampling settings for `{target_id}` based on Hugging Face / performance research: {updates}"
+                        )
+            except Exception:
+                pass
+
+        if "[UPDATE_SPEC:" in response_text:
+            try:
+                start = response_text.find("[UPDATE_SPEC:") + len("[UPDATE_SPEC:")
+                end = response_text.find("]", start)
+                if end != -1:
+                    spec_content = response_text[start:end].strip()
+                    self.memory_manager.update_spec_file(model_id, spec_content)
+            except Exception:
+                pass
 
         if "[SEARCH_HF:" in response_text:
             try:
@@ -399,48 +466,68 @@ class Orchestrator:
                 "error": "File write tools are locked during Discussion Phase. Declare readiness with [READY_FOR_EXECUTION] first."
             }
 
-        if tool_name == "read_file":
-            return self.tool_manager.read_file(args.get("filepath", ""), bot_id=caller_id)
-        elif tool_name == "list_files":
-            return self.tool_manager.list_files(args.get("dir", "."), bot_id=caller_id)
-        elif tool_name == "search_workspace":
-            return self.tool_manager.search_workspace(args.get("query", ""))
-        elif tool_name == "internet_search":
-            return await self.tool_manager.internet_search(args.get("query", ""), domain_filter=args.get("domain_filter"))
-        elif tool_name == "search_huggingface":
-            return await self.tool_manager.search_huggingface(args.get("query", ""), limit=args.get("limit", 5))
-        elif tool_name == "write_file":
-            filepath = args.get("filepath", "")
-            content = args.get("content", "")
-            res = self.tool_manager.write_file(filepath, content, bot_id=caller_id)
-            if res.get("success"):
-                # Track file modification attribution
-                self.memory_manager.log_file_edit(
-                    filepath=filepath,
-                    author=caller_id,
-                    action="write",
-                    diff_snippet=f"Written {res.get('bytes_written', 0)} bytes"
-                )
-            return res
-        elif tool_name == "bot_workspace_write":
-            return self.tool_manager.bot_workspace_write(bot_id=caller_id, filepath=args.get("filepath", ""), content=args.get("content", ""))
-        elif tool_name == "bot_workspace_merge":
-            res = self.tool_manager.bot_workspace_merge_to_main(bot_id=caller_id, filepath=args.get("filepath", ""))
-            if res.get("success"):
-                self.memory_manager.log_file_edit(
-                    filepath=args.get("filepath", ""),
-                    author=caller_id,
-                    action="merge",
-                    diff_snippet=f"Merged from workspace {caller_id}"
-                )
-            return res
-        elif tool_name == "run_terminal_cmd":
-            return self.tool_manager.run_terminal_cmd(args.get("command", ""))
-        elif tool_name == "git_status":
-            return self.tool_manager.git_status()
-        elif tool_name == "git_diff":
-            return self.tool_manager.git_diff()
-        return {"success": False, "error": f"Unknown tool: {tool_name}"}
+        try:
+            if tool_name == "read_file":
+                filepath = args.get("filepath", "")
+                self.set_model_live_status(caller_id, f"Perusing {filepath or 'files'}")
+                return self.tool_manager.read_file(filepath, bot_id=caller_id)
+            elif tool_name == "list_files":
+                self.set_model_live_status(caller_id, "Listing workspace directory files")
+                return self.tool_manager.list_files(args.get("dir", "."), bot_id=caller_id)
+            elif tool_name == "search_workspace":
+                query = args.get("query", "")
+                self.set_model_live_status(caller_id, f"Searching workspace for '{query}'")
+                return self.tool_manager.search_workspace(query)
+            elif tool_name == "internet_search":
+                query = args.get("query", "")
+                self.set_model_live_status(caller_id, f"Searching web for '{query}'")
+                return await self.tool_manager.internet_search(query, domain_filter=args.get("domain_filter"))
+            elif tool_name == "search_huggingface":
+                query = args.get("query", "")
+                self.set_model_live_status(caller_id, f"Researching HuggingFace for '{query}'")
+                return await self.tool_manager.search_huggingface(query, limit=args.get("limit", 5))
+            elif tool_name == "write_file":
+                filepath = args.get("filepath", "")
+                self.set_model_live_status(caller_id, f"Editing file {filepath}")
+                content = args.get("content", "")
+                res = self.tool_manager.write_file(filepath, content, bot_id=caller_id)
+                if res.get("success"):
+                    self.memory_manager.log_file_edit(
+                        filepath=filepath,
+                        author=caller_id,
+                        action="write",
+                        diff_snippet=f"Written {res.get('bytes_written', 0)} bytes"
+                    )
+                return res
+            elif tool_name == "bot_workspace_write":
+                filepath = args.get("filepath", "")
+                self.set_model_live_status(caller_id, f"Writing workspace sandbox {filepath}")
+                return self.tool_manager.bot_workspace_write(bot_id=caller_id, filepath=filepath, content=args.get("content", ""))
+            elif tool_name == "bot_workspace_merge":
+                filepath = args.get("filepath", "")
+                self.set_model_live_status(caller_id, f"Merging sandbox edits for {filepath}")
+                res = self.tool_manager.bot_workspace_merge_to_main(bot_id=caller_id, filepath=filepath)
+                if res.get("success"):
+                    self.memory_manager.log_file_edit(
+                        filepath=filepath,
+                        author=caller_id,
+                        action="merge",
+                        diff_snippet=f"Merged from workspace {caller_id}"
+                    )
+                return res
+            elif tool_name == "run_terminal_cmd":
+                cmd = args.get("command", "")
+                self.set_model_live_status(caller_id, f"Executing command '{cmd[:20]}...'")
+                return self.tool_manager.run_terminal_cmd(cmd)
+            elif tool_name == "git_status":
+                self.set_model_live_status(caller_id, "Checking git repository status")
+                return self.tool_manager.git_status()
+            elif tool_name == "git_diff":
+                self.set_model_live_status(caller_id, "Reviewing git diff")
+                return self.tool_manager.git_diff()
+            return {"success": False, "error": f"Unknown tool: {tool_name}"}
+        finally:
+            self.set_model_live_status(caller_id, "Idle / Live in Chat")
 
     def admin_override_vote(self, vote_id: str, action: str, modified_args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         for req in self.pending_tool_votes:

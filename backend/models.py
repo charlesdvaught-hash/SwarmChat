@@ -268,27 +268,40 @@ class ModelManager:
         model_config: Dict[str, Any],
         system_prompt: str,
         messages: List[Dict[str, str]],
-        temperature: float = 0.7
+        temperature: Optional[float] = None
     ) -> str:
         provider = model_config.get("provider", "ollama")
         model_name = model_config.get("model_name", "llama3.2:1b")
         api_key = model_config.get("api_key", "")
 
+        # Extract sampling parameters with fallbacks
+        temp = temperature if temperature is not None else float(model_config.get("temperature", 0.7))
+        top_p = float(model_config.get("top_p", 0.9))
+        top_k = int(model_config.get("top_k", 40))
+        repeat_penalty = float(model_config.get("repeat_penalty", 1.1))
+
         from backend.sanitizer import normalize_messages_for_gguf, sanitize_message_content
-        full_messages = normalize_messages_for_gguf(system_prompt, messages)
+        role = model_config.get("role", "Participant")
+        full_messages = normalize_messages_for_gguf(system_prompt, messages, role=role)
 
         if provider == "ollama":
             if not self.check_ollama_status():
                 return f"[{model_config.get('name', 'Model')} ({model_name})]: Checked context and discussion goals."
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
+                    options = {
+                        "temperature": temp,
+                        "top_p": top_p,
+                        "top_k": top_k,
+                        "repeat_penalty": repeat_penalty
+                    }
                     resp = await client.post(
                         f"{self.ollama_host}/api/chat",
                         json={
                             "model": model_name,
                             "messages": full_messages,
                             "stream": False,
-                            "options": {"temperature": temperature}
+                            "options": options
                         }
                     )
                     if resp.status_code == 200:
@@ -319,10 +332,13 @@ class ModelManager:
 
             try:
                 start_time = time.time()
-                # Format prompt for llama_cpp chat completion or prompt format
+                # Format prompt for llama_cpp chat completion
                 response = llm.create_chat_completion(
                     messages=full_messages,
-                    temperature=temperature,
+                    temperature=temp,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repeat_penalty=repeat_penalty,
                     max_tokens=512
                 )
                 elapsed = time.time() - start_time
