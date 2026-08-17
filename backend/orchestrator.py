@@ -222,10 +222,20 @@ class Orchestrator:
                 }
             ]
         else:
-            recent_msgs = [
-                {"role": "user" if m["is_admin"] else "assistant", "content": f"[{m['sender']} ({m['role']})]: {m['content']}"}
-                for m in self.chat_history[-6:]
-            ]
+            # Discussion phase: Truncate messages to prevent prompt overflow & context degradation
+            # Limit each message to max 400 characters and include at most the last 5 turns
+            from backend.sanitizer import sanitize_message_content
+            recent_msgs = []
+            for m in self.chat_history[-5:]:
+                clean_c = sanitize_message_content(m["content"])
+                if len(clean_c) > 400:
+                    clean_c = clean_c[:400] + "... [truncated for context efficiency]"
+                role = "user" if m["is_admin"] else "assistant"
+                # Avoid prepending speaker name inside content to prevent model self-echoing header confusion
+                recent_msgs.append({
+                    "role": role,
+                    "content": clean_c
+                })
             if not recent_msgs:
                 recent_msgs = [{"role": "user", "content": "Please introduce your perspective on the current project."}]
 

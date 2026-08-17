@@ -2,16 +2,28 @@ import re
 from typing import List, Dict, Any
 
 def sanitize_message_content(content: str) -> str:
-    """Strips recursive self-echoing headers like [Otis (Architect)]: or [Bonsai 27B Q1 0 (Architect)]:"""
+    """Strips recursive self-echoing headers like [Otis (Architect)]: or [Bonsai 27B Q1 0 (Architect)]:, <think> tags, and 'Thinking Process:' outputs."""
     if not content:
         return ""
 
-    # Pattern to match starting headers like [Name (Role)]: or [Name]: repeatedly
-    pattern = r"^(?:\[[^\]]+\]:\s*)+"
-    cleaned = re.sub(pattern, "", content.strip())
+    cleaned = content.strip()
 
-    # Also clean if header is on a newline at the beginning
-    cleaned = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", cleaned)
+    # Strip <think>...</think> blocks or unclosed <think> blocks
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
+
+    # Strip "Thinking Process: ..." or "Here's a thinking process: ..." blocks
+    cleaned = re.sub(r"(?:Thinking Process|Here's a thinking process|Thinking):.*?(?:\n\n|\n(?=[A-Z0-9]))", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"^(?:Thinking Process|Here's a thinking process|Thinking):.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+
+    # Repeatedly strip starting headers like [Name (Role)]: or [Name]:
+    while True:
+        new_cleaned = re.sub(r"^(?:\[[^\]]+\]:\s*)+", "", cleaned.strip())
+        new_cleaned = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", new_cleaned.strip())
+        if new_cleaned == cleaned:
+            break
+        cleaned = new_cleaned
+
     return cleaned.strip()
 
 def normalize_messages_for_gguf(system_prompt: str, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
