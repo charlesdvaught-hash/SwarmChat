@@ -1,0 +1,49 @@
+{
+  "project_id": "default_project",
+  "phase": "execution",
+  "phase_last_changed": 1786995622.9914875,
+  "shared_entries": [
+    {
+      "id": "mem_1786995622988",
+      "timestamp": 1786995622.9882057,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1786995622990",
+      "timestamp": 1786995622.990186,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1786995622991",
+      "timestamp": 1786995622.9914927,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    }
+  ],
+  "model_journals": {},
+  "episodes": [],
+  "task_itinerary": [],
+  "file_audit_log": [
+    {
+      "id": "audit_1786995623102",
+      "timestamp": 1786995623.1024368,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    }
+  ],
+  "active_file_locks": {
+    "test.txt": {
+      "last_edited_by": "model_coder",
+      "last_edited_at": 1786995623.1024404,
+      "status": "edited"
+    }
+  },
+  "tokens_used": {
+    "model_architect": 7
+  },
+  "session_id": "default_session"
+}
