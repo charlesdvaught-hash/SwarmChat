@@ -191,7 +191,8 @@ class Orchestrator:
             project_info=self.memory_manager.get_project_id(),
             current_task=active_task["title"] if active_task else "General Discussion / Alignment",
             is_moderator=model_cfg.get("is_moderator", False),
-            custom_template=model_cfg.get("custom_start_prompt") if current_phase == "discussion" else model_cfg.get("custom_execution_prompt")
+            custom_template=model_cfg.get("custom_start_prompt") if current_phase == "discussion" else model_cfg.get("custom_execution_prompt"),
+            model_id=model_id
         )
         task_context = ""
         if active_task:
@@ -209,12 +210,24 @@ class Orchestrator:
         if tokens_used > (max_tokens * 0.8):
             context_prompt += "\n\n⚠️ WARNING: Your context usage is high! Please write a 200-300 token self-journal using `[JOURNAL: <summary>]` and request a nap `[REQUEST_NAP]`."
 
-        recent_msgs = [
-            {"role": "user" if m["is_admin"] else "assistant", "content": f"[{m['sender']} ({m['role']})]: {m['content']}"}
-            for m in self.chat_history[-6:]
-        ]
-        if not recent_msgs:
-            recent_msgs = [{"role": "user", "content": "Please introduce your perspective on the current project."}]
+        if current_phase == "execution":
+            # Stateless refresh for execution phase: clean context window populated with workspace file manifest & task details
+            file_manifest = self.tool_manager.list_files(".", bot_id=model_id)
+            manifest_str = ", ".join(file_manifest.get("files", [])[:15]) if isinstance(file_manifest, dict) else ""
+
+            recent_msgs = [
+                {
+                    "role": "user",
+                    "content": f"[SYSTEM REFRESH - STATELESS EXECUTION MODE]\nTask: {active_task['title'] if active_task else 'Execute code edits'}\nWorkspace Files: {manifest_str}\nPlease analyze your task requirements, retrieve any necessary indexed memory/journal entries, and execute your updates using tool commands or proposed edits."
+                }
+            ]
+        else:
+            recent_msgs = [
+                {"role": "user" if m["is_admin"] else "assistant", "content": f"[{m['sender']} ({m['role']})]: {m['content']}"}
+                for m in self.chat_history[-6:]
+            ]
+            if not recent_msgs:
+                recent_msgs = [{"role": "user", "content": "Please introduce your perspective on the current project."}]
 
         response_text = await self.model_manager.generate_response(
             model_config=model_cfg,

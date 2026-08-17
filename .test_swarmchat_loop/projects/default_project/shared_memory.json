@@ -1,0 +1,16 @@
+{
+  "project_id": "default_project",
+  "phase": "discussion",
+  "phase_last_changed": 1786995623.243847,
+  "shared_entries": [],
+  "model_journals": {},
+  "episodes": [],
+  "task_itinerary": [],
+  "file_audit_log": [],
+  "active_file_locks": {},
+  "tokens_used": {
+    "model_coder": 14,
+    "model_architect": 14
+  },
+  "session_id": "default_session"
+}
