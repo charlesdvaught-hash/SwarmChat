@@ -56,6 +56,18 @@ class EvaluateReq(BaseModel):
     candidates: List[Dict[str, Any]]
     task_context: str
 
+class ItineraryTaskReq(BaseModel):
+    title: str
+    description: str
+    priority: str = "medium"
+    assigned_model: Optional[str] = None
+
+class ItineraryTaskUpdateReq(BaseModel):
+    task_id: str
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    assigned_model: Optional[str] = None
+
 @app.get("/api/hardware")
 def get_hardware_info():
     return model_mgr.get_hardware_info()
@@ -88,7 +100,41 @@ def get_full_state():
         "shared_memory": memory_mgr.state.get("shared_entries", []),
         "model_journals": memory_mgr.state.get("model_journals", {}),
         "tokens_used": memory_mgr.state.get("tokens_used", {}),
-        "allowed_domains": tool_mgr.allowed_domains
+        "allowed_domains": tool_mgr.allowed_domains,
+        "episodes": memory_mgr.state.get("episodes", []),
+        "task_itinerary": memory_mgr.get_task_itinerary(),
+        "active_task": memory_mgr.get_active_task(),
+        "file_audit_log": memory_mgr.get_file_audit_log(),
+        "active_file_locks": memory_mgr.state.get("active_file_locks", {})
+    }
+
+@app.post("/api/itinerary/task")
+def add_itinerary_task(req: ItineraryTaskReq):
+    task = memory_mgr.add_itinerary_task(req.title, req.description, req.priority, req.assigned_model)
+    return {"success": True, "task": task}
+
+@app.post("/api/itinerary/update")
+def update_itinerary_task(req: ItineraryTaskUpdateReq):
+    updates = {}
+    if req.status is not None:
+        updates["status"] = req.status
+    if req.priority is not None:
+        updates["priority"] = req.priority
+    if req.assigned_model is not None:
+        updates["assigned_model"] = req.assigned_model
+    updated = memory_mgr.update_itinerary_task(req.task_id, updates)
+    return {"success": updated is not None, "task": updated}
+
+@app.get("/api/workspace/file")
+def get_workspace_file_content(filepath: str):
+    return tool_mgr.read_file(filepath)
+
+@app.get("/api/workspace/audit")
+def get_workspace_file_audit(filepath: Optional[str] = None):
+    return {
+        "success": True,
+        "audit_log": memory_mgr.get_file_audit_log(filepath),
+        "active_file_locks": memory_mgr.state.get("active_file_locks", {})
     }
 
 @app.post("/api/phase")
@@ -146,6 +192,14 @@ def override_vote(req: VoteOverrideReq):
 async def run_evaluate(req: EvaluateReq):
     res = await evaluate_engine.run_candidate_evaluation(req.candidates, req.task_context)
     return res
+
+@app.get("/api/evaluate/health")
+def get_room_health():
+    return evaluate_engine.evaluate_room_health(
+        active_models=orchestrator.models,
+        chat_history=orchestrator.chat_history,
+        tokens_used=memory_mgr.state.get("tokens_used", {})
+    )
 
 @app.get("/api/workspace/files")
 def list_workspace_files(rel_dir: str = "."):
