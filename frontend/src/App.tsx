@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   MessageSquare, Zap, Settings, Shield, BrainCircuit, AlertTriangle,
   Play, Crown, Cpu, Sparkles, Send, X, Users, Check, Plus, FolderOpen, Trash2,
-  ChevronDown, ChevronRight, UserMinus, UserPlus, RefreshCw
+  ChevronDown, ChevronRight, UserMinus, UserPlus, RefreshCw, FileText, CheckSquare, Activity
 } from 'lucide-react';
 
 interface ChatMessage {
@@ -53,6 +53,26 @@ export default function App() {
   const [showSetup, setShowSetup] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
   const [showModPrompt, setShowModPrompt] = useState(false);
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [overlayTab, setOverlayTab] = useState<'itinerary' | 'episodes' | 'workspace' | 'health'>('itinerary');
+
+  const [episodes, setEpisodes] = useState<any[]>([]);
+  const [taskItinerary, setTaskItinerary] = useState<any[]>([]);
+  const [activeTask, setActiveTask] = useState<any>(null);
+  const [fileAuditLog, setFileAuditLog] = useState<any[]>([]);
+  const [activeFileLocks, setActiveFileLocks] = useState<Record<string, any>>({});
+  const [roomHealth, setRoomHealth] = useState<any[]>([]);
+
+  // Workspace File Explorer State
+  const [workspaceFiles, setWorkspaceFiles] = useState<any[]>([]);
+  const [selectedFilePath, setSelectedFilePath] = useState<string>('');
+  const [selectedFileContent, setSelectedFileContent] = useState<string>('');
+
+  // New Itinerary Task Form
+  const [newTaskTitle, setNewTaskTitle] = useState('');
+  const [newTaskDesc, setNewTaskDesc] = useState('');
+  const [newTaskPriority, setNewTaskPriority] = useState('medium');
+
   const [formerModId, setFormerModId] = useState<string | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
   const [isStepping, setIsStepping] = useState(false);
@@ -80,10 +100,27 @@ export default function App() {
         setPendingVotes(data.pending_votes || []);
         setMessages(data.chat_history || []);
         setSharedMemory(data.shared_memory || []);
+        setEpisodes(data.episodes || []);
+        setTaskItinerary(data.task_itinerary || []);
+        setActiveTask(data.active_task || null);
+        setFileAuditLog(data.file_audit_log || []);
+        setActiveFileLocks(data.active_file_locks || {});
       }
       const hwRes = await fetch('/api/hardware');
       if (hwRes.ok) {
         setHardware(await hwRes.json());
+      }
+
+      const filesRes = await fetch('/api/workspace/files');
+      if (filesRes.ok) {
+        const fdata = await filesRes.json();
+        setWorkspaceFiles(fdata.items || []);
+      }
+
+      const healthRes = await fetch('/api/evaluate/health');
+      if (healthRes.ok) {
+        const hdata = await healthRes.json();
+        setRoomHealth(hdata.reports || []);
       }
     } catch (e) {
       console.error('Fetch state error:', e);
@@ -264,7 +301,7 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen bg-slate-950 text-slate-100 font-sans">
       {/* --- TOP BANNER: Phase Indicator & Quick Controls --- */}
-      <header className="flex items-center justify-between px-5 py-3 bg-slate-900/90 border-b border-slate-800 backdrop-blur shrink-0">
+      <header className="flex items-center justify-between px-5 py-2.5 bg-slate-900/90 border-b border-slate-800 backdrop-blur shrink-0">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 font-bold text-lg text-emerald-400">
             <Sparkles className="w-5 h-5 text-emerald-400" />
@@ -275,7 +312,7 @@ export default function App() {
           {/* Phase Badge & Switch Button */}
           <button
             onClick={togglePhase}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-full font-medium text-xs tracking-wide transition-all shadow-sm ${
+            className={`flex items-center gap-2 px-3 py-1 rounded-full font-medium text-xs tracking-wide transition-all shadow-sm ${
               phase === 'discussion'
                 ? 'bg-amber-500/10 text-amber-400 border border-amber-500/30 hover:bg-amber-500/20'
                 : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/20'
@@ -284,46 +321,65 @@ export default function App() {
             {phase === 'discussion' ? (
               <>
                 <MessageSquare className="w-3.5 h-3.5" />
-                <span>💬 DISCUSSION PHASE (Preparatory & Mutual Understanding)</span>
+                <span>💬 DISCUSSION PHASE</span>
               </>
             ) : (
               <>
                 <Zap className="w-3.5 h-3.5" />
-                <span>⚡ EXECUTION PHASE (Tool Active & Coding Work)</span>
+                <span>⚡ EXECUTION PHASE</span>
               </>
             )}
-            <span className="text-[10px] opacity-70 underline ml-1">Click to switch</span>
+            <span className="text-[10px] opacity-70 underline ml-1">Switch</span>
+          </button>
+
+          <div className="h-4 w-px bg-slate-700" />
+
+          {/* SINGLE-LINE ACTIVE TASK / EPISODE HEADER BANNER (Futuristic & Non-Cluttered) */}
+          <button
+            onClick={() => setShowOverlay(true)}
+            className="flex items-center gap-2 bg-slate-950/80 hover:bg-slate-800/80 border border-slate-800 hover:border-cyan-500/50 text-slate-200 px-3 py-1 rounded-xl text-xs transition group"
+            title="Click to view Task Itinerary, Episodes & Workspace Files"
+          >
+            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+            <span className="font-semibold text-cyan-300">Active Task:</span>
+            <span className="text-slate-200 font-medium truncate max-w-xs">
+              {activeTask ? activeTask.title : 'No Active Task'}
+            </span>
+            <span className="text-slate-500">•</span>
+            <span className="text-slate-400">
+              Episodes: <strong className="text-purple-400">{episodes.length}</strong>
+            </span>
+            <span className="text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 px-1.5 py-0.5 rounded ml-1 group-hover:bg-cyan-500/20 transition">
+              Open Menu
+            </span>
           </button>
         </div>
 
         {/* Hardware Status & Top Action Buttons */}
         <div className="flex items-center gap-3">
           {hardware && (
-            <div className="flex items-center gap-3 text-xs bg-slate-800/60 px-3 py-1.5 rounded-lg border border-slate-700/50">
+            <div className="flex items-center gap-3 text-xs bg-slate-800/60 px-3 py-1 rounded-lg border border-slate-700/50">
               <div className="flex items-center gap-1 text-slate-300">
                 <Cpu className="w-3.5 h-3.5 text-slate-400" />
-                <span>RAM: {hardware.ram_available_gb}GB / {hardware.ram_total_gb}GB</span>
+                <span>RAM: {hardware.ram_available_gb}GB</span>
               </div>
-              {hardware.gpu_name && (
-                <span className="text-emerald-400">GPU VRAM: {hardware.vram_free_gb}GB free</span>
-              )}
             </div>
           )}
 
           <button
             onClick={() => setShowSetup(true)}
-            className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-500 text-white font-medium px-3 py-1.5 rounded-lg transition shadow-sm"
+            className="flex items-center gap-1.5 text-xs bg-emerald-600 hover:bg-emerald-500 text-white font-medium px-3 py-1 rounded-lg transition shadow-sm"
           >
             <Settings className="w-3.5 h-3.5" />
-            <span>Settings & Models</span>
+            <span>Settings</span>
           </button>
 
           <button
             onClick={() => setShowMemory(!showMemory)}
-            className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1.5 rounded-lg border border-slate-700 transition"
+            className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-1 rounded-lg border border-slate-700 transition"
           >
             <BrainCircuit className="w-3.5 h-3.5 text-purple-400" />
-            <span>Shared Memory ({sharedMemory.length})</span>
+            <span>Shared Memory</span>
           </button>
         </div>
       </header>
@@ -748,6 +804,331 @@ export default function App() {
                 className="bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs px-3 py-1.5 rounded-lg transition"
               >
                 Auto-assign & Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* --- TASK ITINERARY, EPISODES & WORKSPACE OVERLAY MENU --- */}
+      {showOverlay && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-4xl w-full p-6 shadow-2xl flex flex-col h-[85vh]">
+
+            {/* Modal Header & Navigation Tabs */}
+            <div className="flex items-center justify-between border-b border-slate-800 pb-4 mb-4">
+              <div className="flex items-center gap-2 font-bold text-lg text-slate-100">
+                <Sparkles className="w-5 h-5 text-cyan-400" />
+                <span>SwarmChat Operations & Workspace Control</span>
+              </div>
+              <button onClick={() => setShowOverlay(false)} className="text-slate-400 hover:text-slate-200 p-1">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* TAB SELECTOR BUTTONS */}
+            <div className="flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
+              <button
+                onClick={() => setOverlayTab('itinerary')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl font-medium text-xs transition ${
+                  overlayTab === 'itinerary'
+                    ? 'bg-cyan-500/10 text-cyan-300 border border-cyan-500/30'
+                    : 'bg-slate-950 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                }`}
+              >
+                <CheckSquare className="w-4 h-4 text-cyan-400" />
+                <span>Task Itinerary & Meetings</span>
+              </button>
+
+              <button
+                onClick={() => setOverlayTab('episodes')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl font-medium text-xs transition ${
+                  overlayTab === 'episodes'
+                    ? 'bg-purple-500/10 text-purple-300 border border-purple-500/30'
+                    : 'bg-slate-950 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                }`}
+              >
+                <BrainCircuit className="w-4 h-4 text-purple-400" />
+                <span>Episodes & Thread Checkpoints ({episodes.length})</span>
+              </button>
+
+              <button
+                onClick={() => setOverlayTab('workspace')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl font-medium text-xs transition ${
+                  overlayTab === 'workspace'
+                    ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
+                    : 'bg-slate-950 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                }`}
+              >
+                <FileText className="w-4 h-4 text-emerald-400" />
+                <span>Workspace Files & Change Logs</span>
+              </button>
+
+              <button
+                onClick={() => setOverlayTab('health')}
+                className={`flex items-center gap-2 px-4 py-2 rounded-xl font-medium text-xs transition ${
+                  overlayTab === 'health'
+                    ? 'bg-amber-500/10 text-amber-300 border border-amber-500/30'
+                    : 'bg-slate-950 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                }`}
+              >
+                <Activity className="w-4 h-4 text-amber-400" />
+                <span>Model Health & Evaluation</span>
+              </button>
+            </div>
+
+            {/* TAB CONTENT PANELS */}
+            <div className="flex-1 overflow-y-auto pr-2 space-y-4">
+
+              {/* TAB 1: TASK ITINERARY */}
+              {overlayTab === 'itinerary' && (
+                <div className="space-y-4">
+                  {/* Create Task Form */}
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
+                    <h4 className="font-semibold text-xs text-cyan-400 flex items-center gap-2">
+                      <Plus className="w-4 h-4" /> Add Itinerary Task / Meeting Item
+                    </h4>
+                    <form
+                      onSubmit={async (e) => {
+                        e.preventDefault();
+                        if (!newTaskTitle) return;
+                        await fetch('/api/itinerary/task', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            title: newTaskTitle,
+                            description: newTaskDesc,
+                            priority: newTaskPriority
+                          })
+                        });
+                        setNewTaskTitle('');
+                        setNewTaskDesc('');
+                        fetchState();
+                      }}
+                      className="space-y-3 text-xs"
+                    >
+                      <div className="grid grid-cols-3 gap-3">
+                        <input
+                          type="text"
+                          value={newTaskTitle}
+                          onChange={(e) => setNewTaskTitle(e.target.value)}
+                          placeholder="Task title e.g. Refactor Memory Engine"
+                          className="col-span-2 bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100 placeholder-slate-500"
+                          required
+                        />
+                        <select
+                          value={newTaskPriority}
+                          onChange={(e) => setNewTaskPriority(e.target.value)}
+                          className="bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100"
+                        >
+                          <option value="high">🔴 High Priority</option>
+                          <option value="medium">🟡 Medium Priority</option>
+                          <option value="low">🟢 Low Priority</option>
+                        </select>
+                      </div>
+                      <input
+                        type="text"
+                        value={newTaskDesc}
+                        onChange={(e) => setNewTaskDesc(e.target.value)}
+                        placeholder="Detailed task instructions or meeting agenda objective..."
+                        className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100 placeholder-slate-500"
+                      />
+                      <div className="flex justify-end">
+                        <button type="submit" className="bg-cyan-600 hover:bg-cyan-500 text-white px-4 py-1.5 rounded-xl font-medium">
+                          Add Task
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+
+                  {/* Task List */}
+                  <div className="space-y-2">
+                    <h4 className="font-semibold text-xs text-slate-400 uppercase">Itinerary Agenda Items ({taskItinerary.length})</h4>
+                    {taskItinerary.length === 0 ? (
+                      <div className="text-slate-500 text-xs py-4 text-center">No task items created yet.</div>
+                    ) : (
+                      taskItinerary.map((task) => (
+                        <div key={task.id} className="bg-slate-950 border border-slate-800 p-3 rounded-xl flex items-center justify-between text-xs">
+                          <div className="space-y-1 max-w-xl">
+                            <div className="flex items-center gap-2 font-semibold text-slate-200">
+                              <span>{task.title}</span>
+                              <span className={`text-[10px] px-2 py-0.5 rounded font-mono uppercase ${
+                                task.priority === 'high' ? 'bg-rose-500/10 text-rose-400 border border-rose-500/30' : 'bg-slate-800 text-slate-400'
+                              }`}>
+                                {task.priority}
+                              </span>
+                              <span className={`text-[10px] px-2 py-0.5 rounded font-mono uppercase ${
+                                task.status === 'in_progress' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'bg-slate-800 text-slate-500'
+                              }`}>
+                                {task.status}
+                              </span>
+                            </div>
+                            <div className="text-slate-400 text-[11px]">{task.description}</div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            {task.status !== 'in_progress' && (
+                              <button
+                                onClick={async () => {
+                                  await fetch('/api/itinerary/update', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ task_id: task.id, status: 'in_progress' })
+                                  });
+                                  fetchState();
+                                }}
+                                className="bg-cyan-950/80 hover:bg-cyan-900 text-cyan-300 border border-cyan-800 px-2.5 py-1 rounded font-medium"
+                              >
+                                Set Active
+                              </button>
+                            )}
+                            {task.status !== 'completed' && (
+                              <button
+                                onClick={async () => {
+                                  await fetch('/api/itinerary/update', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ task_id: task.id, status: 'completed' })
+                                  });
+                                  fetchState();
+                                }}
+                                className="bg-emerald-950/80 hover:bg-emerald-900 text-emerald-300 border border-emerald-800 px-2.5 py-1 rounded font-medium"
+                              >
+                                Complete
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 2: EPISODES & THREAD CHECKPOINTS */}
+              {overlayTab === 'episodes' && (
+                <div className="space-y-3">
+                  <h4 className="font-semibold text-xs text-purple-400 uppercase">NAC-Style Episodes & Checkpoint History</h4>
+                  {episodes.length === 0 ? (
+                    <div className="text-slate-500 text-xs py-6 text-center">No episode checkpoints recorded yet. Models generate episodes on naps and handoffs.</div>
+                  ) : (
+                    episodes.map((ep) => (
+                      <div key={ep.id} className="bg-slate-950 border border-slate-800 p-4 rounded-xl space-y-2 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-purple-300">📦 Episode #{ep.id} — [{ep.author}]</span>
+                          <span className="text-[10px] text-slate-500">{new Date(ep.timestamp * 1000).toLocaleTimeString()}</span>
+                        </div>
+                        <div className="text-slate-300 font-medium">Action: {ep.action}</div>
+                        <div className="text-slate-400 leading-relaxed">{ep.summary}</div>
+                        {ep.modified_files && ep.modified_files.length > 0 && (
+                          <div className="text-[11px] text-emerald-400">
+                            Files Modified: <code>{ep.modified_files.join(', ')}</code>
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              {/* TAB 3: WORKSPACE FILES & CHANGE LOGS */}
+              {overlayTab === 'workspace' && (
+                <div className="grid grid-cols-2 gap-4 h-full">
+                  {/* Left Column: File Tree */}
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex flex-col space-y-2">
+                    <h4 className="font-semibold text-xs text-emerald-400 uppercase">Project File Explorer</h4>
+                    <div className="flex-1 overflow-y-auto space-y-1 text-xs">
+                      {workspaceFiles.map((file) => (
+                        <button
+                          key={file.path}
+                          onClick={async () => {
+                            setSelectedFilePath(file.path);
+                            const res = await fetch(`/api/workspace/file?filepath=${encodeURIComponent(file.path)}`);
+                            if (res.ok) {
+                              const data = await res.json();
+                              setSelectedFileContent(data.content || '');
+                            }
+                          }}
+                          className={`w-full text-left px-2.5 py-1.5 rounded flex items-center justify-between font-mono text-[11px] ${
+                            selectedFilePath === file.path ? 'bg-emerald-950 text-emerald-300 border border-emerald-800/50' : 'text-slate-300 hover:bg-slate-900'
+                          }`}
+                        >
+                          <span>{file.name}</span>
+                          {activeFileLocks[file.path] && (
+                            <span className="text-[9px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 px-1 rounded">
+                              By {activeFileLocks[file.path].last_edited_by}
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Right Column: Content Preview & Audit Log */}
+                  <div className="flex flex-col space-y-3">
+                    {/* File Content Preview */}
+                    <div className="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-3 flex flex-col font-mono text-[11px] overflow-hidden">
+                      <div className="font-semibold text-xs text-slate-300 border-b border-slate-800 pb-2 mb-2 flex items-center justify-between">
+                        <span>{selectedFilePath || 'Select a file to view content'}</span>
+                      </div>
+                      <pre className="flex-1 overflow-auto text-slate-300 leading-relaxed whitespace-pre-wrap">
+                        {selectedFileContent || '// Select a file from the explorer on the left.'}
+                      </pre>
+                    </div>
+
+                    {/* Change Attribution Audit Log */}
+                    <div className="h-36 bg-slate-950 border border-slate-800 rounded-xl p-3 flex flex-col overflow-y-auto text-xs space-y-1">
+                      <h5 className="font-semibold text-[11px] text-slate-400 uppercase">File Change Audit Log</h5>
+                      {fileAuditLog.length === 0 ? (
+                        <div className="text-slate-500 text-[10px]">No file modifications recorded yet.</div>
+                      ) : (
+                        fileAuditLog.map((log) => (
+                          <div key={log.id} className="text-[10px] text-slate-300 border-b border-slate-900 pb-1">
+                            <strong className="text-emerald-400">[{log.author}]</strong> modified <code>{log.filepath}</code> — {log.diff_snippet}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 4: MODEL HEALTH & EVALUATION */}
+              {overlayTab === 'health' && (
+                <div className="space-y-3">
+                  <h4 className="font-semibold text-xs text-amber-400 uppercase">Moderator Model Health & Evaluation Report</h4>
+                  <div className="space-y-2">
+                    {roomHealth.map((rep) => (
+                      <div key={rep.model_id} className="bg-slate-950 border border-slate-800 p-3 rounded-xl flex items-center justify-between text-xs">
+                        <div>
+                          <div className="font-semibold text-slate-200">{rep.model_name} ({rep.role})</div>
+                          <div className="text-[11px] text-slate-400">
+                            Tokens Used: {rep.tokens_used} | Turns Taken: {rep.turns_count}
+                          </div>
+                          {rep.recommendation && (
+                            <div className="text-[11px] text-amber-300 mt-1">{rep.recommendation}</div>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleKickModel(rep.model_id)}
+                            className="bg-rose-950/80 hover:bg-rose-900 text-rose-300 border border-rose-800 px-3 py-1 rounded font-medium"
+                          >
+                            Kick Model
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+            </div>
+
+            <div className="pt-3 border-t border-slate-800 flex justify-end">
+              <button onClick={() => setShowOverlay(false)} className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-1.5 rounded-xl text-xs font-medium">
+                Close Operations Menu
               </button>
             </div>
           </div>

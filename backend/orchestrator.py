@@ -157,11 +157,24 @@ class Orchestrator:
         memory_summary = self.memory_manager.get_memory_summary()
         latest_journal = self.memory_manager.get_model_latest_journal(model_id)
 
+        # Retrieve recent episodes for NAC-style thread weaving
+        episodes = self.memory_manager.get_latest_episodes(limit=3)
+        ep_summary = ""
+        if episodes:
+            ep_lines = [f"- [{e['author']}] Task ({e['action']}): {e['summary']}" for e in episodes]
+            ep_summary = f"\n\n### RECENT EPISODE CHECKPOINTS (HANDOFFS):\n" + "\n".join(ep_lines)
+
+        # Retrieve Active Task / Itinerary Item for Meetings
+        active_task = self.memory_manager.get_active_task()
+        task_context = ""
+        if active_task:
+            task_context = f"\n\n### 🎯 ACTIVE ITINERARY ITEM / MEETING AGENDA:\nTitle: {active_task['title']}\nDescription: {active_task['description']}\nPriority: {active_task['priority'].upper()}\nStatus: {active_task['status'].upper()}"
+
         journal_context = ""
         if latest_journal:
             journal_context = f"\n\n### YOUR LATEST TIMESTAMPED SELF-JOURNAL (PRE-NAP PERSPECTIVE):\n{latest_journal}"
 
-        context_prompt = f"{sys_prompt}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{journal_context}"
+        context_prompt = f"{sys_prompt}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{task_context}{journal_context}"
 
         # Check model token usage against limits
         tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)
@@ -236,7 +249,7 @@ class Orchestrator:
         }
 
         if risk == "low":
-            exec_res = self._execute_tool(tool_name, args)
+            exec_res = self._execute_tool(tool_name, args, caller_id=model_id)
             vote_req["status"] = "executed"
             vote_req["result"] = exec_res
             return vote_req
@@ -244,7 +257,7 @@ class Orchestrator:
         self.pending_tool_votes.append(vote_req)
         return vote_req
 
-    def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute_tool(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
         if tool_name == "read_file":
             return self.tool_manager.read_file(args.get("filepath", ""))
         elif tool_name == "list_files":
@@ -252,7 +265,18 @@ class Orchestrator:
         elif tool_name == "search_workspace":
             return self.tool_manager.search_workspace(args.get("query", ""))
         elif tool_name == "write_file":
-            return self.tool_manager.write_file(args.get("filepath", ""), args.get("content", ""))
+            filepath = args.get("filepath", "")
+            content = args.get("content", "")
+            res = self.tool_manager.write_file(filepath, content)
+            if res.get("success"):
+                # Track file modification attribution
+                self.memory_manager.log_file_edit(
+                    filepath=filepath,
+                    author=caller_id,
+                    action="write",
+                    diff_snippet=f"Written {res.get('bytes_written', 0)} bytes"
+                )
+            return res
         elif tool_name == "run_terminal_cmd":
             return self.tool_manager.run_terminal_cmd(args.get("command", ""))
         elif tool_name == "git_status":
@@ -267,7 +291,7 @@ class Orchestrator:
                 if action == "approve":
                     req["status"] = "approved"
                     args = modified_args or req["args"]
-                    exec_res = self._execute_tool(req["tool_name"], args)
+                    exec_res = self._execute_tool(req["tool_name"], args, caller_id=req.get("model_id", "Admin"))
                     req["status"] = "executed"
                     req["result"] = exec_res
                     return {"success": True, "executed": True, "result": exec_res}
