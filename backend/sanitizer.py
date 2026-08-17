@@ -8,18 +8,19 @@ def sanitize_message_content(content: str) -> str:
 
     cleaned = content.strip()
 
-    # Strip <think>...</think> blocks or unclosed <think> blocks
-    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL)
-    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL)
+    # Aggressively strip thinking tags <think>...</think>, <thought>...</thought>, <reasoning>...</reasoning> for Qwen, Llama, Dolphin
+    cleaned = re.sub(r"<(?:think|thought|reasoning)>.*?</(?:think|thought|reasoning)>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<(?:think|thought|reasoning)>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
 
-    # Handle orphan </think> tags where the model omitted the opening <think> tag
-    if "</think>" in cleaned:
-        parts = cleaned.split("</think>", 1)
-        cleaned = parts[1].strip()
+    # Handle orphan closing tags </think>, </thought>, </reasoning>
+    for tag in ["</think>", "</thought>", "</reasoning>"]:
+        if tag in cleaned.lower():
+            idx = cleaned.lower().rfind(tag)
+            cleaned = cleaned[idx + len(tag):].strip()
 
-    # Strip "Thinking Process: ..." or "Here's a thinking process: ..." blocks
-    cleaned = re.sub(r"(?:Thinking Process|Here's a thinking process|Thinking):.*?(?:\n\n|\n(?=[A-Z0-9]))", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub(r"^(?:Thinking Process|Here's a thinking process|Thinking):.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    # Strip "Thinking Process: ...", "Chain of thought: ...", or "Thinking: ..." blocks
+    cleaned = re.sub(r"(?:Thinking Process|Here's a thinking process|Thinking|Chain of Thought|Thought):.*?(?:\n\n|\n(?=[A-Z0-9]))", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"^(?:Thinking Process|Here's a thinking process|Thinking|Chain of Thought|Thought):.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
 
     # Strip meta-commentary role-confusion paragraphs (e.g. "Apologies for the confusion...", "The user is telling me it's my turn...", "Let me read the context again...")
     meta_patterns = [

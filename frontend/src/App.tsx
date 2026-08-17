@@ -83,6 +83,11 @@ export default function App() {
   const [isStepping, setIsStepping] = useState(false);
   const [collapsedCodeBlocks, setCollapsedCodeBlocks] = useState<Record<string, boolean>>({});
 
+  // @ Mention Autocomplete state
+  const [showMentionDropdown, setShowMentionDropdown] = useState(false);
+  const [mentionQuery, setMentionQuery] = useState('');
+  const [mentionCursorPos, setMentionCursorPos] = useState<number>(0);
+
   // New Model Form State in Settings
   const [newModelName, setNewModelName] = useState('');
   const [newModelRole, setNewModelRole] = useState('Architect');
@@ -243,11 +248,36 @@ export default function App() {
     fetchState();
   };
 
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value;
+    const cursor = e.target.selectionStart || 0;
+    setInputText(value);
+
+    // Detect @ symbol before cursor
+    const lastAt = value.lastIndexOf('@', cursor - 1);
+    if (lastAt !== -1 && !value.slice(lastAt, cursor).includes(' ')) {
+      const q = value.slice(lastAt + 1, cursor).toLowerCase();
+      setMentionQuery(q);
+      setMentionCursorPos(lastAt);
+      setShowMentionDropdown(true);
+    } else {
+      setShowMentionDropdown(false);
+    }
+  };
+
+  const handleSelectMention = (nameOrRole: string) => {
+    const before = inputText.slice(0, mentionCursorPos);
+    const after = inputText.slice(mentionCursorPos + mentionQuery.length + 1);
+    setInputText(`${before}@${nameOrRole} ${after}`);
+    setShowMentionDropdown(false);
+  };
+
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputText.trim()) return;
     const text = inputText;
     setInputText('');
+    setShowMentionDropdown(false);
 
     await fetch('/api/chat/message', {
       method: 'POST',
@@ -564,13 +594,35 @@ export default function App() {
           </div>
 
           {/* INPUT BAR & CONTROLS */}
-          <div className="p-4 bg-slate-900/80 border-t border-slate-800 backdrop-blur">
+          <div className="p-4 bg-slate-900/80 border-t border-slate-800 backdrop-blur relative">
+            {/* @ Mention Autocomplete Dropdown */}
+            {showMentionDropdown && (
+              <div className="absolute bottom-16 left-4 bg-slate-900 border border-slate-800 rounded-xl shadow-2xl p-2 z-50 w-64 space-y-1">
+                <div className="text-[10px] font-semibold text-slate-400 px-2 py-1 uppercase border-b border-slate-800">
+                  Mention Model or Role
+                </div>
+                {Object.values(models)
+                  .filter(m => m.name.toLowerCase().includes(mentionQuery) || m.role.toLowerCase().includes(mentionQuery))
+                  .map(m => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => handleSelectMention(m.name)}
+                      className="w-full text-left px-2 py-1.5 rounded-lg hover:bg-slate-800 flex items-center justify-between text-xs text-slate-200 transition"
+                    >
+                      <span className="font-semibold text-emerald-400">@{m.name}</span>
+                      <span className="text-[10px] text-slate-500">{m.role}</span>
+                    </button>
+                  ))}
+              </div>
+            )}
+
             <form onSubmit={handleSendMessage} className="flex gap-2">
               <input
                 type="text"
                 value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                placeholder="Message the room or instruct models (Admin)..."
+                onChange={handleInputChange}
+                placeholder="Message the room or instruct models (Admin)... (type @ to mention)"
                 className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500/50 text-slate-100 placeholder-slate-500 transition"
               />
               <button
@@ -615,7 +667,27 @@ export default function App() {
               {Object.values(models).map((m) => {
                 const st = modelStatuses[m.id] || { status: 'online', tok_per_sec: 0, error: null };
                 const isError = st.status === 'error' || !!st.error;
+                const isUnloaded = st.status === 'offline' || !m.enabled;
                 const tokPerSec = st.tok_per_sec || 0;
+
+                // Status text & icon logic
+                let statusBadgeText = 'Live / In Chat';
+                let statusColorClass = 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]';
+                let statusBgBox = 'bg-emerald-950/40 border-emerald-800/40 text-emerald-400';
+
+                if (isError) {
+                  statusBadgeText = 'Disconnected / Error';
+                  statusColorClass = 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.6)]';
+                  statusBgBox = 'bg-rose-950/40 border-rose-800/40 text-rose-400';
+                } else if (isUnloaded) {
+                  statusBadgeText = 'Asleep / Unloaded';
+                  statusColorClass = 'bg-slate-600';
+                  statusBgBox = 'bg-slate-900 border-slate-800 text-slate-500';
+                } else if (m.live_status && m.live_status !== 'Idle / Live in Chat') {
+                  statusBadgeText = m.live_status;
+                  statusColorClass = 'bg-cyan-400 animate-pulse';
+                  statusBgBox = 'bg-cyan-950/40 border-cyan-800/40 text-cyan-300';
+                }
 
                 return (
                   <div
@@ -625,21 +697,10 @@ export default function App() {
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
                         {/* Status Icon Indicator */}
-                        {isError ? (
-                          <button
-                            type="button"
-                            onClick={() => setSelectedErrorModel(m.id)}
-                            className="text-rose-400 hover:text-rose-300 transition"
-                            title={`Error: ${st.error || 'Click for details'}`}
-                          >
-                            <AlertTriangle className="w-4 h-4 fill-rose-500/20 stroke-rose-400" />
-                          </button>
-                        ) : (
-                          <div
-                            className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]"
-                            title="Online & Ready"
-                          />
-                        )}
+                        <div
+                          className={`w-2.5 h-2.5 rounded-full ${statusColorClass}`}
+                          title={statusBadgeText}
+                        />
 
                         <span className="font-semibold text-sm text-slate-100">{m.name}</span>
 
@@ -677,9 +738,9 @@ export default function App() {
                     </div>
 
                     {/* Live Truth-Backed Status Indicator (Discord Style) */}
-                    <div className="text-[11px] text-emerald-400 font-medium flex items-center gap-1 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded-md">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
-                      <span className="truncate">{m.live_status || 'Idle / Live in Chat'}</span>
+                    <div className={`text-[11px] font-medium flex items-center gap-1.5 px-2 py-0.5 rounded-md border ${statusBgBox}`}>
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColorClass}`} />
+                      <span className="truncate">{statusBadgeText}</span>
                     </div>
 
                     <div className="text-[11px] text-slate-500 truncate" title={m.gguf_path || m.model_name}>

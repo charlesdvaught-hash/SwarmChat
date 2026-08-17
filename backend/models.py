@@ -79,21 +79,34 @@ class ModelManager:
         except ImportError:
             return False
 
-    def install_llama_cpp(self) -> Dict[str, Any]:
-        """Attempts 1-click pip installation of llama-cpp-python."""
+    def install_llama_cpp(self, use_cuda_wheels: bool = True) -> Dict[str, Any]:
+        """Attempts 1-click installation of llama-cpp-python, preferring official pre-built CUDA wheels if GPU is present."""
         hw = self.get_hardware_info()
-        cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python"]
         env = os.environ.copy()
 
-        # Enable CUDA build flags if NVIDIA GPU is detected
-        if hw.get("gpu_name"):
-            env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
+        # If NVIDIA GPU is detected and pre-built CUDA wheel installation requested
+        if hw.get("gpu_name") and use_cuda_wheels:
+            # Install pre-compiled wheel index for CUDA support
+            cmd = [
+                sys.executable, "-m", "pip", "install", "llama-cpp-python",
+                "--extra-index-url", "https://abetlen.github.io/llama-cpp-python/wheels/cu121",
+                "--no-cache-dir", "--force-reinstall"
+            ]
+        else:
+            cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python"]
+            if hw.get("gpu_name"):
+                env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
 
         try:
-            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180)
             if res.returncode == 0:
-                return {"success": True, "message": "Successfully installed llama-cpp-python engine."}
+                return {"success": True, "message": "Successfully installed llama-cpp-python engine (CUDA wheel / build)." }
             else:
+                # Fallback to standard pip install if wheel url failed
+                fallback_cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python"]
+                res2 = subprocess.run(fallback_cmd, env=env, capture_output=True, text=True, timeout=180)
+                if res2.returncode == 0:
+                    return {"success": True, "message": "Successfully installed standard llama-cpp-python engine."}
                 return {"success": False, "error": f"Installation failed: {res.stderr or res.stdout}"}
         except Exception as e:
             return {"success": False, "error": f"Error during engine installation: {str(e)}"}
@@ -115,7 +128,7 @@ class ModelManager:
             except Exception:
                 pass
 
-    def load_gguf_model(self, model_id: str, gguf_path: str, max_tokens: int = 2048, mmproj_path: Optional[str] = None) -> Optional[Any]:
+    def load_gguf_model(self, model_id: str, gguf_path: str, max_tokens: int = 2048, mmproj_path: Optional[str] = None, force_device: Optional[str] = None) -> Optional[Any]:
         if not self.is_llama_cpp_installed():
             self.update_model_status(
                 model_id,
@@ -140,8 +153,15 @@ class ModelManager:
         import llama_cpp
         hw = self.get_hardware_info()
         # Decide VRAM vs RAM allocation
-        n_gpu_layers = -1 if hw["vram_free_gb"] > 1.0 else 0
-        location = "VRAM" if n_gpu_layers == -1 else "RAM"
+        if force_device == "gpu":
+            n_gpu_layers = -1
+            location = "VRAM"
+        elif force_device == "cpu":
+            n_gpu_layers = 0
+            location = "RAM"
+        else:
+            n_gpu_layers = -1 if hw["vram_free_gb"] > 1.0 else 0
+            location = "VRAM" if n_gpu_layers == -1 else "RAM"
 
         # Resolve mmproj (clip/vision projector) if provided
         chat_handler = None

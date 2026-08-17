@@ -1,7 +1,7 @@
 {
   "project_id": "default_project",
   "phase": "execution",
-  "phase_last_changed": 1787003310.088283,
+  "phase_last_changed": 1787009703.22654,
   "shared_entries": [
     {
       "id": "mem_1786995622988",
@@ -110,6 +110,132 @@
       "timestamp": 1787003310.0882885,
       "author": "System State Machine",
       "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787009257270",
+      "timestamp": 1787009257.2706172,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787009257272",
+      "timestamp": 1787009257.2727647,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787009257273",
+      "timestamp": 1787009257.2736733,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787009294651",
+      "timestamp": 1787009294.651554,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787009294653",
+      "timestamp": 1787009294.6534803,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787009294654",
+      "timestamp": 1787009294.6544943,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787009349143",
+      "timestamp": 1787009349.143288,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787009349145",
+      "timestamp": 1787009349.145559,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787009349146",
+      "timestamp": 1787009349.1467216,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787009409022",
+      "timestamp": 1787009409.0223875,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787009409024",
+      "timestamp": 1787009409.0249634,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787009409026",
+      "timestamp": 1787009409.02624,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787009558852",
+      "timestamp": 1787009558.8527994,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787009558855",
+      "timestamp": 1787009558.8552825,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787009558856",
+      "timestamp": 1787009558.8564563,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787009635084",
+      "timestamp": 1787009635.084884,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787009635087",
+      "timestamp": 1787009635.0874348,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787009635088",
+      "timestamp": 1787009635.088443,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787009703222",
+      "timestamp": 1787009703.222352,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787009703225",
+      "timestamp": 1787009703.2250204,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787009703226",
+      "timestamp": 1787009703.2265463,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
     }
   ],
   "model_journals": {},
@@ -164,17 +290,73 @@
       "author": "model_coder",
       "action": "write",
       "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787009257338",
+      "timestamp": 1787009257.3388433,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787009294729",
+      "timestamp": 1787009294.7295623,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787009349218",
+      "timestamp": 1787009349.2188582,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787009409102",
+      "timestamp": 1787009409.1026876,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787009558933",
+      "timestamp": 1787009558.9337165,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787009635156",
+      "timestamp": 1787009635.1564806,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787009703301",
+      "timestamp": 1787009703.301817,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
     }
   ],
   "active_file_locks": {
     "test.txt": {
       "last_edited_by": "model_coder",
-      "last_edited_at": 1787003310.1495275,
+      "last_edited_at": 1787009703.3018222,
       "status": "edited"
     }
   },
   "tokens_used": {
-    "model_architect": 42
+    "model_architect": 91
   },
   "session_id": "default_session"
 }
