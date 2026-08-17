@@ -1,7 +1,7 @@
 {
   "project_id": "default_project",
   "phase": "execution",
-  "phase_last_changed": 1786997323.5122387,
+  "phase_last_changed": 1786999079.5342062,
   "shared_entries": [
     {
       "id": "mem_1786995622988",
@@ -38,6 +38,42 @@
       "timestamp": 1786997323.5122435,
       "author": "System State Machine",
       "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1786998927640",
+      "timestamp": 1786998927.6409638,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1786998927643",
+      "timestamp": 1786998927.6431823,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1786998927643",
+      "timestamp": 1786998927.6438284,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1786999079531",
+      "timestamp": 1786999079.5318491,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1786999079533",
+      "timestamp": 1786999079.533333,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1786999079534",
+      "timestamp": 1786999079.5342112,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
     }
   ],
   "model_journals": {},
@@ -59,17 +95,33 @@
       "author": "model_coder",
       "action": "write",
       "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1786998927755",
+      "timestamp": 1786998927.7557979,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1786999079611",
+      "timestamp": 1786999079.611132,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
     }
   ],
   "active_file_locks": {
     "test.txt": {
       "last_edited_by": "model_coder",
-      "last_edited_at": 1786997323.60841,
+      "last_edited_at": 1786999079.6111357,
       "status": "edited"
     }
   },
   "tokens_used": {
-    "model_architect": 14
+    "model_architect": 28
   },
   "session_id": "default_session"
 }
