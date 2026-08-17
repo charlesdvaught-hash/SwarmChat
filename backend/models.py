@@ -10,6 +10,102 @@ class ModelManager:
     def __init__(self, ollama_host: str = "http://localhost:11434"):
         self.ollama_host = ollama_host
         self.loaded_models: Dict[str, Dict[str, Any]] = {}
+        self.model_statuses: Dict[str, Dict[str, Any]] = {}
+        self.gguf_instances: Dict[str, Any] = {}
+
+    def is_llama_cpp_installed(self) -> bool:
+        try:
+            import llama_cpp
+            return True
+        except ImportError:
+            return False
+
+    def install_llama_cpp(self) -> Dict[str, Any]:
+        """Attempts 1-click pip installation of llama-cpp-python."""
+        hw = self.get_hardware_info()
+        cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python"]
+        env = os.environ.copy()
+
+        # Enable CUDA build flags if NVIDIA GPU is detected
+        if hw.get("gpu_name"):
+            env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
+
+        try:
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
+            if res.returncode == 0:
+                return {"success": True, "message": "Successfully installed llama-cpp-python engine."}
+            else:
+                return {"success": False, "error": f"Installation failed: {res.stderr or res.stdout}"}
+        except Exception as e:
+            return {"success": False, "error": f"Error during engine installation: {str(e)}"}
+
+    def update_model_status(self, model_id: str, status: str, error: Optional[str] = None, tok_per_sec: Optional[float] = None, vram_used_gb: float = 0.0, location: str = "RAM"):
+        current = self.model_statuses.get(model_id, {})
+        self.model_statuses[model_id] = {
+            "status": status,  # "online", "offline", "error"
+            "error": error,
+            "tok_per_sec": tok_per_sec if tok_per_sec is not None else current.get("tok_per_sec", 0.0),
+            "vram_used_gb": vram_used_gb,
+            "location": location  # "VRAM", "RAM", or "Cloud"
+        }
+
+    def unload_gguf_model(self, model_id: str):
+        if model_id in self.gguf_instances:
+            try:
+                del self.gguf_instances[model_id]
+            except Exception:
+                pass
+
+    def load_gguf_model(self, model_id: str, gguf_path: str, max_tokens: int = 2048) -> Optional[Any]:
+        if not self.is_llama_cpp_installed():
+            self.update_model_status(
+                model_id,
+                status="error",
+                error="llama-cpp-python engine not installed. Use 1-click installer in Settings."
+            )
+            return None
+
+        if not gguf_path or not os.path.exists(gguf_path):
+            self.update_model_status(
+                model_id,
+                status="error",
+                error=f"GGUF file not found at: '{gguf_path}'"
+            )
+            return None
+
+        if model_id in self.gguf_instances:
+            return self.gguf_instances[model_id]
+
+        import llama_cpp
+        hw = self.get_hardware_info()
+        # Decide VRAM vs RAM allocation
+        n_gpu_layers = -1 if hw["vram_free_gb"] > 1.0 else 0
+        location = "VRAM" if n_gpu_layers == -1 else "RAM"
+
+        try:
+            llm = llama_cpp.Llama(
+                model_path=gguf_path,
+                n_ctx=max_tokens,
+                n_gpu_layers=n_gpu_layers,
+                verbose=False
+            )
+            self.gguf_instances[model_id] = llm
+            file_size_gb = round(os.path.getsize(gguf_path) / (1024 ** 3), 2)
+            self.update_model_status(
+                model_id,
+                status="online",
+                error=None,
+                vram_used_gb=file_size_gb if location == "VRAM" else 0.0,
+                location=location
+            )
+            return llm
+        except Exception as e:
+            self.update_model_status(
+                model_id,
+                status="error",
+                error=f"Failed to load GGUF model: {str(e)}"
+            )
+            return None
 
     def get_hardware_info(self) -> Dict[str, Any]:
         mem = psutil.virtual_memory()
@@ -129,7 +225,42 @@ class ModelManager:
             return f"[{model_config.get('name', 'Model')} via Cloud-{provider}]: Processed context for '{last_user_msg[:40]}...'."
 
         elif provider == "gguf_local":
-            return f"[{model_config.get('name', 'Model')} (GGUF)]: Evaluated task. High efficiency execution ready."
+            import time
+            model_id = model_config.get("id", "gguf_model")
+            gguf_path = model_config.get("gguf_path") or model_config.get("model_name", "")
+            max_tokens = model_config.get("max_context_tokens", 2048)
+
+            llm = self.load_gguf_model(model_id, gguf_path, max_tokens)
+            if not llm:
+                error_msg = self.model_statuses.get(model_id, {}).get("error", "Unknown GGUF loading error")
+                return f"[{model_config.get('name', 'Model')} Error]: {error_msg}"
+
+            try:
+                start_time = time.time()
+                # Format prompt for llama_cpp chat completion or prompt format
+                response = llm.create_chat_completion(
+                    messages=full_messages,
+                    temperature=temperature,
+                    max_tokens=512
+                )
+                elapsed = time.time() - start_time
+                content = response["choices"][0]["message"]["content"]
+
+                # Calculate speed (tok/sec)
+                completion_tokens = response.get("usage", {}).get("completion_tokens", len(content.split()))
+                tok_per_sec = round(completion_tokens / max(elapsed, 0.001), 1)
+
+                self.update_model_status(
+                    model_id,
+                    status="online",
+                    error=None,
+                    tok_per_sec=tok_per_sec
+                )
+                return content
+            except Exception as e:
+                err_str = f"GGUF inference error: {str(e)}"
+                self.update_model_status(model_id, status="error", error=err_str)
+                return f"[{model_config.get('name', 'Model')} GGUF Error]: {err_str}"
 
         else:
             return f"[{model_config.get('name', 'Model')}]: Prepared perspective based on shared context."

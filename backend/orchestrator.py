@@ -1,4 +1,6 @@
 import time
+import random
+import asyncio
 from typing import Dict, Any, List, Optional
 from backend.models import ModelManager
 from backend.prompts import get_system_prompt
@@ -15,6 +17,10 @@ class Orchestrator:
         self.voting_threshold = "majority"
         self.respond_immediately_to_at = True
         self.moderator_model_id = "model_architect"
+
+        self.loop_active = False
+        self.tie_counters: Dict[str, int] = {}
+        self.last_speaker_id: Optional[str] = None
 
         # Known models library (persisted across room additions/removals)
         self.known_models: Dict[str, Dict[str, Any]] = {
@@ -127,20 +133,36 @@ class Orchestrator:
         return msg
 
     def get_next_speaker(self, last_speaker_id: Optional[str] = None) -> Optional[str]:
-        active_models = [m_id for m_id, m in self.models.items() if m["enabled"] and m["status"] == "active"]
+        active_models = [m_id for m_id, m in self.models.items() if m.get("enabled", True)]
         if not active_models:
             return None
 
-        if self.turn_mode == "round_robin":
-            if not last_speaker_id or last_speaker_id not in active_models:
-                return active_models[0]
-            idx = active_models.index(last_speaker_id)
-            return active_models[(idx + 1) % len(active_models)]
+        # Check safety rule: Every 15 messages, ensure any model that hasn't spoken gets a turn
+        if len(self.chat_history) >= 15:
+            last_15 = self.chat_history[-15:]
+            spoken_ids = {m.get("model_id") for m in last_15 if m.get("model_id")}
+            unspoken = [m_id for m_id in active_models if m_id not in spoken_ids]
+            if unspoken:
+                return unspoken[0]
 
-        elif self.turn_mode == "moderator_controlled":
-            return self.moderator_model_id if self.moderator_model_id in active_models else active_models[0]
+        # Context-based selection: check if last message @mentions a specific model name/role
+        if self.chat_history:
+            last_msg = self.chat_history[-1]["content"].lower()
+            for m_id in active_models:
+                m_cfg = self.models[m_id]
+                if f"@{m_cfg['name'].lower()}" in last_msg or f"@{m_cfg['role'].lower()}" in last_msg:
+                    return m_id
 
-        return None
+        # Fallback to round-robin or stalling resolution (pick random eligible speaker who didn't speak last)
+        effective_last = last_speaker_id or self.last_speaker_id
+        if effective_last and effective_last in active_models and len(active_models) > 1:
+            candidates = [m_id for m_id in active_models if m_id != effective_last]
+            if self.turn_mode == "round_robin":
+                idx = active_models.index(effective_last)
+                return active_models[(idx + 1) % len(active_models)]
+            return random.choice(candidates)
+
+        return active_models[0]
 
     async def step_model_turn(self, model_id: str) -> Dict[str, Any]:
         model_cfg = self.models.get(model_id)
@@ -219,7 +241,50 @@ class Orchestrator:
             model_id=model_id
         )
 
+        self.last_speaker_id = model_id
         return msg
+
+    async def run_autonomous_loop(self, max_turns: int = 5):
+        if self.loop_active:
+            return
+        self.loop_active = True
+        try:
+            turns = 0
+            while turns < max_turns and self.loop_active:
+                next_speaker = self.get_next_speaker(self.last_speaker_id)
+                if not next_speaker:
+                    break
+
+                # Manage VRAM allocation prior to turn (ensure Moderator gets priority if VRAM is tight)
+                self.manage_vram_allocation(next_speaker)
+
+                res = await self.step_model_turn(next_speaker)
+                turns += 1
+
+                # If model indicated consensus / execution readiness or requested pause, pause loop
+                msg_content = res.get("content", "")
+                if "[READY_FOR_EXECUTION]" in msg_content or "CONSENSUS_REACHED" in msg_content:
+                    break
+                await asyncio.sleep(0.5)
+        finally:
+            self.loop_active = False
+
+    def manage_vram_allocation(self, active_speaker_id: str):
+        """Prioritizes VRAM for the Moderator model and active speaker, offloading other GGUF models to RAM if tight."""
+        hw = self.model_manager.get_hardware_info()
+        if hw.get("vram_free_gb", 0) < 1.0:
+            # Unload any GGUF instances that are not the Moderator and not the active speaker
+            for m_id, m_cfg in list(self.models.items()):
+                if m_cfg.get("provider") == "gguf_local":
+                    if m_id != self.moderator_model_id and m_id != active_speaker_id:
+                        self.model_manager.unload_gguf_model(m_id)
+                        self.model_manager.update_model_status(
+                            m_id,
+                            status="online",
+                            error=None,
+                            vram_used_gb=0.0,
+                            location="RAM"
+                        )
 
     def propose_tool_call(self, model_id: str, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         risk = self.tool_manager.classify_tool_risk(tool_name)
