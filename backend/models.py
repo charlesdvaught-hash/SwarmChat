@@ -12,6 +12,65 @@ class ModelManager:
         self.loaded_models: Dict[str, Dict[str, Any]] = {}
         self.model_statuses: Dict[str, Dict[str, Any]] = {}
         self.gguf_instances: Dict[str, Any] = {}
+        self.custom_search_paths: List[str] = []
+
+    def add_search_path(self, path: str):
+        if path and path not in self.custom_search_paths:
+            self.custom_search_paths.append(os.path.abspath(path))
+
+    def get_search_paths(self) -> List[str]:
+        paths = [
+            os.path.abspath("."),
+            os.path.abspath("models"),
+            os.path.expanduser("~/Downloads"),
+            os.path.expanduser("~/models"),
+            os.path.expanduser("~/.cache/lm-studio/models"),
+        ]
+        if os.name == "nt":
+            paths.append("C:\\models")
+        else:
+            paths.append("/models")
+
+        for cp in self.custom_search_paths:
+            if cp not in paths:
+                paths.append(cp)
+        return [p for p in paths if os.path.exists(p)]
+
+    def resolve_gguf_path(self, raw_path: Optional[str]) -> Optional[str]:
+        if not raw_path or not raw_path.strip():
+            return None
+
+        raw_path = raw_path.strip()
+
+        # 1. Direct path check
+        if os.path.exists(raw_path) and os.path.isfile(raw_path):
+            return os.path.abspath(raw_path)
+
+        basename = os.path.basename(raw_path)
+        search_dirs = self.get_search_paths()
+
+        # 2. Search in search_dirs for direct join or basename join
+        for sdir in search_dirs:
+            candidate1 = os.path.join(sdir, raw_path)
+            if os.path.exists(candidate1) and os.path.isfile(candidate1):
+                return os.path.abspath(candidate1)
+
+            candidate2 = os.path.join(sdir, basename)
+            if os.path.exists(candidate2) and os.path.isfile(candidate2):
+                return os.path.abspath(candidate2)
+
+        # 3. Case-insensitive basename search in search_dirs
+        for sdir in search_dirs:
+            try:
+                for entry in os.listdir(sdir):
+                    if entry.lower() == basename.lower():
+                        full = os.path.join(sdir, entry)
+                        if os.path.isfile(full):
+                            return os.path.abspath(full)
+            except Exception:
+                pass
+
+        return None
 
     def is_llama_cpp_installed(self) -> bool:
         try:
@@ -56,7 +115,7 @@ class ModelManager:
             except Exception:
                 pass
 
-    def load_gguf_model(self, model_id: str, gguf_path: str, max_tokens: int = 2048) -> Optional[Any]:
+    def load_gguf_model(self, model_id: str, gguf_path: str, max_tokens: int = 2048, mmproj_path: Optional[str] = None) -> Optional[Any]:
         if not self.is_llama_cpp_installed():
             self.update_model_status(
                 model_id,
@@ -65,11 +124,13 @@ class ModelManager:
             )
             return None
 
-        if not gguf_path or not os.path.exists(gguf_path):
+        resolved_gguf = self.resolve_gguf_path(gguf_path)
+        if not resolved_gguf:
+            searched = ", ".join(self.get_search_paths())
             self.update_model_status(
                 model_id,
                 status="error",
-                error=f"GGUF file not found at: '{gguf_path}'"
+                error=f"GGUF file not found at: '{gguf_path}'. Searched directories: [{searched}]"
             )
             return None
 
@@ -82,15 +143,33 @@ class ModelManager:
         n_gpu_layers = -1 if hw["vram_free_gb"] > 1.0 else 0
         location = "VRAM" if n_gpu_layers == -1 else "RAM"
 
+        # Resolve mmproj (clip/vision projector) if provided
+        chat_handler = None
+        resolved_mmproj = self.resolve_gguf_path(mmproj_path) if mmproj_path else None
+        if resolved_mmproj:
+            try:
+                from llama_cpp.llama_chat_handler import Llava15ChatHandler
+                chat_handler = Llava15ChatHandler(clip_model_path=resolved_mmproj)
+            except Exception:
+                try:
+                    from llama_cpp.llama_chat_handler import NanoLlavaChatHandler
+                    chat_handler = NanoLlavaChatHandler(clip_model_path=resolved_mmproj)
+                except Exception:
+                    pass
+
         try:
-            llm = llama_cpp.Llama(
-                model_path=gguf_path,
-                n_ctx=max_tokens,
-                n_gpu_layers=n_gpu_layers,
-                verbose=False
-            )
+            kwargs = {
+                "model_path": resolved_gguf,
+                "n_ctx": max_tokens,
+                "n_gpu_layers": n_gpu_layers,
+                "verbose": False
+            }
+            if chat_handler:
+                kwargs["chat_handler"] = chat_handler
+
+            llm = llama_cpp.Llama(**kwargs)
             self.gguf_instances[model_id] = llm
-            file_size_gb = round(os.path.getsize(gguf_path) / (1024 ** 3), 2)
+            file_size_gb = round(os.path.getsize(resolved_gguf) / (1024 ** 3), 2)
             self.update_model_status(
                 model_id,
                 status="online",
@@ -228,9 +307,10 @@ class ModelManager:
             import time
             model_id = model_config.get("id", "gguf_model")
             gguf_path = model_config.get("gguf_path") or model_config.get("model_name", "")
+            mmproj_path = model_config.get("mmproj_path") or model_config.get("clip_model_path", "")
             max_tokens = model_config.get("max_context_tokens", 2048)
 
-            llm = self.load_gguf_model(model_id, gguf_path, max_tokens)
+            llm = self.load_gguf_model(model_id, gguf_path, max_tokens, mmproj_path=mmproj_path)
             if not llm:
                 error_msg = self.model_statuses.get(model_id, {}).get("error", "Unknown GGUF loading error")
                 return f"[{model_config.get('name', 'Model')} Error]: {error_msg}"

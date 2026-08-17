@@ -224,6 +224,22 @@ class Orchestrator:
         elif "[REQUEST_DISCUSSION]" in response_text:
             self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
 
+        if "[SEARCH_HF:" in response_text:
+            try:
+                start = response_text.find("[SEARCH_HF:") + len("[SEARCH_HF:")
+                end = response_text.find("]", start)
+                if end != -1:
+                    query = response_text[start:end].strip()
+                    hf_res = await self.tool_manager.search_huggingface(query)
+                    m_list = hf_res.get("models", [])
+                    res_summary = ", ".join([m["model_id"] for m in m_list[:3]])
+                    self.memory_manager.add_entry(
+                        model_cfg["name"],
+                        f"HuggingFace search for '{query}' returned candidate models: {res_summary}"
+                    )
+            except Exception:
+                pass
+
         if "[JOURNAL:" in response_text:
             try:
                 start = response_text.find("[JOURNAL:") + len("[JOURNAL:")
@@ -314,7 +330,7 @@ class Orchestrator:
         }
 
         if risk == "low":
-            exec_res = self._execute_tool(tool_name, args, caller_id=model_id)
+            exec_res = self._execute_tool_sync(tool_name, args, caller_id=model_id)
             vote_req["status"] = "executed"
             vote_req["result"] = exec_res
             return vote_req
@@ -322,13 +338,30 @@ class Orchestrator:
         self.pending_tool_votes.append(vote_req)
         return vote_req
 
-    def _execute_tool(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
+    def _execute_tool_sync(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Run in existing event loop
+                import nest_asyncio
+                nest_asyncio.apply()
+                return loop.run_until_complete(self._execute_tool_async(tool_name, args, caller_id))
+            else:
+                return loop.run_until_complete(self._execute_tool_async(tool_name, args, caller_id))
+        except Exception:
+            return asyncio.run(self._execute_tool_async(tool_name, args, caller_id))
+
+    async def _execute_tool_async(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
         if tool_name == "read_file":
             return self.tool_manager.read_file(args.get("filepath", ""))
         elif tool_name == "list_files":
             return self.tool_manager.list_files(args.get("dir", "."))
         elif tool_name == "search_workspace":
             return self.tool_manager.search_workspace(args.get("query", ""))
+        elif tool_name == "internet_search":
+            return await self.tool_manager.internet_search(args.get("query", ""), domain_filter=args.get("domain_filter"))
+        elif tool_name == "search_huggingface":
+            return await self.tool_manager.search_huggingface(args.get("query", ""), limit=args.get("limit", 5))
         elif tool_name == "write_file":
             filepath = args.get("filepath", "")
             content = args.get("content", "")
@@ -356,7 +389,7 @@ class Orchestrator:
                 if action == "approve":
                     req["status"] = "approved"
                     args = modified_args or req["args"]
-                    exec_res = self._execute_tool(req["tool_name"], args, caller_id=req.get("model_id", "Admin"))
+                    exec_res = self._execute_tool_sync(req["tool_name"], args, caller_id=req.get("model_id", "Admin"))
                     req["status"] = "executed"
                     req["result"] = exec_res
                     return {"success": True, "executed": True, "result": exec_res}

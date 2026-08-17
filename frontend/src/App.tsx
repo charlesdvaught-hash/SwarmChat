@@ -88,8 +88,28 @@ export default function App() {
   const [newModelProvider, setNewModelProvider] = useState('gguf_local');
   const [newModelNameOrTag, setNewModelNameOrTag] = useState('');
   const [newGgufPath, setNewGgufPath] = useState('');
+  const [newMmprojPath, setNewMmprojPath] = useState('');
   const [newApiKey, setNewApiKey] = useState('');
   const [newIsModerator, setNewIsModerator] = useState(false);
+
+  // Path Validation & FS Browser State
+  const [pathValidationMsg, setPathValidationMsg] = useState<{ valid: boolean; message: string; size_gb?: number } | null>(null);
+  const [showFsBrowser, setShowFsBrowser] = useState(false);
+  const [fsTargetField, setFsTargetField] = useState<'gguf' | 'mmproj' | 'search_path'>('gguf');
+  const [fsCurrentPath, setFsCurrentPath] = useState('');
+  const [fsParentPath, setFsParentPath] = useState<string | null>(null);
+  const [fsDirs, setFsDirs] = useState<any[]>([]);
+  const [fsFiles, setFsFiles] = useState<any[]>([]);
+
+  // Search Paths State
+  const [searchPaths, setSearchPaths] = useState<string[]>([]);
+  const [customSearchPathInput, setCustomSearchPathInput] = useState('');
+
+  // HuggingFace Model Search / Hiring State
+  const [hfQuery, setHfQuery] = useState('');
+  const [hfResults, setHfResults] = useState<any[]>([]);
+  const [isSearchingHf, setIsSearchingHf] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<'models' | 'browse_hf' | 'search_paths'>('models');
 
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -131,8 +151,64 @@ export default function App() {
         const hdata = await healthRes.json();
         setRoomHealth(hdata.reports || []);
       }
+
+      const pathsRes = await fetch('/api/models/search_paths');
+      if (pathsRes.ok) {
+        const pdata = await pathsRes.json();
+        setSearchPaths(pdata.search_paths || []);
+      }
     } catch (e) {
       console.error('Fetch state error:', e);
+    }
+  };
+
+  const handleBrowseFs = async (targetPath?: string) => {
+    try {
+      const url = targetPath ? `/api/fs/browse?path=${encodeURIComponent(targetPath)}` : '/api/fs/browse';
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        setFsCurrentPath(data.current_path);
+        setFsParentPath(data.parent_path);
+        setFsDirs(data.directories || []);
+        setFsFiles(data.files || []);
+      }
+    } catch (e) {
+      console.error('Browse filesystem error:', e);
+    }
+  };
+
+  const handleValidatePath = async (p: string, mmP?: string) => {
+    if (!p) return;
+    try {
+      const res = await fetch('/api/fs/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: p, mmproj_path: mmP })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPathValidationMsg({ valid: data.valid, message: data.message, size_gb: data.file_size_gb });
+      }
+    } catch (e) {
+      console.error('Validate path error:', e);
+    }
+  };
+
+  const handleSearchHf = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!hfQuery.trim()) return;
+    setIsSearchingHf(true);
+    try {
+      const res = await fetch(`/api/tools/search_hf?query=${encodeURIComponent(hfQuery)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setHfResults(data.models || []);
+      }
+    } catch (e) {
+      console.error('HF Search error:', e);
+    } finally {
+      setIsSearchingHf(false);
     }
   };
 
@@ -252,6 +328,7 @@ export default function App() {
       provider: newModelProvider,
       model_name: newModelNameOrTag || (newModelProvider === 'gguf_local' ? newGgufPath : 'llama3.2:1b'),
       gguf_path: newGgufPath,
+      mmproj_path: newMmprojPath,
       api_key: newApiKey,
       enabled: true,
       is_moderator: newIsModerator,
@@ -266,7 +343,9 @@ export default function App() {
 
     setNewModelName('');
     setNewGgufPath('');
+    setNewMmprojPath('');
     setNewApiKey('');
+    setPathValidationMsg(null);
     fetchState();
   };
 
@@ -665,6 +744,97 @@ export default function App() {
         </div>
       )}
 
+      {/* --- SERVER FILESYSTEM BROWSER MODAL --- */}
+      {showFsBrowser && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-4 z-[60]">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full p-6 shadow-2xl flex flex-col h-[75vh]">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3 mb-3">
+              <div className="flex items-center gap-2 font-bold text-slate-100 text-base">
+                <FolderOpen className="w-5 h-5 text-amber-400" />
+                <span>Server Filesystem Explorer</span>
+              </div>
+              <button onClick={() => setShowFsBrowser(false)} className="text-slate-400 hover:text-slate-200">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-slate-950 p-2.5 rounded-xl border border-slate-800 font-mono text-xs text-slate-300 mb-3 flex items-center justify-between">
+              <span className="truncate">Path: {fsCurrentPath}</span>
+              {fsParentPath && (
+                <button
+                  onClick={() => handleBrowseFs(fsParentPath)}
+                  className="bg-slate-800 hover:bg-slate-700 text-cyan-300 px-2.5 py-1 rounded text-[11px] font-sans font-medium"
+                >
+                  ⬆️ Parent Dir
+                </button>
+              )}
+            </div>
+
+            <div className="flex-1 overflow-y-auto space-y-1.5 pr-2 text-xs">
+              {/* Directories */}
+              {fsDirs.map((d) => (
+                <button
+                  key={d.path}
+                  onClick={() => handleBrowseFs(d.path)}
+                  className="w-full text-left bg-slate-950 hover:bg-slate-800/80 border border-slate-800/80 p-2.5 rounded-xl flex items-center gap-2 text-slate-200 transition group"
+                >
+                  <FolderOpen className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span className="font-semibold text-slate-200 group-hover:text-amber-300">{d.name}</span>
+                </button>
+              ))}
+
+              {/* Files */}
+              {fsFiles.map((f) => (
+                <div
+                  key={f.path}
+                  className={`p-2.5 rounded-xl border flex items-center justify-between transition ${
+                    f.is_gguf
+                      ? 'bg-emerald-950/20 border-emerald-800/50 text-emerald-200'
+                      : f.is_mmproj
+                      ? 'bg-purple-950/20 border-purple-800/50 text-purple-200'
+                      : 'bg-slate-950 border-slate-800/60 text-slate-400'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 truncate">
+                    <FileText className={`w-4 h-4 shrink-0 ${f.is_gguf ? 'text-emerald-400' : f.is_mmproj ? 'text-purple-400' : 'text-slate-500'}`} />
+                    <span className="font-mono text-[11px] truncate">{f.name}</span>
+                    <span className="text-[10px] text-slate-500">({f.size_mb} MB)</span>
+                  </div>
+
+                  <button
+                    onClick={() => {
+                      if (fsTargetField === 'gguf') {
+                        setNewGgufPath(f.path);
+                        if (!newModelName) {
+                          const cleanName = f.name.replace(/\.gguf$/i, '').replace(/[-_]/g, ' ');
+                          setNewModelName(cleanName);
+                        }
+                        handleValidatePath(f.path, newMmprojPath);
+                      } else if (fsTargetField === 'mmproj') {
+                        setNewMmprojPath(f.path);
+                        handleValidatePath(newGgufPath, f.path);
+                      } else if (fsTargetField === 'search_path') {
+                        setCustomSearchPathInput(f.path);
+                      }
+                      setShowFsBrowser(false);
+                    }}
+                    className="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1 rounded-lg text-xs font-medium shrink-0 shadow transition"
+                  >
+                    Select Path
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="pt-3 border-t border-slate-800 flex justify-end">
+              <button onClick={() => setShowFsBrowser(false)} className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-1.5 rounded-xl text-xs">
+                Close Explorer
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* --- ALL-IN-ONE SETTINGS & MODEL PICKER MODAL --- */}
       {showSetup && (
         <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
@@ -679,180 +849,375 @@ export default function App() {
               </button>
             </div>
 
-            {/* SECTION 1: Add New Model / GGUF File Picker */}
-            <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
-              <h4 className="font-semibold text-sm text-emerald-400 flex items-center gap-2">
-                <Plus className="w-4 h-4" />
-                <span>Add Model / Local GGUF Participant</span>
-              </h4>
-
-              <form onSubmit={handleAddModelSubmit} className="space-y-3 text-xs">
-                <div>
-                  <label className="block text-slate-300 font-medium mb-1">Model Provider Type</label>
-                  <select
-                    value={newModelProvider}
-                    onChange={(e) => setNewModelProvider(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100 focus:outline-none focus:border-emerald-500"
-                  >
-                    <option value="gguf_local">📁 Local GGUF File (.gguf on hard drive)</option>
-                    <option value="ollama">🦙 Ollama Local Model</option>
-                    <option value="claude">☁️ Claude API (Anthropic)</option>
-                    <option value="groq">⚡ Groq API</option>
-                    <option value="gemini">♊ Gemini API (Google)</option>
-                  </select>
-                </div>
-
-                {/* Local GGUF File Picker */}
-                {newModelProvider === 'gguf_local' && (
-                  <div className="space-y-2 bg-slate-900 border border-slate-800 p-3 rounded-xl">
-                    <label className="block text-slate-300 font-medium">Select GGUF File from Hard Drive</label>
-                    <div className="flex gap-2 items-center">
-                      <input
-                        type="file"
-                        accept=".gguf"
-                        onChange={handleFileSelect}
-                        className="hidden"
-                        id="gguf-file-picker-settings"
-                      />
-                      <label
-                        htmlFor="gguf-file-picker-settings"
-                        className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg cursor-pointer flex items-center gap-1.5 font-medium shrink-0 border border-slate-700"
-                      >
-                        <FolderOpen className="w-4 h-4 text-amber-400" />
-                        <span>Browse GGUF...</span>
-                      </label>
-                      <input
-                        type="text"
-                        value={newGgufPath}
-                        onChange={(e) => setNewGgufPath(e.target.value)}
-                        placeholder="Or type full filepath e.g. C:\models\bonsai-1.7b.gguf"
-                        className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 placeholder-slate-500 font-mono text-[11px]"
-                      />
-                    </div>
-                  </div>
-                )}
-
-                {newModelProvider !== 'gguf_local' && (
-                  <div>
-                    <label className="block text-slate-300 font-medium mb-1">Model Tag / API Key</label>
-                    <input
-                      type="text"
-                      value={newModelNameOrTag}
-                      onChange={(e) => setNewModelNameOrTag(e.target.value)}
-                      placeholder="e.g. llama3.2:1b, claude-3-5-sonnet-20241022, groq-llama3"
-                      className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100 font-mono"
-                    />
-                  </div>
-                )}
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-slate-300 font-medium mb-1">Display Name</label>
-                    <input
-                      type="text"
-                      value={newModelName}
-                      onChange={(e) => setNewModelName(e.target.value)}
-                      placeholder="e.g. Bonsai Solver, Llama Architect"
-                      className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100"
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-slate-300 font-medium mb-1">Assigned Role</label>
-                    <select
-                      value={newModelRole}
-                      onChange={(e) => setNewModelRole(e.target.value)}
-                      className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100"
-                    >
-                      <option value="Architect">🏗️ Architect</option>
-                      <option value="Critic">🧐 Critic</option>
-                      <option value="Solver">💡 Solver</option>
-                      <option value="Coder">💻 Coder</option>
-                      <option value="Tester/Debugger">🧪 Tester/Debugger</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between pt-1">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      id="mod-check-settings"
-                      checked={newIsModerator}
-                      onChange={(e) => setNewIsModerator(e.target.checked)}
-                      className="rounded border-slate-800 text-emerald-500 focus:ring-emerald-500"
-                    />
-                    <label htmlFor="mod-check-settings" className="text-slate-300 font-medium cursor-pointer">
-                      👑 Designate as Moderator
-                    </label>
-                  </div>
-
-                  <button
-                    type="submit"
-                    className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-xl font-medium"
-                  >
-                    Add Model to Room
-                  </button>
-                </div>
-              </form>
+            {/* SETTINGS TABS SELECTOR */}
+            <div className="flex items-center gap-2 border-b border-slate-800 pb-3">
+              <button
+                onClick={() => setSettingsTab('models')}
+                className={`px-3.5 py-1.5 rounded-xl font-medium text-xs transition ${
+                  settingsTab === 'models' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30' : 'bg-slate-950 text-slate-400 hover:bg-slate-800'
+                }`}
+              >
+                ⚙️ Add & Manage Models
+              </button>
+              <button
+                onClick={() => setSettingsTab('browse_hf')}
+                className={`px-3.5 py-1.5 rounded-xl font-medium text-xs transition ${
+                  settingsTab === 'browse_hf' ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30' : 'bg-slate-950 text-slate-400 hover:bg-slate-800'
+                }`}
+              >
+                🤗 Brainstorm & Hire from HuggingFace
+              </button>
+              <button
+                onClick={() => setSettingsTab('search_paths')}
+                className={`px-3.5 py-1.5 rounded-xl font-medium text-xs transition ${
+                  settingsTab === 'search_paths' ? 'bg-purple-500/10 text-purple-400 border border-purple-500/30' : 'bg-slate-950 text-slate-400 hover:bg-slate-800'
+                }`}
+              >
+                📁 GGUF Search Paths ({searchPaths.length})
+              </button>
             </div>
 
-            {/* SECTION 2: Known Models Library & Room Status */}
-            <div className="space-y-2">
-              <h4 className="font-semibold text-xs text-slate-300 uppercase tracking-wider">
-                Known Models Library ({Object.keys(knownModels).length})
-              </h4>
-              <div className="space-y-2 text-xs">
-                {Object.values(knownModels).map((m) => {
-                  const isInRoom = !!models[m.id];
-                  return (
-                    <div
-                      key={m.id}
-                      className="bg-slate-950 border border-slate-800 p-3 rounded-xl flex items-center justify-between"
-                    >
-                      <div className="space-y-0.5">
-                        <div className="flex items-center gap-2 font-semibold text-slate-200">
-                          <span>{m.name}</span>
-                          <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded font-mono uppercase">
-                            {m.provider === 'gguf_local' ? 'GGUF' : m.provider}
-                          </span>
-                          {m.is_moderator && <span className="text-amber-400 text-[10px]">👑 Moderator</span>}
-                          {isInRoom ? (
-                            <span className="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-1.5 py-0.5 rounded-full font-medium">In Room</span>
-                          ) : (
-                            <span className="text-[10px] bg-slate-800 text-slate-500 px-1.5 py-0.5 rounded-full font-medium">Kicked / Offline</span>
-                          )}
-                        </div>
-                        <div className="text-[11px] text-slate-400">
-                          Role: {m.role} | {m.gguf_path ? `Path: ${m.gguf_path}` : `Model: ${m.model_name}`}
-                        </div>
-                      </div>
+            {/* TAB 1: ADD & MANAGE MODELS */}
+            {settingsTab === 'models' && (
+              <div className="space-y-4">
+                {/* Add New Model Form */}
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
+                  <h4 className="font-semibold text-sm text-emerald-400 flex items-center gap-2">
+                    <Plus className="w-4 h-4" />
+                    <span>Add Model / Local GGUF Participant</span>
+                  </h4>
 
-                      <div className="flex items-center gap-2">
-                        {isInRoom ? (
+                  <form onSubmit={handleAddModelSubmit} className="space-y-3 text-xs">
+                    <div>
+                      <label className="block text-slate-300 font-medium mb-1">Model Provider Type</label>
+                      <select
+                        value={newModelProvider}
+                        onChange={(e) => setNewModelProvider(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100 focus:outline-none focus:border-emerald-500"
+                      >
+                        <option value="gguf_local">📁 Local GGUF File (.gguf on hard drive)</option>
+                        <option value="ollama">🦙 Ollama Local Model</option>
+                        <option value="claude">☁️ Claude API (Anthropic)</option>
+                        <option value="groq">⚡ Groq API</option>
+                        <option value="gemini">♊ Gemini API (Google)</option>
+                      </select>
+                    </div>
+
+                    {/* Local GGUF File Picker */}
+                    {newModelProvider === 'gguf_local' && (
+                      <div className="space-y-3 bg-slate-900 border border-slate-800 p-3 rounded-xl">
+                        <label className="block text-slate-300 font-medium">Select GGUF File from Hard Drive</label>
+                        <div className="flex gap-2 items-center">
                           <button
-                            onClick={() => handleKickModel(m.id)}
-                            className="bg-rose-950/60 hover:bg-rose-900/80 text-rose-300 border border-rose-800/50 px-2.5 py-1 rounded-lg flex items-center gap-1 font-medium transition"
+                            type="button"
+                            onClick={() => {
+                              setFsTargetField('gguf');
+                              handleBrowseFs();
+                              setShowFsBrowser(true);
+                            }}
+                            className="bg-emerald-950 hover:bg-emerald-900 text-emerald-300 border border-emerald-800/80 px-3 py-2 rounded-lg font-medium flex items-center gap-1.5 shrink-0"
                           >
-                            <UserMinus className="w-3.5 h-3.5" />
-                            <span>Remove</span>
+                            <FolderOpen className="w-4 h-4 text-emerald-400" />
+                            <span>Browse Server Drives...</span>
                           </button>
-                        ) : (
+
+                          <input
+                            type="text"
+                            value={newGgufPath}
+                            onChange={(e) => {
+                              setNewGgufPath(e.target.value);
+                              handleValidatePath(e.target.value, newMmprojPath);
+                            }}
+                            placeholder="Type file name or path e.g. Bonsai-27B-Q1_0.gguf"
+                            className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100 placeholder-slate-500 font-mono text-[11px]"
+                          />
+
                           <button
-                            onClick={() => handleReaddModel(m.id)}
-                            className="bg-emerald-600 hover:bg-emerald-500 text-white px-2.5 py-1 rounded-lg flex items-center gap-1 font-medium transition"
+                            type="button"
+                            onClick={() => handleValidatePath(newGgufPath, newMmprojPath)}
+                            className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-3 py-2 rounded-lg font-medium shrink-0 border border-slate-700"
                           >
-                            <UserPlus className="w-3.5 h-3.5" />
-                            <span>Add to Room</span>
+                            Validate
                           </button>
+                        </div>
+
+                        {/* Optional mmproj (Multimodal Projector) File Picker */}
+                        <div className="pt-2 border-t border-slate-800/80 space-y-1">
+                          <label className="block text-slate-400 text-[11px]">
+                            Optional Multimodal Projector / Vision File (<code>mmproj</code>)
+                          </label>
+                          <div className="flex gap-2 items-center">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setFsTargetField('mmproj');
+                                handleBrowseFs();
+                                setShowFsBrowser(true);
+                              }}
+                              className="bg-purple-950 hover:bg-purple-900 text-purple-300 border border-purple-800/80 px-2.5 py-1.5 rounded-lg text-[11px] font-medium flex items-center gap-1 shrink-0"
+                            >
+                              <FolderOpen className="w-3.5 h-3.5 text-purple-400" />
+                              <span>Browse mmproj...</span>
+                            </button>
+                            <input
+                              type="text"
+                              value={newMmprojPath}
+                              onChange={(e) => {
+                                setNewMmprojPath(e.target.value);
+                                handleValidatePath(newGgufPath, e.target.value);
+                              }}
+                              placeholder="e.g. mmproj-model-f16.gguf"
+                              className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-slate-100 font-mono text-[11px]"
+                            />
+                          </div>
+                        </div>
+
+                        {/* Path Validation Status Message Badge */}
+                        {pathValidationMsg && (
+                          <div className={`p-2.5 rounded-lg text-[11px] font-mono leading-relaxed ${
+                            pathValidationMsg.valid ? 'bg-emerald-950/60 border border-emerald-800 text-emerald-300' : 'bg-rose-950/60 border border-rose-800 text-rose-300'
+                          }`}>
+                            {pathValidationMsg.message}
+                          </div>
                         )}
                       </div>
+                    )}
+
+                    {newModelProvider !== 'gguf_local' && (
+                      <div>
+                        <label className="block text-slate-300 font-medium mb-1">Model Tag / API Key</label>
+                        <input
+                          type="text"
+                          value={newModelNameOrTag}
+                          onChange={(e) => setNewModelNameOrTag(e.target.value)}
+                          placeholder="e.g. llama3.2:1b, claude-3-5-sonnet-20241022, groq-llama3"
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100 font-mono"
+                        />
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-slate-300 font-medium mb-1">Display Name</label>
+                        <input
+                          type="text"
+                          value={newModelName}
+                          onChange={(e) => setNewModelName(e.target.value)}
+                          placeholder="e.g. Bonsai Solver, Llama Architect"
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100"
+                          required
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-slate-300 font-medium mb-1">Assigned Role</label>
+                        <select
+                          value={newModelRole}
+                          onChange={(e) => setNewModelRole(e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100"
+                        >
+                          <option value="Architect">🏗️ Architect</option>
+                          <option value="Critic">🧐 Critic</option>
+                          <option value="Solver">💡 Solver</option>
+                          <option value="Coder">💻 Coder</option>
+                          <option value="Tester/Debugger">🧪 Tester/Debugger</option>
+                        </select>
+                      </div>
                     </div>
-                  );
-                })}
+
+                    <div className="flex items-center justify-between pt-1">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          id="mod-check-settings"
+                          checked={newIsModerator}
+                          onChange={(e) => setNewIsModerator(e.target.checked)}
+                          className="rounded border-slate-800 text-emerald-500 focus:ring-emerald-500"
+                        />
+                        <label htmlFor="mod-check-settings" className="text-slate-300 font-medium cursor-pointer">
+                          👑 Designate as Moderator
+                        </label>
+                      </div>
+
+                      <button
+                        type="submit"
+                        className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-xl font-medium"
+                      >
+                        Add Model to Room
+                      </button>
+                    </div>
+                  </form>
+                </div>
+
+                {/* Known Models Library & Room Status */}
+                <div className="space-y-2">
+                  <h4 className="font-semibold text-xs text-slate-300 uppercase tracking-wider">
+                    Known Models Library ({Object.keys(knownModels).length})
+                  </h4>
+                  <div className="space-y-2 text-xs">
+                    {Object.values(knownModels).map((m) => {
+                      const isInRoom = !!models[m.id];
+                      return (
+                        <div
+                          key={m.id}
+                          className="bg-slate-950 border border-slate-800 p-3 rounded-xl flex items-center justify-between"
+                        >
+                          <div className="space-y-0.5">
+                            <div className="flex items-center gap-2 font-semibold text-slate-200">
+                              <span>{m.name}</span>
+                              <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded font-mono uppercase">
+                                {m.provider === 'gguf_local' ? 'GGUF' : m.provider}
+                              </span>
+                              {m.is_moderator && <span className="text-amber-400 text-[10px]">👑 Moderator</span>}
+                              {isInRoom ? (
+                                <span className="text-[10px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-1.5 py-0.5 rounded-full font-medium">In Room</span>
+                              ) : (
+                                <span className="text-[10px] bg-slate-800 text-slate-500 px-1.5 py-0.5 rounded-full font-medium">Kicked / Offline</span>
+                              )}
+                            </div>
+                            <div className="text-[11px] text-slate-400">
+                              Role: {m.role} | {m.gguf_path ? `Path: ${m.gguf_path}` : `Model: ${m.model_name}`}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            {isInRoom ? (
+                              <button
+                                onClick={() => handleKickModel(m.id)}
+                                className="bg-rose-950/60 hover:bg-rose-900/80 text-rose-300 border border-rose-800/50 px-2.5 py-1 rounded-lg flex items-center gap-1 font-medium transition"
+                              >
+                                <UserMinus className="w-3.5 h-3.5" />
+                                <span>Remove</span>
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => handleReaddModel(m.id)}
+                                className="bg-emerald-600 hover:bg-emerald-500 text-white px-2.5 py-1 rounded-lg flex items-center gap-1 font-medium transition"
+                              >
+                                <UserPlus className="w-3.5 h-3.5" />
+                                <span>Add to Room</span>
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
-            </div>
+            )}
+
+            {/* TAB 2: BRAINSTORM & HIRE FROM HUGGINGFACE */}
+            {settingsTab === 'browse_hf' && (
+              <div className="space-y-4 text-xs">
+                <form onSubmit={handleSearchHf} className="flex gap-2">
+                  <input
+                    type="text"
+                    value={hfQuery}
+                    onChange={(e) => setHfQuery(e.target.value)}
+                    placeholder="Search HuggingFace models e.g. Llama-3, Bonsai, Dolphin, Qwen GGUF"
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-slate-100 placeholder-slate-500 font-mono"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isSearchingHf}
+                    className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white px-4 py-2 rounded-xl font-medium"
+                  >
+                    {isSearchingHf ? 'Searching HF...' : 'Search HuggingFace'}
+                  </button>
+                </form>
+
+                <div className="space-y-2 max-h-80 overflow-y-auto pr-1">
+                  {hfResults.length === 0 ? (
+                    <div className="text-slate-500 text-center py-8">
+                      Search HuggingFace to discover and brainstorm new models for your team!
+                    </div>
+                  ) : (
+                    hfResults.map((hf) => (
+                      <div key={hf.model_id} className="bg-slate-950 border border-slate-800 p-3 rounded-xl flex items-center justify-between">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2 font-semibold text-cyan-300">
+                            <a href={hf.url} target="_blank" rel="noreferrer" className="hover:underline">
+                              {hf.model_id}
+                            </a>
+                            {hf.is_gguf && (
+                              <span className="text-[9px] bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 px-1.5 py-0.5 rounded uppercase font-mono">
+                                GGUF Ready
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-400 flex items-center gap-3">
+                            <span>❤️ Likes: {hf.likes}</span>
+                            <span>📥 Downloads: {hf.downloads}</span>
+                            <span>Tags: {hf.tags ? hf.tags.join(', ') : 'None'}</span>
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={() => {
+                            setNewModelName(hf.model_id.split('/').pop() || hf.model_id);
+                            setNewGgufPath(`${hf.model_id.split('/').pop()}.gguf`);
+                            setNewModelProvider('gguf_local');
+                            setSettingsTab('models');
+                          }}
+                          className="bg-cyan-950 hover:bg-cyan-900 text-cyan-300 border border-cyan-800 px-3 py-1.5 rounded-lg font-medium transition shrink-0"
+                        >
+                          Hire Model
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 3: MODEL SEARCH DIRECTORIES */}
+            {settingsTab === 'search_paths' && (
+              <div className="space-y-4 text-xs">
+                <div className="bg-slate-950 border border-slate-800 p-3 rounded-xl space-y-2">
+                  <h4 className="font-semibold text-slate-200">Active GGUF Search Directories</h4>
+                  <p className="text-slate-400 text-[11px]">
+                    When you enter a filename like <code>Bonsai-27B-Q1_0.gguf</code>, SwarmChat automatically scans these folders to resolve the full absolute path!
+                  </p>
+                  <div className="space-y-1 font-mono text-[11px] text-emerald-400">
+                    {searchPaths.map((p, idx) => (
+                      <div key={idx} className="bg-slate-900 p-2 rounded border border-slate-800 truncate">
+                        📁 {p}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 p-3 rounded-xl space-y-2">
+                  <h4 className="font-semibold text-slate-200">Add Custom Model Directory</h4>
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      if (!customSearchPathInput) return;
+                      await fetch('/api/models/search_paths', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ path: customSearchPathInput })
+                      });
+                      setCustomSearchPathInput('');
+                      fetchState();
+                    }}
+                    className="flex gap-2"
+                  >
+                    <input
+                      type="text"
+                      value={customSearchPathInput}
+                      onChange={(e) => setCustomSearchPathInput(e.target.value)}
+                      placeholder="e.g. D:\MyGGUFModels or /home/user/downloads"
+                      className="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-slate-100 font-mono"
+                    />
+                    <button type="submit" className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded-xl font-medium">
+                      Add Path
+                    </button>
+                  </form>
+                </div>
+              </div>
+            )}
 
             <div className="flex justify-end pt-2 border-t border-slate-800">
               <button

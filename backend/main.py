@@ -43,9 +43,18 @@ class ModelConfigReq(BaseModel):
     role: str
     provider: str = "ollama"
     model_name: str = "llama3.2:1b"
+    gguf_path: Optional[str] = ""
+    mmproj_path: Optional[str] = ""
     api_key: Optional[str] = ""
     enabled: bool = True
     is_moderator: bool = False
+
+class ValidatePathReq(BaseModel):
+    path: str
+    mmproj_path: Optional[str] = None
+
+class SearchPathReq(BaseModel):
+    path: str
 
 class VoteOverrideReq(BaseModel):
     vote_id: str
@@ -67,6 +76,100 @@ class ItineraryTaskUpdateReq(BaseModel):
     status: Optional[str] = None
     priority: Optional[str] = None
     assigned_model: Optional[str] = None
+
+@app.get("/api/fs/browse")
+def browse_filesystem(path: Optional[str] = None):
+    target = path.strip() if path and path.strip() else os.path.expanduser("~")
+    if not os.path.exists(target):
+        target = os.path.abspath(".")
+
+    abs_target = os.path.abspath(target)
+    if not os.path.isdir(abs_target):
+        abs_target = os.path.dirname(abs_target)
+
+    parent_path = os.path.dirname(abs_target) if abs_target != os.path.dirname(abs_target) else None
+
+    directories = []
+    files = []
+
+    try:
+        for entry in os.listdir(abs_target):
+            full_p = os.path.join(abs_target, entry)
+            if os.path.isdir(full_p):
+                directories.append({
+                    "name": entry,
+                    "path": full_p
+                })
+            elif os.path.isfile(full_p):
+                lower = entry.lower()
+                is_gguf = lower.endswith(".gguf") or lower.endswith(".bin")
+                is_mmproj = "mmproj" in lower or "clip" in lower
+                try:
+                    size_mb = round(os.path.getsize(full_p) / (1024 * 1024), 2)
+                except Exception:
+                    size_mb = 0.0
+
+                files.append({
+                    "name": entry,
+                    "path": full_p,
+                    "size_mb": size_mb,
+                    "is_gguf": is_gguf,
+                    "is_mmproj": is_mmproj
+                })
+    except Exception as e:
+        return {"success": False, "error": str(e), "current_path": abs_target}
+
+    directories.sort(key=lambda x: x["name"].lower())
+    files.sort(key=lambda x: x["name"].lower())
+
+    return {
+        "success": True,
+        "current_path": abs_target,
+        "parent_path": parent_path,
+        "directories": directories,
+        "files": files
+    }
+
+@app.post("/api/fs/validate")
+def validate_model_path(req: ValidatePathReq):
+    resolved_gguf = model_mgr.resolve_gguf_path(req.path)
+    resolved_mmproj = model_mgr.resolve_gguf_path(req.mmproj_path) if req.mmproj_path else None
+
+    valid = resolved_gguf is not None
+    size_gb = 0.0
+    if resolved_gguf and os.path.exists(resolved_gguf):
+        size_gb = round(os.path.getsize(resolved_gguf) / (1024 ** 3), 2)
+
+    msg = f"Path valid. Absolute location: '{resolved_gguf}' ({size_gb} GB)" if valid else f"File not found in path or search directories. Path: '{req.path}'"
+    if req.mmproj_path:
+        mm_valid = resolved_mmproj is not None
+        msg += f" | mmproj: {'Valid (' + str(resolved_mmproj) + ')' if mm_valid else 'Not found (' + req.mmproj_path + ')'}"
+
+    return {
+        "valid": valid,
+        "resolved_path": resolved_gguf,
+        "file_size_gb": size_gb,
+        "mmproj_valid": resolved_mmproj is not None if req.mmproj_path else True,
+        "resolved_mmproj_path": resolved_mmproj,
+        "message": msg
+    }
+
+@app.get("/api/models/search_paths")
+def get_search_paths():
+    return {
+        "search_paths": model_mgr.get_search_paths(),
+        "custom_paths": model_mgr.custom_search_paths
+    }
+
+@app.post("/api/models/search_paths")
+def add_search_path(req: SearchPathReq):
+    if req.path:
+        model_mgr.add_search_path(req.path)
+    return {
+        "success": True,
+        "search_paths": model_mgr.get_search_paths(),
+        "custom_paths": model_mgr.custom_search_paths
+    }
 
 @app.get("/api/hardware")
 def get_hardware_info():
@@ -182,6 +285,16 @@ def readd_model(model_id: str):
 def set_moderator(model_id: str):
     orchestrator.set_moderator(model_id)
     return {"success": True, "moderator_model_id": orchestrator.moderator_model_id}
+
+@app.get("/api/tools/search_hf")
+async def search_huggingface(query: str, limit: int = 5):
+    res = await tool_mgr.search_huggingface(query, limit=limit)
+    return res
+
+@app.get("/api/tools/internet_search")
+async def internet_search(query: str, domain_filter: Optional[str] = None):
+    res = await tool_mgr.internet_search(query, domain_filter=domain_filter)
+    return res
 
 @app.post("/api/votes/override")
 def override_vote(req: VoteOverrideReq):

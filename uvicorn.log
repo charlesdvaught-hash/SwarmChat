@@ -1,11 +1,38 @@
-INFO:     Started server process [121712]
+INFO:     Started server process [173870]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-INFO:     127.0.0.1:34830 - "GET /api/dependencies HTTP/1.1" 200 OK
-INFO:     127.0.0.1:40420 - "GET / HTTP/1.1" 200 OK
-INFO:     127.0.0.1:40420 - "GET /assets/index-CwUNxpEU.js HTTP/1.1" 200 OK
-INFO:     127.0.0.1:40432 - "GET /assets/index-Brt4g5Ul.css HTTP/1.1" 200 OK
-INFO:     127.0.0.1:40420 - "GET /api/state HTTP/1.1" 200 OK
-INFO:     127.0.0.1:40420 - "GET /api/hardware HTTP/1.1" 200 OK
-INFO:     127.0.0.1:40420 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38570 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /assets/index-DHegE3RV.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38768 - "GET /assets/index-C5kSgOWY.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/fs/browse HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38754 - "GET /api/tools/search_hf?query=Bonsai HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38772 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [173870]
