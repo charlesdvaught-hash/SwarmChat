@@ -80,3 +80,65 @@ def test_evaluate_engine():
     res = asyncio.run(ee.run_candidate_evaluation(candidates, "Build a file parser"))
     assert "rankings" in res
     assert len(res["rankings"]) == 2
+
+def test_tiny_gguf_models_interaction_and_memory():
+    # Verify that two tiny GGUF models can be configured, interact, and write self-journals to shared memory
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=".test_swarmchat_gguf")
+    tm = ToolManager()
+    orch = Orchestrator(mm, mem, tm)
+
+    # Configure two authentic tiny GGUF models in known models and active room
+    tiny_gguf_1 = {
+        "id": "gguf_qwen_0_5b",
+        "name": "Qwen 0.5B Architect",
+        "role": "Architect",
+        "provider": "gguf_local",
+        "model_name": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "gguf_path": "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "enabled": True,
+        "is_moderator": True,
+        "status": "active",
+        "max_context_tokens": 2048
+    }
+
+    tiny_gguf_2 = {
+        "id": "gguf_qwen_0_8b",
+        "name": "Qwen 0.8B Coder",
+        "role": "Coder",
+        "provider": "gguf_local",
+        "model_name": "qwen2.5-0.8b-instruct-q4_k_m.gguf",
+        "gguf_path": "/models/qwen2.5-0.8b-instruct-q4_k_m.gguf",
+        "enabled": True,
+        "is_moderator": False,
+        "status": "active",
+        "max_context_tokens": 2048
+    }
+
+    orch.add_or_update_known_model(tiny_gguf_1)
+    orch.add_or_update_known_model(tiny_gguf_2)
+
+    assert "gguf_qwen_0_5b" in orch.models
+    assert "gguf_qwen_0_8b" in orch.models
+
+    # Step turns for both models and check response & memory journaling
+    msg1 = asyncio.run(orch.step_model_turn("gguf_qwen_0_5b"))
+    assert msg1["sender"] == "Qwen 0.5B Architect"
+
+    msg2 = asyncio.run(orch.step_model_turn("gguf_qwen_0_8b"))
+    assert msg2["sender"] == "Qwen 0.8B Coder"
+
+    # Test self-journaling and napping
+    mem.record_model_nap("gguf_qwen_0_5b", "Qwen 0.5B Architect self-journal summary: Architecture layout approved.")
+    latest_journal = mem.get_model_latest_journal("gguf_qwen_0_5b")
+    assert "Architecture layout approved" in latest_journal
+
+    # Test kicking a model and re-adding from known library
+    kick_res = orch.kick_model_from_room("gguf_qwen_0_5b")
+    assert kick_res["was_moderator"] is True
+    assert "gguf_qwen_0_5b" not in orch.models
+    assert "gguf_qwen_0_5b" in orch.known_models
+
+    readd_res = orch.readd_model_to_room("gguf_qwen_0_5b")
+    assert readd_res["success"] is True
+    assert "gguf_qwen_0_5b" in orch.models
