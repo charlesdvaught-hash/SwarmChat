@@ -1,12 +1,17 @@
 import os
 import json
+import shutil
 import subprocess
+import py_compile
 import httpx
 from typing import Dict, Any, List, Optional
 
 class ToolManager:
     def __init__(self, workspace_root: str = "."):
         self.workspace_root = os.path.abspath(workspace_root)
+        self.bot_workspaces_dir = os.path.join(self.workspace_root, ".swarmchat", "workspaces")
+        os.makedirs(self.bot_workspaces_dir, exist_ok=True)
+
         self.allowed_domains = [
             "github.com",
             "docs.python.org",
@@ -24,15 +29,21 @@ class ToolManager:
         if domain and domain not in self.allowed_domains:
             self.allowed_domains.append(domain)
 
-    def _is_safe_path(self, full_path: str) -> bool:
+    def get_bot_workspace_dir(self, bot_id: str) -> str:
+        bot_dir = os.path.join(self.bot_workspaces_dir, bot_id)
+        os.makedirs(bot_dir, exist_ok=True)
+        return bot_dir
+
+    def _is_safe_path(self, full_path: str, root_dir: Optional[str] = None) -> bool:
+        target_root = root_dir or self.workspace_root
         try:
-            return os.path.commonpath([full_path, self.workspace_root]) == self.workspace_root
+            return os.path.commonpath([full_path, target_root]) == target_root
         except ValueError:
             return False
 
     def classify_tool_risk(self, tool_name: str) -> str:
         low_risk = ["read_file", "list_files", "search_workspace", "internet_search", "search_huggingface", "git_status", "git_diff", "git_log"]
-        consequential = ["write_file", "patch_file", "git_branch", "git_commit", "git_rollback"]
+        consequential = ["write_file", "patch_file", "git_branch", "git_commit", "git_rollback", "bot_workspace_write", "bot_workspace_merge"]
         high_risk = ["run_terminal_cmd"]
 
         if tool_name in low_risk:
@@ -43,9 +54,14 @@ class ToolManager:
             return "high"
         return "consequential"
 
-    def read_file(self, filepath: str) -> Dict[str, Any]:
-        full_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
-        if not self._is_safe_path(full_path):
+    def read_file(self, filepath: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
+        root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
+        full_path = os.path.abspath(os.path.join(root, filepath))
+        if not os.path.exists(full_path):
+            # Fallback to main workspace if not in bot workspace
+            full_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
+
+        if not self._is_safe_path(full_path, self.workspace_root) and not self._is_safe_path(full_path, self.bot_workspaces_dir):
             return {"success": False, "error": "Access outside workspace denied."}
         if not os.path.exists(full_path):
             return {"success": False, "error": f"File not found: {filepath}"}
@@ -56,10 +72,12 @@ class ToolManager:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def list_files(self, rel_dir: str = ".") -> Dict[str, Any]:
-        full_path = os.path.abspath(os.path.join(self.workspace_root, rel_dir))
-        if not self._is_safe_path(full_path):
-            return {"success": False, "error": "Access outside workspace denied."}
+    def list_files(self, rel_dir: str = ".", bot_id: Optional[str] = None) -> Dict[str, Any]:
+        root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
+        full_path = os.path.abspath(os.path.join(root, rel_dir))
+        if not os.path.exists(full_path):
+            full_path = os.path.abspath(os.path.join(self.workspace_root, rel_dir))
+
         try:
             items = []
             for entry in os.listdir(full_path):
@@ -107,7 +125,6 @@ class ToolManager:
         if domain_filter:
             domains = [domain_filter]
 
-        # Check if query targets HuggingFace
         if "huggingface" in query.lower() or "hf" in query.lower():
             return await self.search_huggingface(query)
 
@@ -207,7 +224,97 @@ class ToolManager:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def write_file(self, filepath: str, content: str) -> Dict[str, Any]:
+    def validate_file_syntax(self, full_path: str) -> Dict[str, Any]:
+        """Validates Python/JSON file syntax prior to merging."""
+        if full_path.endswith(".py"):
+            try:
+                py_compile.compile(full_path, doraise=True)
+                return {"valid": True}
+            except Exception as e:
+                return {"valid": False, "error": f"Python syntax error: {str(e)}"}
+        elif full_path.endswith(".json"):
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    json.load(f)
+                return {"valid": True}
+            except Exception as e:
+                return {"valid": False, "error": f"JSON syntax error: {str(e)}"}
+        return {"valid": True}
+
+    def bot_workspace_write(self, bot_id: str, filepath: str, content: str) -> Dict[str, Any]:
+        """Writes file to the bot's isolated workspace sandbox."""
+        bot_dir = self.get_bot_workspace_dir(bot_id)
+        full_path = os.path.abspath(os.path.join(bot_dir, filepath))
+        if not self._is_safe_path(full_path, bot_dir):
+            return {"success": False, "error": "Access outside bot workspace denied."}
+        try:
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            # Syntax verification
+            syntax_res = self.validate_file_syntax(full_path)
+            return {
+                "success": syntax_res["valid"],
+                "filepath": filepath,
+                "bytes_written": len(content),
+                "bot_id": bot_id,
+                "syntax_valid": syntax_res["valid"],
+                "syntax_error": syntax_res.get("error")
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def bot_workspace_merge_to_main(self, bot_id: str, filepath: str) -> Dict[str, Any]:
+        """Validates and merges a file from bot workspace into main repository with git commit / rollback."""
+        bot_dir = self.get_bot_workspace_dir(bot_id)
+        src_path = os.path.abspath(os.path.join(bot_dir, filepath))
+        dest_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
+
+        if not os.path.exists(src_path):
+            return {"success": False, "error": f"File '{filepath}' does not exist in bot workspace '{bot_id}'."}
+
+        syntax_res = self.validate_file_syntax(src_path)
+        if not syntax_res["valid"]:
+            return {"success": False, "error": f"Merge rejected due to syntax error: {syntax_res.get('error')}"}
+
+        try:
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            shutil.copy2(src_path, dest_path)
+
+            # Auto git commit
+            try:
+                subprocess.run(["git", "add", filepath], cwd=self.workspace_root, capture_output=True, text=True)
+                commit_res = subprocess.run(
+                    ["git", "commit", "-m", f"Incremental bot update by {bot_id}: {filepath}"],
+                    cwd=self.workspace_root,
+                    capture_output=True,
+                    text=True
+                )
+                committed = (commit_res.returncode == 0)
+            except Exception:
+                committed = False
+
+            return {
+                "success": True,
+                "filepath": filepath,
+                "bot_id": bot_id,
+                "git_committed": committed
+            }
+        except Exception as e:
+            # Rollback file copy
+            return {"success": False, "error": f"Merge failed with error: {str(e)}"}
+
+    def write_file(self, filepath: str, content: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
+        """Standard write tool. If bot_id is provided, writes to bot workspace first."""
+        if bot_id:
+            w_res = self.bot_workspace_write(bot_id, filepath, content)
+            if not w_res.get("success"):
+                return w_res
+            # Auto-merge to main if syntax valid
+            m_res = self.bot_workspace_merge_to_main(bot_id, filepath)
+            return m_res
+
         full_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
         if not self._is_safe_path(full_path):
             return {"success": False, "error": "Access outside workspace denied."}

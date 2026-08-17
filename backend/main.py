@@ -37,6 +37,10 @@ class ChatMsgReq(BaseModel):
     content: str
     is_admin: bool = True
 
+class PromptTemplateUpdateReq(BaseModel):
+    start_prompt: Optional[str] = None
+    execution_prompt: Optional[str] = None
+
 class ModelConfigReq(BaseModel):
     id: str
     name: str
@@ -48,6 +52,8 @@ class ModelConfigReq(BaseModel):
     api_key: Optional[str] = ""
     enabled: bool = True
     is_moderator: bool = False
+    custom_start_prompt: Optional[str] = None
+    custom_execution_prompt: Optional[str] = None
 
 class ValidatePathReq(BaseModel):
     path: str
@@ -76,6 +82,20 @@ class ItineraryTaskUpdateReq(BaseModel):
     status: Optional[str] = None
     priority: Optional[str] = None
     assigned_model: Optional[str] = None
+
+@app.get("/api/prompts/templates")
+def get_prompt_templates():
+    from backend.prompts import prompt_template_mgr
+    return prompt_template_mgr.templates
+
+@app.post("/api/prompts/templates")
+def update_prompt_templates(req: PromptTemplateUpdateReq):
+    from backend.prompts import prompt_template_mgr
+    prompt_template_mgr.update_templates(
+        start_prompt=req.start_prompt,
+        execution_prompt=req.execution_prompt
+    )
+    return {"success": True, "templates": prompt_template_mgr.templates}
 
 @app.get("/api/fs/browse")
 def browse_filesystem(path: Optional[str] = None):

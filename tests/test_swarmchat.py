@@ -29,11 +29,11 @@ def test_memory_manager():
     assert mem.get_phase() == "execution"
 
 def test_thinking_disabled_prompts():
-    prompt_disc = get_system_prompt("Architect", "discussion", is_moderator=False)
-    assert "THINKING / REASONING MODE: DISABLED BY DEFAULT" in prompt_disc
+    prompt_disc = get_system_prompt("Architect", "Otis", "discussion", is_moderator=False)
+    assert "Phase: Discussion" in prompt_disc
     
-    prompt_mod = get_system_prompt("Architect", "discussion", is_moderator=True)
-    assert "MODERATOR REASONING MODE: BRIEF & FOCUSED" in prompt_mod
+    prompt_mod = get_system_prompt("Architect", "Otis", "discussion", is_moderator=True)
+    assert "Moderator Directive" in prompt_mod
 
 def test_tool_risk_classification():
     tm = ToolManager()
