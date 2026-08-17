@@ -27,6 +27,7 @@ interface ModelConfig {
   enabled: boolean;
   is_moderator: boolean;
   status: string;
+  live_status?: string;
 }
 
 interface PendingVote {
@@ -673,6 +674,12 @@ export default function App() {
                           {tokPerSec} tok/s
                         </div>
                       )}
+                    </div>
+
+                    {/* Live Truth-Backed Status Indicator (Discord Style) */}
+                    <div className="text-[11px] text-emerald-400 font-medium flex items-center gap-1 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded-md">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                      <span className="truncate">{m.live_status || 'Idle / Live in Chat'}</span>
                     </div>
 
                     <div className="text-[11px] text-slate-500 truncate" title={m.gguf_path || m.model_name}>

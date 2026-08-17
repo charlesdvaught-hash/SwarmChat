@@ -19,6 +19,7 @@ class MemoryManager:
             "phase_last_changed": time.time(),
             "shared_entries": [],
             "model_journals": {},
+            "model_spec_files": {},  # Per-model spec files/notebooks (model_id -> str content)
             "episodes": [],  # Structured NAC-style episodes
             "task_itinerary": [],  # Meeting itinerary tasks
             "file_audit_log": [],  # File edits and user/model attribution
@@ -282,3 +283,29 @@ class MemoryManager:
         if journals:
             return journals[-1].get("summary", "")
         return None
+
+    # --- SPEC FILES / NOTEBOOKS ---
+    def get_spec_file(self, model_id: str) -> str:
+        """Returns the model's dedicated spec file content."""
+        return self.state.setdefault("model_spec_files", {}).get(model_id, "")
+
+    def update_spec_file(self, model_id: str, content: str) -> str:
+        """Updates the model's dedicated spec file."""
+        self.state.setdefault("model_spec_files", {})[model_id] = content
+
+        # Save to file
+        model_dir = os.path.join(self.project_dir, "models", model_id)
+        os.makedirs(model_dir, exist_ok=True)
+        spec_path = os.path.join(model_dir, "spec_file.md")
+        try:
+            with open(spec_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+
+        self.save_memory()
+        return content
+
+    def get_all_spec_files(self) -> Dict[str, str]:
+        """Returns all models' spec files for selective reading."""
+        return self.state.get("model_spec_files", {})

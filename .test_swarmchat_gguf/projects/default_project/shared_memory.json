@@ -50,6 +50,30 @@
       "timestamp": 1786999079.694773,
       "author": "Moderator System (gguf_qwen_0_5b)",
       "content": "Model `gguf_qwen_0_5b` took a nap / refreshed context. Shared summary: Qwen 0.5B Architect self-journal summary: Architecture layout approved."
+    },
+    {
+      "id": "mem_1787003261156",
+      "timestamp": 1787003261.156841,
+      "author": "Model (gguf_qwen_0_5b)",
+      "content": "\ud83d\udce6 [EPISODE CHECKPOINT #ep_1787003261156] Context Nap Handoff: Qwen 0.5B Architect self-journal summary: Architecture layout approved."
+    },
+    {
+      "id": "mem_1787003261158",
+      "timestamp": 1787003261.1580162,
+      "author": "Moderator System (gguf_qwen_0_5b)",
+      "content": "Model `gguf_qwen_0_5b` took a nap / refreshed context. Shared summary: Qwen 0.5B Architect self-journal summary: Architecture layout approved."
+    },
+    {
+      "id": "mem_1787003310229",
+      "timestamp": 1787003310.2295659,
+      "author": "Model (gguf_qwen_0_5b)",
+      "content": "\ud83d\udce6 [EPISODE CHECKPOINT #ep_1787003310229] Context Nap Handoff: Qwen 0.5B Architect self-journal summary: Architecture layout approved."
+    },
+    {
+      "id": "mem_1787003310230",
+      "timestamp": 1787003310.230971,
+      "author": "Moderator System (gguf_qwen_0_5b)",
+      "content": "Model `gguf_qwen_0_5b` took a nap / refreshed context. Shared summary: Qwen 0.5B Architect self-journal summary: Architecture layout approved."
     }
   ],
   "model_journals": {
@@ -69,9 +93,18 @@
       {
         "timestamp": 1786999079.690275,
         "summary": "Qwen 0.5B Architect self-journal summary: Architecture layout approved."
+      },
+      {
+        "timestamp": 1787003261.1565528,
+        "summary": "Qwen 0.5B Architect self-journal summary: Architecture layout approved."
+      },
+      {
+        "timestamp": 1787003310.2293105,
+        "summary": "Qwen 0.5B Architect self-journal summary: Architecture layout approved."
       }
     ]
   },
+  "model_spec_files": {},
   "episodes": [
     {
       "id": "ep_1786995623188",
@@ -112,6 +145,26 @@
       "thread_name": "gguf_qwen_0_5b",
       "modified_files": [],
       "source_threads": []
+    },
+    {
+      "id": "ep_1787003261156",
+      "timestamp": 1787003261.1568344,
+      "author": "Model (gguf_qwen_0_5b)",
+      "action": "Context Nap Handoff",
+      "summary": "Qwen 0.5B Architect self-journal summary: Architecture layout approved.",
+      "thread_name": "gguf_qwen_0_5b",
+      "modified_files": [],
+      "source_threads": []
+    },
+    {
+      "id": "ep_1787003310229",
+      "timestamp": 1787003310.22956,
+      "author": "Model (gguf_qwen_0_5b)",
+      "action": "Context Nap Handoff",
+      "summary": "Qwen 0.5B Architect self-journal summary: Architecture layout approved.",
+      "thread_name": "gguf_qwen_0_5b",
+      "modified_files": [],
+      "source_threads": []
     }
   ],
   "task_itinerary": [],
@@ -119,7 +172,7 @@
   "active_file_locks": {},
   "tokens_used": {
     "gguf_qwen_0_5b": 0,
-    "gguf_qwen_0_8b": 52
+    "gguf_qwen_0_8b": 78
   },
   "session_id": "default_session"
 }
