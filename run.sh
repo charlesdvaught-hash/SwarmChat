@@ -17,10 +17,16 @@ python3 -m pip install --quiet -r backend/requirements.txt
 echo "[2/4] Running hardware & runtime diagnostics..."
 python3 setup.py
 
-echo "[3/4] Checking frontend build..."
+echo "[3/4] Checking web interface build..."
 if [ ! -d "frontend/dist" ]; then
-    echo "Building frontend web interface..."
-    (cd frontend && npm install && npm run build)
+    if command -v npm &> /dev/null; then
+        echo "Building frontend web interface with npm..."
+        (cd frontend && npm install && npm run build)
+    else
+        echo "[NOTE] npm not detected; serving pre-built web interface."
+    fi
+else
+    echo "Web interface ready."
 fi
 
 echo "[4/4] Opening SwarmChat web interface..."

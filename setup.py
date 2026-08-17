@@ -57,12 +57,15 @@ def check_dependencies():
         else:
             print(f"  [✓] {dep}: {status}")
 
-    # Display GPU acceleration hint if CUDA is available
     if deps.get("nvcc (CUDA Toolkit)") or shutil.which("nvidia-smi"):
-        print("\n💡 GPU Acceleration Hint:")
-        print("   If you want GGUF model acceleration via CUDA with llama-cpp-python, run:")
-        print("   CMAKE_ARGS='-DGGML_CUDA=on' pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir")
-        print("   Ollama automatically detects and utilizes CUDA/ROCm GPUs if available.")
+        print("\n💡 Optional CUDA Acceleration for llama-cpp-python:")
+        print("   - PowerShell:")
+        print('     $env:CMAKE_ARGS="-DGGML_CUDA=on"; pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir')
+        print("   - Command Prompt (cmd.exe):")
+        print('     set CMAKE_ARGS="-DGGML_CUDA=on" && pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir')
+        print("   - Linux/macOS (Bash):")
+        print('     CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir')
+        print("   Note: Ollama automatically uses your GPU out of the box without any extra steps!")
 
     return deps
 

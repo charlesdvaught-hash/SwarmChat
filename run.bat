@@ -1,5 +1,5 @@
 @echo off
-title SwarmChat - 1-Click Launch & Setup
+title SwarmChat - 1-Click Launch ^& Setup
 echo ====================================================
 echo               SwarmChat Launch Script
 echo ====================================================
@@ -17,16 +17,23 @@ if %errorlevel% neq 0 (
 echo [1/4] Checking and installing Python dependencies...
 python -m pip install --quiet -r backend\requirements.txt
 
-echo [2/4] Running hardware & runtime diagnostic checks...
+echo [2/4] Running hardware ^& runtime diagnostic checks...
 python setup.py
 
-echo [3/4] Checking frontend build...
+echo [3/4] Checking web interface build...
 if not exist "frontend\dist" (
-    echo Building frontend web interface...
-    cd frontend
-    call npm install
-    call npm run build
-    cd ..
+    where npm >nul 2>&1
+    if %errorlevel% equ 0 (
+        echo Building frontend web interface with npm...
+        cd frontend
+        call npm install
+        call npm run build
+        cd ..
+    ) else (
+        echo [NOTE] npm not detected; serving pre-built web interface.
+    )
+) else (
+    echo Web interface ready.
 )
 
 echo [4/4] Opening SwarmChat in your default web browser...

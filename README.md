@@ -11,7 +11,7 @@ SwarmChat is a user-friendly desktop application that loads multiple local GGUF 
 - **GPU & CUDA Acceleration Ready:** Seamlessly utilizes CUDA/ROCm GPU acceleration if present (via Ollama or CUDA-enabled llama.cpp), while maintaining pure CPU core logic fallback.
 - **Risk-Based Tool Voting & Admin Override:** Read-only research tools run automatically; file modifications require voting/Moderator decision; terminal commands require explicit Admin approval.
 - **Continuous Shared Memory Archive:** Generates `shared_memory.json` and markdown summaries while supporting context nap refreshes.
-- **1-Click Launchers:** Automated `run.bat` (Windows) and `run.sh` (Linux/macOS) scripts.
+- **Zero-Dependency 1-Click Launchers:** Pre-built web interface included so users do NOT need Node or npm installed! Double-click `run.bat` (Windows) or `./run.sh` (Linux/macOS).
 
 ## 🚀 Quick Start (1-Click)
 
@@ -27,15 +27,24 @@ chmod +x run.sh
 ./run.sh
 ```
 
-The script will automatically verify Python dependencies, run setup diagnostics, compile frontend assets if needed, and open `http://localhost:8000` in your browser.
+The script will automatically verify Python dependencies, run setup diagnostics, serve the pre-built web interface, and open `http://localhost:8000` in your browser.
 
 ## ⚡ CUDA / GPU Acceleration (Optional)
 If your machine has an NVIDIA GPU and CUDA installed:
-1. **Ollama:** Ollama automatically detects CUDA/ROCm GPUs upon launch.
+1. **Ollama:** Ollama automatically detects and utilizes CUDA/ROCm GPUs out of the box without any extra configuration.
 2. **Custom GGUF / llama-cpp-python:**
-   ```bash
-   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir
-   ```
+   - **PowerShell:**
+     ```powershell
+     $env:CMAKE_ARGS="-DGGML_CUDA=on"; pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir
+     ```
+   - **Command Prompt (cmd.exe):**
+     ```cmd
+     set CMAKE_ARGS="-DGGML_CUDA=on" && pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir
+     ```
+   - **Linux / macOS (Bash):**
+     ```bash
+     CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir
+     ```
 
 ## 🧪 Testing
 Run backend unit and integration tests:
