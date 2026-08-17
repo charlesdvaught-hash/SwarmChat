@@ -67,6 +67,13 @@ class VoteOverrideReq(BaseModel):
     action: str
     modified_args: Optional[Dict[str, Any]] = None
 
+class HireVoteReq(BaseModel):
+    model_id: str
+    model_name: str
+    gguf_url_or_tag: str
+    votes_for: List[str]
+    notes: Optional[str] = ""
+
 class EvaluateReq(BaseModel):
     candidates: List[Dict[str, Any]]
     task_context: str
@@ -320,6 +327,17 @@ async def internet_search(query: str, domain_filter: Optional[str] = None):
 def override_vote(req: VoteOverrideReq):
     res = orchestrator.admin_override_vote(req.vote_id, req.action, req.modified_args)
     return res
+
+@app.post("/api/hiring/vote")
+def submit_hire_vote(req: HireVoteReq):
+    """Handles a successful bot vote on a HuggingFace candidate and notifies the Admin via private notification."""
+    admin_msg = orchestrator.add_chat_message(
+        sender="System / Hiring Pipeline",
+        role="System",
+        content=f"📬 [PRIVATE NOTIFICATION TO ADMIN]: The room models voted unanimously ({len(req.votes_for)} votes) to hire candidate '{req.model_name}' ({req.model_id}). Notes: {req.notes or 'None'}. GGUF Tag: {req.gguf_url_or_tag}",
+        is_admin=True
+    )
+    return {"success": True, "notification_sent": True, "message": admin_msg}
 
 @app.post("/api/evaluate")
 async def run_evaluate(req: EvaluateReq):

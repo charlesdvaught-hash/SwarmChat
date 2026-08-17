@@ -78,6 +78,9 @@ class Orchestrator:
 
         self.pending_tool_votes: List[Dict[str, Any]] = []
         self.chat_history: List[Dict[str, Any]] = []
+        self.turn_schedule: List[str] = []  # 5-10 turn scheduled roster queue
+        self.autorun_enabled: bool = False
+        self.last_speech_time: float = time.time()
 
     def set_turn_mode(self, mode: str):
         if mode in ["admin_controlled", "moderator_controlled", "round_robin"]:
@@ -152,6 +155,35 @@ class Orchestrator:
         self.chat_history.append(msg)
         return msg
 
+    def generate_turn_schedule(self, length: int = 8) -> List[str]:
+        """Generates a 5-10 turn scheduled roster based on available user roles, prioritizing Architect first."""
+        active_models = [m_id for m_id, m in self.models.items() if m.get("enabled", True)]
+        if not active_models:
+            return []
+
+        schedule: List[str] = []
+
+        # 1. Ensure Architect is first if present and not spoke very recently
+        architect_id = None
+        for m_id in active_models:
+            if self.models[m_id].get("role", "").lower() in ["architect", "planner"] or self.models[m_id].get("is_moderator"):
+                architect_id = m_id
+                break
+
+        if architect_id:
+            schedule.append(architect_id)
+
+        # 2. Add other active roles sequentially, ensuring fair coverage without default bias
+        remaining = [m_id for m_id in active_models if m_id not in schedule]
+        while len(schedule) < length:
+            if not remaining:
+                remaining = list(active_models)
+            next_m = remaining.pop(0)
+            schedule.append(next_m)
+
+        self.turn_schedule = schedule
+        return self.turn_schedule
+
     def get_next_speaker(self, last_speaker_id: Optional[str] = None) -> Optional[str]:
         active_models = [m_id for m_id, m in self.models.items() if m.get("enabled", True)]
         if not active_models:
@@ -173,14 +205,28 @@ class Orchestrator:
                 if f"@{m_cfg['name'].lower()}" in last_msg or f"@{m_cfg['role'].lower()}" in last_msg:
                     return m_id
 
-        # Fallback to round-robin or stalling resolution (pick random eligible speaker who didn't speak last)
+        # Use scheduled queue if available
+        if not self.turn_schedule:
+            self.generate_turn_schedule()
+
+        if self.turn_schedule:
+            next_spk = self.turn_schedule.pop(0)
+            if next_spk in active_models:
+                # Check if schedule queue is almost empty (1 left)
+                if len(self.turn_schedule) <= 1:
+                    self.add_chat_message(
+                        sender="System / Toast",
+                        role="System",
+                        content="[TOAST_NOTIFICATION] Approaches end of turn schedule! Moderator is planning the next turn sequence.",
+                        is_admin=True
+                    )
+                return next_spk
+
+        # Fallback to round-robin
         effective_last = last_speaker_id or self.last_speaker_id
         if effective_last and effective_last in active_models and len(active_models) > 1:
-            candidates = [m_id for m_id in active_models if m_id != effective_last]
-            if self.turn_mode == "round_robin":
-                idx = active_models.index(effective_last)
-                return active_models[(idx + 1) % len(active_models)]
-            return random.choice(candidates)
+            idx = active_models.index(effective_last)
+            return active_models[(idx + 1) % len(active_models)]
 
         return active_models[0]
 
@@ -227,11 +273,16 @@ class Orchestrator:
 
         context_prompt = f"{sys_prompt}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{task_context}{journal_context}{spec_context}"
 
-        # Check model token usage against limits
+        # Check model token usage against limits - enforce context reset if exceeded to prevent degradation
         tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)
         max_tokens = model_cfg.get("max_context_tokens", 4096)
-        if tokens_used > (max_tokens * 0.8):
-            context_prompt += "\n\n⚠️ WARNING: Your context usage is high! Please write a 200-300 token self-journal using `[JOURNAL: <summary>]` and request a nap `[REQUEST_NAP]`."
+        if tokens_used > (max_tokens * 0.75):
+            # Record automatic self-journal and reset token counter for model
+            auto_journal = f"Auto-checkpoint save file for {model_cfg['name']}: Completed discussions/actions. Active role: {model_cfg['role']}."
+            self.memory_manager.record_model_nap(model_id, auto_journal)
+            self.memory_manager.state["tokens_used"][model_id] = 0
+            self.memory_manager.save_memory()
+            context_prompt += f"\n\n### 🔄 REFRESHED CONTEXT SAVE FILE:\n{auto_journal}\nPlease continue your concise contribution (1-5 sentences)."
 
         if current_phase == "execution":
             # Stateless refresh for execution phase: clean context window populated with workspace file manifest & task details
