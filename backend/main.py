@@ -75,10 +75,12 @@ def get_full_state():
         "turn_mode": orchestrator.turn_mode,
         "moderator_model_id": orchestrator.moderator_model_id,
         "models": orchestrator.models,
+        "known_models": orchestrator.known_models,
         "pending_votes": orchestrator.pending_tool_votes,
         "chat_history": orchestrator.chat_history,
         "shared_memory": memory_mgr.state.get("shared_entries", []),
         "model_journals": memory_mgr.state.get("model_journals", {}),
+        "tokens_used": memory_mgr.state.get("tokens_used", {}),
         "allowed_domains": tool_mgr.allowed_domains
     }
 
@@ -107,10 +109,24 @@ async def step_turn(model_id: Optional[str] = None):
 
 @app.post("/api/models/configure")
 def configure_model(req: ModelConfigReq):
-    orchestrator.models[req.id] = req.dict()
-    if req.is_moderator:
-        orchestrator.set_moderator(req.id)
-    return {"success": True, "models": orchestrator.models}
+    m_dict = req.dict()
+    orchestrator.add_or_update_known_model(m_dict)
+    return {"success": True, "models": orchestrator.models, "known_models": orchestrator.known_models}
+
+@app.post("/api/models/kick")
+def kick_model(model_id: str):
+    res = orchestrator.kick_model_from_room(model_id)
+    return res
+
+@app.post("/api/models/readd")
+def readd_model(model_id: str):
+    res = orchestrator.readd_model_to_room(model_id)
+    return res
+
+@app.post("/api/models/set_moderator")
+def set_moderator(model_id: str):
+    orchestrator.set_moderator(model_id)
+    return {"success": True, "moderator_model_id": orchestrator.moderator_model_id}
 
 @app.post("/api/votes/override")
 def override_vote(req: VoteOverrideReq):

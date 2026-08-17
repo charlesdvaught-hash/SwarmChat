@@ -16,7 +16,8 @@ class Orchestrator:
         self.respond_immediately_to_at = True
         self.moderator_model_id = "model_architect"
 
-        self.models: Dict[str, Dict[str, Any]] = {
+        # Known models library (persisted across room additions/removals)
+        self.known_models: Dict[str, Dict[str, Any]] = {
             "model_architect": {
                 "id": "model_architect",
                 "name": "Architect",
@@ -25,7 +26,8 @@ class Orchestrator:
                 "model_name": "llama3.2:1b",
                 "enabled": True,
                 "is_moderator": True,
-                "status": "active"
+                "status": "active",
+                "max_context_tokens": 4096
             },
             "model_critic": {
                 "id": "model_critic",
@@ -35,7 +37,8 @@ class Orchestrator:
                 "model_name": "llama3.2:1b",
                 "enabled": True,
                 "is_moderator": False,
-                "status": "active"
+                "status": "active",
+                "max_context_tokens": 4096
             },
             "model_coder": {
                 "id": "model_coder",
@@ -45,8 +48,14 @@ class Orchestrator:
                 "model_name": "llama3.2:1b",
                 "enabled": True,
                 "is_moderator": False,
-                "status": "active"
+                "status": "active",
+                "max_context_tokens": 4096
             }
+        }
+
+        # Active chatroom models (subset of known models currently in the room)
+        self.models: Dict[str, Dict[str, Any]] = {
+            m_id: dict(cfg) for m_id, cfg in self.known_models.items()
         }
 
         self.pending_tool_votes: List[Dict[str, Any]] = []
@@ -60,7 +69,48 @@ class Orchestrator:
         if model_id in self.models:
             for m_id, m_cfg in self.models.items():
                 m_cfg["is_moderator"] = (m_id == model_id)
+            for m_id, m_cfg in self.known_models.items():
+                m_cfg["is_moderator"] = (m_id == model_id)
             self.moderator_model_id = model_id
+
+    def add_or_update_known_model(self, model_cfg: Dict[str, Any]):
+        m_id = model_cfg["id"]
+        self.known_models[m_id] = model_cfg
+        self.models[m_id] = dict(model_cfg)
+        if model_cfg.get("is_moderator"):
+            self.set_moderator(m_id)
+
+    def kick_model_from_room(self, model_id: str) -> Dict[str, Any]:
+        was_moderator = False
+        if model_id in self.models:
+            was_moderator = self.models[model_id].get("is_moderator", False)
+            del self.models[model_id]
+
+        new_mod_id = None
+        if was_moderator:
+            # Select replacement that wasn't former moderator
+            candidates = [m_id for m_id in self.models if m_id != model_id]
+            if candidates:
+                new_mod_id = candidates[0]
+                self.set_moderator(new_mod_id)
+            else:
+                self.moderator_model_id = None
+
+        return {
+            "success": True,
+            "kicked_id": model_id,
+            "was_moderator": was_moderator,
+            "auto_assigned_moderator": new_mod_id,
+            "active_models": self.models
+        }
+
+    def readd_model_to_room(self, model_id: str) -> Dict[str, Any]:
+        if model_id in self.known_models:
+            self.models[model_id] = dict(self.known_models[model_id])
+            if self.known_models[model_id].get("is_moderator"):
+                self.set_moderator(model_id)
+            return {"success": True, "model": self.models[model_id]}
+        return {"success": False, "error": "Model not found in known models library"}
 
     def add_chat_message(self, sender: str, role: str, content: str, is_admin: bool = False, model_id: Optional[str] = None) -> Dict[str, Any]:
         msg = {
@@ -105,11 +155,23 @@ class Orchestrator:
         )
 
         memory_summary = self.memory_manager.get_memory_summary()
-        context_prompt = f"{sys_prompt}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}"
+        latest_journal = self.memory_manager.get_model_latest_journal(model_id)
+
+        journal_context = ""
+        if latest_journal:
+            journal_context = f"\n\n### YOUR LATEST TIMESTAMPED SELF-JOURNAL (PRE-NAP PERSPECTIVE):\n{latest_journal}"
+
+        context_prompt = f"{sys_prompt}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{journal_context}"
+
+        # Check model token usage against limits
+        tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)
+        max_tokens = model_cfg.get("max_context_tokens", 4096)
+        if tokens_used > (max_tokens * 0.8):
+            context_prompt += "\n\n⚠️ WARNING: Your context usage is high! Please write a 200-300 token self-journal using `[JOURNAL: <summary>]` and request a nap `[REQUEST_NAP]`."
 
         recent_msgs = [
             {"role": "user" if m["is_admin"] else "assistant", "content": f"[{m['sender']} ({m['role']})]: {m['content']}"}
-            for m in self.chat_history[-8:]
+            for m in self.chat_history[-6:]
         ]
         if not recent_msgs:
             recent_msgs = [{"role": "user", "content": "Please introduce your perspective on the current project."}]
@@ -126,6 +188,16 @@ class Orchestrator:
             self.memory_manager.add_entry(model_cfg["name"], "Declared readiness for Execution Phase.")
         elif "[REQUEST_DISCUSSION]" in response_text:
             self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
+
+        if "[JOURNAL:" in response_text:
+            try:
+                start = response_text.find("[JOURNAL:") + len("[JOURNAL:")
+                end = response_text.find("]", start)
+                if end != -1:
+                    journal_content = response_text[start:end].strip()
+                    self.memory_manager.record_model_nap(model_id, journal_content)
+            except Exception:
+                pass
         elif "[LOG_TO_MEMORY:" in response_text:
             try:
                 start = response_text.find("[LOG_TO_MEMORY:") + len("[LOG_TO_MEMORY:")
@@ -136,7 +208,7 @@ class Orchestrator:
             except Exception:
                 pass
 
-        if "[REQUEST_NAP]" in response_text:
+        if "[REQUEST_NAP]" in response_text and "[JOURNAL:" not in response_text:
             self.memory_manager.record_model_nap(model_id, f"{model_cfg['name']} completed a context nap.")
 
         msg = self.add_chat_message(

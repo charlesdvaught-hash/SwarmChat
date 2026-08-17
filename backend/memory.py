@@ -126,3 +126,9 @@ class MemoryManager:
             return "No shared memory entries recorded yet."
         summary_lines = [f"- [{e.get('author')}]: {e.get('content')}" for e in entries[-10:]]
         return "\n".join(summary_lines)
+
+    def get_model_latest_journal(self, model_id: str) -> Optional[str]:
+        journals = self.state.get("model_journals", {}).get(model_id, [])
+        if journals:
+            return journals[-1].get("summary", "")
+        return None
