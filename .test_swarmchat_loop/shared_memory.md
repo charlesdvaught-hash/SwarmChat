@@ -9,6 +9,11 @@
 *No shared entries logged yet.*
 
 ---
+## 📦 Episodes & Thread Checkpoints (NAC Architecture)
+
+*No episodes recorded yet.*
+
+---
 ## 💤 Model Context Journals & Naps
 
 *No model naps or context refreshes logged yet.*

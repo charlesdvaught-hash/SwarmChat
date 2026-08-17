@@ -174,3 +174,45 @@ def test_autonomous_loop_and_speaker_selection():
     # Test autonomous loop max turn execution
     asyncio.run(orch.run_autonomous_loop(max_turns=2))
     assert len(orch.chat_history) >= 3
+
+def test_gguf_path_resolution_and_search_paths(tmp_path):
+    mm = ModelManager()
+    # Create a dummy gguf file in temp dir
+    fake_dir = tmp_path / "custom_models"
+    fake_dir.mkdir()
+    dummy_gguf = fake_dir / "Bonsai-27B-Q1_0.gguf"
+    dummy_gguf.write_text("dummy gguf weights")
+
+    # Before adding custom path, path resolution by filename alone should fail
+    resolved_before = mm.resolve_gguf_path("Bonsai-27B-Q1_0.gguf")
+    assert resolved_before is None or os.path.exists(resolved_before)
+
+    # Add custom path to search paths
+    mm.add_search_path(str(fake_dir))
+    assert str(fake_dir) in mm.get_search_paths()
+
+    # Now resolve_gguf_path with filename should find absolute path
+    resolved_after = mm.resolve_gguf_path("Bonsai-27B-Q1_0.gguf")
+    assert resolved_after is not None
+    assert os.path.abspath(resolved_after) == os.path.abspath(str(dummy_gguf))
+
+def test_huggingface_search_tool():
+    tm = ToolManager()
+    assert "huggingface.co" in tm.allowed_domains
+    assert tm.classify_tool_risk("search_huggingface") == "low"
+
+    res = asyncio.run(tm.search_huggingface("Llama-3-GGUF", limit=3))
+    assert res["success"] is True
+    assert "models" in res
+    assert len(res["models"]) > 0
+    assert "model_id" in res["models"][0]
+
+def test_fs_browser_and_validation():
+    from backend.main import browse_filesystem, validate_model_path, ValidatePathReq
+    browse_res = browse_filesystem(".")
+    assert browse_res["success"] is True
+    assert "current_path" in browse_res
+    assert "files" in browse_res
+
+    val_res = validate_model_path(ValidatePathReq(path="non_existent_file.gguf"))
+    assert val_res["valid"] is False
