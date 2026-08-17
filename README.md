@@ -1,4 +1,4 @@
-# SwarmChat — Multi-Model Agentic Chat Room (Local GGUF + Cloud Hybrid)
+# SwarmChat — Multi-Model Agentic Chat Room (Local GGUF + Cloud Hybrid) for budget to high end hardware.
 
 SwarmChat is a user-friendly desktop application that loads multiple local GGUF models (via Ollama or custom runners) and optional cloud models (Claude, Groq, Gemini) into a shared, interactive chat room. Models act as specialized participants (Architect, Critic, Solver, Coder, Tester/Debugger) and collaborate under an optional Moderator.
 
