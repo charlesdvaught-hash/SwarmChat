@@ -11,7 +11,7 @@ def check_system_resources():
     total_gb = mem.total / (1024 ** 3)
     available_gb = mem.available / (1024 ** 3)
     print(f"RAM Total: {total_gb:.2f} GB | Available: {available_gb:.2f} GB")
-
+    
     cuda_available = False
     vram_gb = 0
     if shutil.which("nvidia-smi"):
@@ -49,7 +49,7 @@ def check_dependencies():
         "node": shutil.which("node") is not None,
         "npm": shutil.which("npm") is not None
     }
-
+    
     for dep, status in deps.items():
         if isinstance(status, bool):
             symbol = "✓" if status else "✗ (Optional)"

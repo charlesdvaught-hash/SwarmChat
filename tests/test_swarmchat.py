@@ -31,7 +31,7 @@ def test_memory_manager():
 def test_thinking_disabled_prompts():
     prompt_disc = get_system_prompt("Architect", "discussion", is_moderator=False)
     assert "THINKING / REASONING MODE: DISABLED BY DEFAULT" in prompt_disc
-
+    
     prompt_mod = get_system_prompt("Architect", "discussion", is_moderator=True)
     assert "MODERATOR REASONING MODE: BRIEF & FOCUSED" in prompt_mod
 

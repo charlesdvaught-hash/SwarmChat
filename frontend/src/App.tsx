@@ -46,7 +46,7 @@ export default function App() {
   const [pendingVotes, setPendingVotes] = useState<PendingVote[]>([]);
   const [sharedMemory, setSharedMemory] = useState<any[]>([]);
   const [hardware, setHardware] = useState<any>(null);
-
+  
   // UI Panels & Modals
   const [showSetup, setShowSetup] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
@@ -189,7 +189,7 @@ export default function App() {
             <span>SwarmChat</span>
           </div>
           <div className="h-4 w-px bg-slate-700" />
-
+          
           {/* Phase Badge & Switch Button */}
           <button
             onClick={togglePhase}
@@ -250,7 +250,7 @@ export default function App() {
       <div className="flex flex-1 overflow-hidden">
         {/* CENTER CHAT ARENA (Takes Center Stage) */}
         <div className="flex-1 flex flex-col bg-slate-950 relative">
-
+          
           {/* Pending Tool Vote Banner */}
           {pendingVotes.filter(v => v.status === 'pending').length > 0 && (
             <div className="bg-amber-500/10 border-b border-amber-500/30 px-5 py-2.5 flex items-center justify-between text-xs text-amber-300">

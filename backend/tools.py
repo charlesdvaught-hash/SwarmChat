@@ -98,7 +98,7 @@ class ToolManager:
         domains = self.allowed_domains
         if domain_filter:
             domains = [domain_filter]
-
+            
         return {
             "success": True,
             "query": query,

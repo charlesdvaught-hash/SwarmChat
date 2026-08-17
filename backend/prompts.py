@@ -83,7 +83,7 @@ ROLE_DEFINITIONS = {
 def get_system_prompt(role: str, phase: str = "discussion", is_moderator: bool = False) -> str:
     role_info = ROLE_DEFINITIONS.get(role, ROLE_DEFINITIONS["Architect"])
     thinking_inst = MODERATOR_THINKING_INSTRUCTION if is_moderator else THINKING_DISABLED_INSTRUCTION
-
+    
     if phase.lower() == "execution":
         prompt = EXECUTION_PROMPT_TEMPLATE.format(
             role_name=role,
@@ -96,8 +96,8 @@ def get_system_prompt(role: str, phase: str = "discussion", is_moderator: bool =
             role_description=role_info["description"],
             thinking_instruction=thinking_inst
         )
-
+        
     if is_moderator:
         prompt += MODERATOR_OVERLAY
-
+        
     return prompt
