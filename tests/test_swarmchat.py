@@ -398,11 +398,11 @@ def test_workspace_read_and_list_report_missing_paths():
 
 def test_terminal_command_reports_nonzero_exit_and_timeout():
     tm = ToolManager()
-    failed = tm.run_terminal_cmd("exit 3")
+    failed = tm.run_terminal_cmd("python -c 'import sys; sys.exit(3)'")
     assert failed["success"] is False
     assert failed["returncode"] == 3
 
-    timed_out = tm.run_terminal_cmd("sleep 5", timeout=1)
+    timed_out = tm.run_terminal_cmd("python -c 'import time; time.sleep(5)'", timeout=1)
     assert timed_out["success"] is False
     assert timed_out["timed_out"] is True
 
