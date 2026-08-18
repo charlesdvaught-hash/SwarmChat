@@ -568,8 +568,7 @@ export default function App() {
               <div className="flex items-center gap-1 text-cyan-300">
                 <Zap className="w-3.5 h-3.5 text-cyan-400" />
                 <span>
-                  VRAM: {hardware.vram_free_gb ?? 0}GB
-                  {hardware.vram_total_gb ? ` / ${hardware.vram_total_gb}GB` : ''}
+                  VRAM: {hardware.gpu_name || hardware.vram_total_gb > 0 ? `${hardware.vram_free_gb ?? 0}GB / ${hardware.vram_total_gb ?? 0}GB` : '0GB (CPU Mode)'}
                 </span>
                 {hardware.gpu_name && (
                   <span className="text-[10px] text-slate-400 font-mono">({hardware.gpu_name})</span>
