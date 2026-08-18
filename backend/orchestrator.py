@@ -326,36 +326,44 @@ class Orchestrator:
         # Check model token usage against limits - enforce context reset if exceeded to prevent degradation
         tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)
         max_tokens = model_cfg.get("max_context_tokens", 4096)
+        context_was_reset = False
         if tokens_used > (max_tokens * 0.75):
-            # Record automatic self-journal and reset token counter for model
-            auto_journal = f"Auto-checkpoint save file for {model_cfg['name']}: Completed discussions/actions. Active role: {model_cfg['role']}."
+            # Record automatic LLM-driven/rule self-journal and reset token counter for model
+            auto_journal = f"Context refresh checkpoint for {model_cfg['name']} ({model_cfg['role']}): Active project '{self.memory_manager.get_project_id()}'. Current task: '{active_task['title'] if active_task else 'General Discussion'}'. Key contributions logged to shared memory."
             self.memory_manager.record_model_nap(model_id, auto_journal)
             self.memory_manager.state["tokens_used"][model_id] = 0
             self.memory_manager.save_memory()
-            context_prompt += f"\n\n### 🔄 REFRESHED CONTEXT SAVE FILE:\n{auto_journal}\nPlease continue your concise contribution (1-5 sentences)."
+            context_was_reset = True
 
-        if current_phase == "execution":
-            # Stateless refresh for execution phase: clean context window populated with workspace file manifest & task details
+            # Construct ~50-token high-level project summary
+            proj_summary_50_tokens = (
+                f"PROJECT INDEX ({self.memory_manager.get_project_id()}): "
+                f"Phase: {current_phase.upper()}. Task: {active_task['title'] if active_task else 'General Alignment'}. "
+                f"Goal: Execute requirements with full audit trail, indexed memory logging, and zero context bloat."
+            )
+            context_prompt = f"{sys_prompt}\n\n### 📌 HIGH-LEVEL PROJECT INDEX (~50 TOKENS):\n{proj_summary_50_tokens}\n\n### SHARED INDEXED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{task_context}\n\n### 🔄 REFRESHED CONTEXT SAVE FILE:\n{auto_journal}\nPlease continue your concise contribution."
+
+        if context_was_reset or current_phase == "execution":
+            # Clean context refresh mode: minimal message context to prevent token overload
             file_manifest = self.tool_manager.list_files(".", bot_id=model_id)
             manifest_str = ", ".join(file_manifest.get("files", [])[:15]) if isinstance(file_manifest, dict) else ""
 
             recent_msgs = [
                 {
                     "role": "user",
-                    "content": f"[SYSTEM REFRESH - STATELESS EXECUTION MODE]\nTask: {active_task['title'] if active_task else 'Execute code edits'}\nWorkspace Files: {manifest_str}\nPlease analyze your task requirements, retrieve any necessary indexed memory/journal entries, and execute your updates using tool commands or proposed edits."
+                    "content": f"[SYSTEM REFRESH - INDEXED MEMORY MODE]\nTask: {active_task['title'] if active_task else 'Execute or discuss requirements'}\nWorkspace Files: {manifest_str}\nProvide your next concise contribution or action tag based on indexed memory."
                 }
             ]
         else:
             # Discussion phase: Truncate messages to prevent prompt overflow & context degradation
-            # Limit each message to max 400 characters and include at most the last 5 turns
+            # Limit each message to max 300 characters and include at most the last 3 turns to prevent echo loops
             from backend.sanitizer import sanitize_message_content
             recent_msgs = []
-            for m in self.chat_history[-5:]:
+            for m in self.chat_history[-3:]:
                 clean_c = sanitize_message_content(m["content"])
-                if len(clean_c) > 400:
-                    clean_c = clean_c[:400] + "... [truncated for context efficiency]"
+                if len(clean_c) > 300:
+                    clean_c = clean_c[:300] + "... [truncated]"
                 role = "user" if m["is_admin"] else "assistant"
-                # Avoid prepending speaker name inside content to prevent model self-echoing header confusion
                 recent_msgs.append({
                     "role": role,
                     "content": clean_c
@@ -431,6 +439,47 @@ class Orchestrator:
             except Exception:
                 pass
 
+        if "[UPDATE_TASK:" in response_text:
+            try:
+                start = response_text.find("[UPDATE_TASK:") + len("[UPDATE_TASK:")
+                end = response_text.find("]", start)
+                if end != -1:
+                    raw_task = response_text[start:end].strip()
+                    parts = [p.strip() for p in raw_task.split(",")]
+                    kwargs = {}
+                    for p in parts:
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            kwargs[k.strip()] = v.strip()
+
+                    task_id = kwargs.get("id")
+                    if task_id and any(t["id"] == task_id for t in self.memory_manager.get_task_itinerary()):
+                        updates = {k: v for k, v in kwargs.items() if k != "id"}
+                        self.memory_manager.update_itinerary_task(task_id, updates)
+                        self.memory_manager.add_entry(
+                            model_cfg["name"],
+                            f"Updated itinerary task '{task_id}': {updates}"
+                        )
+                    else:
+                        title = kwargs.get("title", kwargs.get("description", "New Task"))
+                        desc = kwargs.get("description", title)
+                        priority = kwargs.get("priority", "medium")
+                        status = kwargs.get("status", "pending")
+                        created = self.memory_manager.add_itinerary_task(
+                            title=title,
+                            description=desc,
+                            priority=priority,
+                            assigned_model=kwargs.get("assigned_model", model_id)
+                        )
+                        if status != "pending":
+                            self.memory_manager.update_itinerary_task(created["id"], {"status": status})
+                        self.memory_manager.add_entry(
+                            model_cfg["name"],
+                            f"Created new itinerary task '{created['id']}': {title} (Status: {status})"
+                        )
+            except Exception as e:
+                print(f"Error parsing UPDATE_TASK tag: {e}")
+
         if "[SEARCH_HF:" in response_text:
             try:
                 start = response_text.find("[SEARCH_HF:") + len("[SEARCH_HF:")
@@ -456,7 +505,8 @@ class Orchestrator:
                     self.memory_manager.record_model_nap(model_id, journal_content)
             except Exception:
                 pass
-        elif "[LOG_TO_MEMORY:" in response_text:
+
+        if "[LOG_TO_MEMORY:" in response_text:
             try:
                 start = response_text.find("[LOG_TO_MEMORY:") + len("[LOG_TO_MEMORY:")
                 end = response_text.find("]", start)

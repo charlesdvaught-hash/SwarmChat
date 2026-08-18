@@ -216,3 +216,21 @@ def test_fs_browser_and_validation():
 
     val_res = validate_model_path(ValidatePathReq(path="non_existent_file.gguf"))
     assert val_res["valid"] is False
+
+def test_action_tag_parsing_and_context_reset():
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=".test_swarmchat_tags")
+    tm = ToolManager()
+    orch = Orchestrator(mm, mem, tm)
+
+    # Test UPDATE_TASK tag parsing
+    task = mem.add_itinerary_task("Initial Task", "Task description")
+    task_id = task["id"]
+
+    # Exceed model token limit to trigger context refresh
+    mem.state.setdefault("tokens_used", {})["model_architect"] = 4000
+    res = asyncio.run(orch.step_model_turn("model_architect"))
+
+    # Token counter should reset to 0 after turn
+    assert mem.state["tokens_used"]["model_architect"] < 4000
+    assert len(mem.state.get("model_journals", {}).get("model_architect", [])) > 0
