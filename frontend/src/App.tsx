@@ -83,6 +83,12 @@ export default function App() {
   const [isStepping, setIsStepping] = useState(false);
   const [collapsedCodeBlocks, setCollapsedCodeBlocks] = useState<Record<string, boolean>>({});
 
+  // Roster & Auto-Turn State
+  const [turnSchedule, setTurnSchedule] = useState<string[]>([]);
+  const [isAutoTurn, setIsAutoTurn] = useState(false);
+  const [showRosterModal, setShowRosterModal] = useState(false);
+  const [editedRoster, setEditedRoster] = useState<string[]>([]);
+
   // @ Mention Autocomplete state
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
   const [mentionQuery, setMentionQuery] = useState('');
@@ -136,6 +142,7 @@ export default function App() {
         setActiveTask(data.active_task || null);
         setFileAuditLog(data.file_audit_log || []);
         setActiveFileLocks(data.active_file_locks || {});
+        setTurnSchedule(data.turn_schedule || []);
       }
       const hwRes = await fetch('/api/hardware');
       if (hwRes.ok) {
@@ -295,6 +302,42 @@ export default function App() {
       await fetchState();
     } finally {
       setIsStepping(false);
+    }
+  };
+
+  const handleEmergencyStop = async () => {
+    try {
+      await fetch('/api/chat/stop', { method: 'POST' });
+      setIsAutoTurn(false);
+      await fetchState();
+    } catch (e) {
+      console.error('Emergency stop error:', e);
+    }
+  };
+
+  const handleRefreshRoster = async () => {
+    try {
+      const res = await fetch('/api/roster/refresh', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setTurnSchedule(data.turn_schedule || []);
+      }
+    } catch (e) {
+      console.error('Refresh roster error:', e);
+    }
+  };
+
+  const handleSaveRoster = async () => {
+    try {
+      await fetch('/api/roster/update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ schedule: editedRoster })
+      });
+      setShowRosterModal(false);
+      await fetchState();
+    } catch (e) {
+      console.error('Save roster error:', e);
     }
   };
 
@@ -484,7 +527,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* Hardware Status & Top Action Buttons */}
+        {/* Hardware Status, Emergency Stop & Top Action Buttons */}
         <div className="flex items-center gap-3">
           {hardware && (
             <div className="flex items-center gap-3 text-xs bg-slate-800/60 px-3 py-1 rounded-lg border border-slate-700/50">
@@ -494,6 +537,16 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {/* EMERGENCY STOP BUTTON */}
+          <button
+            onClick={handleEmergencyStop}
+            className="flex items-center gap-1.5 text-xs bg-rose-600 hover:bg-rose-500 text-white font-bold px-3 py-1.5 rounded-lg transition shadow-[0_0_12px_rgba(225,29,72,0.4)] animate-pulse"
+            title="Emergency Stop all loops and tool executions immediately"
+          >
+            <X className="w-4 h-4 stroke-[3]" />
+            <span>EMERGENCY STOP</span>
+          </button>
 
           <button
             onClick={() => setShowSetup(true)}
@@ -617,6 +670,48 @@ export default function App() {
               </div>
             )}
 
+            {/* Roster Queue Dashboard & Auto Control Banner */}
+            <div className="mb-2 flex items-center justify-between bg-slate-950/80 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-300">
+              <div className="flex items-center gap-2">
+                <Users className="w-4 h-4 text-cyan-400" />
+                <span className="font-semibold text-cyan-300">Roster Step:</span>
+                <span className="bg-slate-900 border border-slate-800 px-2 py-0.5 rounded font-mono text-[11px] text-slate-200">
+                  {turnSchedule.length > 0
+                    ? `Next: @${models[turnSchedule[0]]?.name || turnSchedule[0]} (${turnSchedule.length} in queue)`
+                    : 'Queue Empty (Moderator Alerted)'}
+                </span>
+                <button
+                  onClick={() => {
+                    setEditedRoster([...turnSchedule]);
+                    setShowRosterModal(true);
+                  }}
+                  className="text-[10px] bg-slate-800 hover:bg-slate-700 text-cyan-300 px-2 py-0.5 rounded border border-slate-700 transition"
+                >
+                  Edit Roster
+                </button>
+                <button
+                  onClick={handleRefreshRoster}
+                  className="text-[10px] bg-slate-800 hover:bg-slate-700 text-emerald-400 px-2 py-0.5 rounded border border-slate-700 flex items-center gap-1 transition"
+                  title="Refresh Roster Queue"
+                >
+                  <RefreshCw className="w-3 h-3" /> Refresh
+                </button>
+              </div>
+
+              {/* Auto Mode Toggle */}
+              <button
+                onClick={() => setIsAutoTurn(!isAutoTurn)}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold transition shadow ${
+                  isAutoTurn
+                    ? 'bg-emerald-600 text-white shadow-emerald-900/50 animate-pulse'
+                    : 'bg-slate-800 text-slate-400 border border-slate-700 hover:text-slate-200'
+                }`}
+              >
+                <Zap className="w-3.5 h-3.5" />
+                <span>Auto: {isAutoTurn ? 'ON' : 'OFF'}</span>
+              </button>
+            </div>
+
             <form onSubmit={handleSendMessage} className="flex gap-2">
               <input
                 type="text"
@@ -633,15 +728,16 @@ export default function App() {
                 <span>Send</span>
               </button>
 
+              {/* Compact Next Turn Button */}
               <button
                 type="button"
                 onClick={handleStepTurn}
                 disabled={isStepping}
-                className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white px-4 py-2.5 rounded-xl font-medium text-sm flex items-center gap-1.5 transition shadow-sm"
+                className="bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white px-3 py-2.5 rounded-xl font-medium text-xs flex items-center gap-1 transition shadow-sm shrink-0"
                 title="Trigger Next Model Turn"
               >
-                <Play className="w-4 h-4" />
-                <span>{isStepping ? 'Model Thinking...' : 'Trigger Model Turn'}</span>
+                <Play className="w-3.5 h-3.5" />
+                <span>{isStepping ? 'Thinking...' : 'Next Turn'}</span>
               </button>
             </form>
           </div>
@@ -1667,6 +1763,75 @@ export default function App() {
             <div className="pt-3 border-t border-slate-800 flex justify-end">
               <button onClick={() => setShowOverlay(false)} className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-1.5 rounded-xl text-xs font-medium">
                 Close Operations Menu
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* --- ADMIN ROSTER CUSTOMIZATION POPUP MODAL --- */}
+      {showRosterModal && (
+        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-base text-cyan-400 flex items-center gap-2">
+                <Users className="w-5 h-5" />
+                <span>Admin Roster Customization</span>
+              </h3>
+              <button onClick={() => setShowRosterModal(false)} className="text-slate-400 hover:text-slate-200">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-300">
+              Customize or reorder the speaker turn sequence for active models in the room:
+            </p>
+
+            <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+              {editedRoster.map((mId, idx) => (
+                <div key={idx} className="flex items-center justify-between bg-slate-950 border border-slate-800 p-2.5 rounded-xl text-xs text-slate-200">
+                  <span className="font-mono text-cyan-300">#{idx + 1} @{models[mId]?.name || mId} ({models[mId]?.role || 'Participant'})</span>
+                  <button
+                    type="button"
+                    onClick={() => setEditedRoster(editedRoster.filter((_, i) => i !== idx))}
+                    className="text-rose-400 hover:text-rose-300 p-1 rounded"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              <div className="text-xs font-semibold text-slate-400 uppercase">Add Participant to Turn Queue</div>
+              <div className="flex gap-2">
+                {Object.values(models).map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => setEditedRoster([...editedRoster, m.id])}
+                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 px-2.5 py-1 rounded-lg text-xs font-medium border border-slate-700"
+                  >
+                    + {m.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="pt-3 border-t border-slate-800 flex justify-between">
+              <button
+                type="button"
+                onClick={handleRefreshRoster}
+                className="bg-slate-800 hover:bg-slate-700 text-emerald-400 text-xs px-3 py-1.5 rounded-xl font-medium"
+              >
+                Auto-Generate Roster
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveRoster}
+                className="bg-cyan-600 hover:bg-cyan-500 text-white text-xs px-4 py-1.5 rounded-xl font-medium"
+              >
+                Save Roster
               </button>
             </div>
           </div>
