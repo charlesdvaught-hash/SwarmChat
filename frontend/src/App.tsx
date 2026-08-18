@@ -5,6 +5,37 @@ import {
   ChevronDown, ChevronRight, UserMinus, UserPlus, RefreshCw, FileText, CheckSquare, Activity
 } from 'lucide-react';
 
+const TOKEN_HEADER = 'X-SwarmChat-Token';
+const TOKEN_STORAGE_KEY = 'swarmchat_api_token';
+
+/**
+ * Reads the API token used when the backend runs with SWARMCHAT_API_TOKEN set. The token may be
+ * handed over once as a `?token=` query parameter; it is then kept in sessionStorage and removed
+ * from the address bar so it does not linger in history or shared links.
+ */
+function getApiToken(): string {
+  try {
+    const url = new URL(window.location.href);
+    const fromUrl = url.searchParams.get('token');
+    if (fromUrl) {
+      sessionStorage.setItem(TOKEN_STORAGE_KEY, fromUrl);
+      url.searchParams.delete('token');
+      window.history.replaceState({}, '', url.toString());
+      return fromUrl;
+    }
+    return sessionStorage.getItem(TOKEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const token = getApiToken();
+  const headers = new Headers(init.headers || {});
+  if (token) headers.set(TOKEN_HEADER, token);
+  return fetch(input, { ...init, headers, credentials: 'same-origin' });
+}
+
 interface ChatMessage {
   id: string;
   sender: string;
@@ -127,7 +158,7 @@ export default function App() {
 
   const fetchState = async () => {
     try {
-      const res = await fetch('/api/state');
+      const res = await apiFetch('/api/state');
       if (res.ok) {
         const data = await res.json();
         setPhase(data.phase);
@@ -144,28 +175,28 @@ export default function App() {
         setActiveFileLocks(data.active_file_locks || {});
         setTurnSchedule(data.turn_schedule || []);
       }
-      const hwRes = await fetch('/api/hardware');
+      const hwRes = await apiFetch('/api/hardware');
       if (hwRes.ok) {
         setHardware(await hwRes.json());
       }
-      const depRes = await fetch('/api/dependencies');
+      const depRes = await apiFetch('/api/dependencies');
       if (depRes.ok) {
         setDependencies(await depRes.json());
       }
 
-      const filesRes = await fetch('/api/workspace/files');
+      const filesRes = await apiFetch('/api/workspace/files');
       if (filesRes.ok) {
         const fdata = await filesRes.json();
         setWorkspaceFiles(fdata.items || []);
       }
 
-      const healthRes = await fetch('/api/evaluate/health');
+      const healthRes = await apiFetch('/api/evaluate/health');
       if (healthRes.ok) {
         const hdata = await healthRes.json();
         setRoomHealth(hdata.reports || []);
       }
 
-      const pathsRes = await fetch('/api/models/search_paths');
+      const pathsRes = await apiFetch('/api/models/search_paths');
       if (pathsRes.ok) {
         const pdata = await pathsRes.json();
         setSearchPaths(pdata.search_paths || []);
@@ -178,7 +209,7 @@ export default function App() {
   const handleBrowseFs = async (targetPath?: string) => {
     try {
       const url = targetPath ? `/api/fs/browse?path=${encodeURIComponent(targetPath)}` : '/api/fs/browse';
-      const res = await fetch(url);
+      const res = await apiFetch(url);
       if (res.ok) {
         const data = await res.json();
         setFsCurrentPath(data.current_path);
@@ -194,7 +225,7 @@ export default function App() {
   const handleValidatePath = async (p: string, mmP?: string) => {
     if (!p) return;
     try {
-      const res = await fetch('/api/fs/validate', {
+      const res = await apiFetch('/api/fs/validate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: p, mmproj_path: mmP })
@@ -213,7 +244,7 @@ export default function App() {
     if (!hfQuery.trim()) return;
     setIsSearchingHf(true);
     try {
-      const res = await fetch(`/api/tools/search_hf?query=${encodeURIComponent(hfQuery)}`);
+      const res = await apiFetch(`/api/tools/search_hf?query=${encodeURIComponent(hfQuery)}`);
       if (res.ok) {
         const data = await res.json();
         setHfResults(data.models || []);
@@ -228,7 +259,7 @@ export default function App() {
   const handleInstallEngine = async () => {
     setIsInstallingEngine(true);
     try {
-      await fetch('/api/engine/install', { method: 'POST' });
+      await apiFetch('/api/engine/install', { method: 'POST' });
       await fetchState();
     } finally {
       setIsInstallingEngine(false);
@@ -247,7 +278,7 @@ export default function App() {
 
   const togglePhase = async () => {
     const nextPhase = phase === 'discussion' ? 'execution' : 'discussion';
-    await fetch('/api/phase', {
+    await apiFetch('/api/phase', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ phase: nextPhase })
@@ -286,7 +317,7 @@ export default function App() {
     setInputText('');
     setShowMentionDropdown(false);
 
-    await fetch('/api/chat/message', {
+    await apiFetch('/api/chat/message', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sender: 'Admin', content: text, is_admin: true })
@@ -298,7 +329,7 @@ export default function App() {
   const handleStepTurn = async () => {
     setIsStepping(true);
     try {
-      await fetch('/api/chat/step', { method: 'POST' });
+      await apiFetch('/api/chat/step', { method: 'POST' });
       await fetchState();
     } finally {
       setIsStepping(false);
@@ -307,7 +338,7 @@ export default function App() {
 
   const handleEmergencyStop = async () => {
     try {
-      await fetch('/api/chat/stop', { method: 'POST' });
+      await apiFetch('/api/chat/stop', { method: 'POST' });
       setIsAutoTurn(false);
       await fetchState();
     } catch (e) {
@@ -317,7 +348,7 @@ export default function App() {
 
   const handleRefreshRoster = async () => {
     try {
-      const res = await fetch('/api/roster/refresh', { method: 'POST' });
+      const res = await apiFetch('/api/roster/refresh', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         setTurnSchedule(data.turn_schedule || []);
@@ -329,7 +360,7 @@ export default function App() {
 
   const handleSaveRoster = async () => {
     try {
-      await fetch('/api/roster/update', {
+      await apiFetch('/api/roster/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ schedule: editedRoster })
@@ -342,7 +373,7 @@ export default function App() {
   };
 
   const handleVoteOverride = async (voteId: string, action: 'approve' | 'reject') => {
-    await fetch('/api/votes/override', {
+    await apiFetch('/api/votes/override', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ vote_id: voteId, action })
@@ -364,7 +395,7 @@ export default function App() {
 
   const handleKickModel = async (modelId: string) => {
     const isMod = models[modelId]?.is_moderator;
-    const res = await fetch(`/api/models/kick?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
+    const res = await apiFetch(`/api/models/kick?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
     if (res.ok) {
       const data = await res.json();
       if (isMod) {
@@ -376,12 +407,12 @@ export default function App() {
   };
 
   const handleReaddModel = async (modelId: string) => {
-    await fetch(`/api/models/readd?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
+    await apiFetch(`/api/models/readd?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
     fetchState();
   };
 
   const handleSelectModerator = async (modelId: string) => {
-    await fetch(`/api/models/set_moderator?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
+    await apiFetch(`/api/models/set_moderator?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
     setShowModPrompt(false);
     setFormerModId(null);
     fetchState();
@@ -409,7 +440,7 @@ export default function App() {
       status: 'active'
     };
 
-    await fetch('/api/models/configure', {
+    await apiFetch('/api/models/configure', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -1358,7 +1389,7 @@ export default function App() {
                     onSubmit={async (e) => {
                       e.preventDefault();
                       if (!customSearchPathInput) return;
-                      await fetch('/api/models/search_paths', {
+                      await apiFetch('/api/models/search_paths', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ path: customSearchPathInput })
@@ -1526,7 +1557,7 @@ export default function App() {
                       onSubmit={async (e) => {
                         e.preventDefault();
                         if (!newTaskTitle) return;
-                        await fetch('/api/itinerary/task', {
+                        await apiFetch('/api/itinerary/task', {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({
@@ -1604,7 +1635,7 @@ export default function App() {
                             {task.status !== 'in_progress' && (
                               <button
                                 onClick={async () => {
-                                  await fetch('/api/itinerary/update', {
+                                  await apiFetch('/api/itinerary/update', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({ task_id: task.id, status: 'in_progress' })
@@ -1619,7 +1650,7 @@ export default function App() {
                             {task.status !== 'completed' && (
                               <button
                                 onClick={async () => {
-                                  await fetch('/api/itinerary/update', {
+                                  await apiFetch('/api/itinerary/update', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({ task_id: task.id, status: 'completed' })
@@ -1677,7 +1708,7 @@ export default function App() {
                           key={file.path}
                           onClick={async () => {
                             setSelectedFilePath(file.path);
-                            const res = await fetch(`/api/workspace/file?filepath=${encodeURIComponent(file.path)}`);
+                            const res = await apiFetch(`/api/workspace/file?filepath=${encodeURIComponent(file.path)}`);
                             if (res.ok) {
                               const data = await res.json();
                               setSelectedFileContent(data.content || '');

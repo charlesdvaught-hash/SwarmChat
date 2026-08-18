@@ -46,6 +46,9 @@ echo   Press Ctrl+C to stop the server when done.
 echo ====================================================
 echo.
 
-python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+if "%SWARMCHAT_HOST%"=="" set SWARMCHAT_HOST=127.0.0.1
+if "%SWARMCHAT_PORT%"=="" set SWARMCHAT_PORT=8000
+
+python -m uvicorn backend.main:app --host %SWARMCHAT_HOST% --port %SWARMCHAT_PORT%
 
 pause

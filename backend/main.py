@@ -4,7 +4,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from pydantic import BaseModel, Field, field_validator
 from typing import Dict, Any, List, Optional
 
 from backend.models import ModelManager
@@ -12,16 +13,44 @@ from backend.memory import MemoryManager
 from backend.tools import ToolManager
 from backend.orchestrator import Orchestrator
 from backend.evaluate import EvaluateEngine
+from backend.security import (
+    TOKEN_HEADER,
+    check_api_access,
+    get_allowed_hosts,
+    get_allowed_origins,
+    redact_model_config,
+    redact_model_configs,
+    validate_safe_id,
+)
+
+MAX_MESSAGE_CHARS = 20000
+MAX_TEXT_CHARS = 2000
+PROVIDERS = {"ollama", "gguf_local", "claude", "groq", "gemini"}
+TASK_PRIORITIES = {"low", "medium", "high"}
+TASK_STATUSES = {"pending", "in_progress", "completed"}
+VOTE_ACTIONS = {"approve", "reject"}
+PHASES = {"discussion", "execution"}
 
 app = FastAPI(title="SwarmChat API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=get_allowed_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", TOKEN_HEADER, "Authorization"],
 )
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_allowed_hosts())
+
+
+@app.middleware("http")
+async def authorize_api_requests(request: Request, call_next):
+    if request.url.path.startswith("/api"):
+        denial = check_api_access(request)
+        if denial is not None:
+            return denial
+    return await call_next(request)
 
 model_mgr = ModelManager()
 memory_mgr = MemoryManager()
@@ -32,9 +61,16 @@ evaluate_engine = EvaluateEngine(model_mgr)
 class PhaseSwitchReq(BaseModel):
     phase: str
 
+    @field_validator("phase")
+    @classmethod
+    def known_phase(cls, v: str) -> str:
+        if v.strip().lower() not in PHASES:
+            raise ValueError(f"phase must be one of {sorted(PHASES)}")
+        return v.strip().lower()
+
 class ChatMsgReq(BaseModel):
-    sender: str = "Admin"
-    content: str
+    sender: str = Field(default="Admin", max_length=120)
+    content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     is_admin: bool = True
 
 class PromptTemplateUpdateReq(BaseModel):
@@ -43,55 +79,95 @@ class PromptTemplateUpdateReq(BaseModel):
 
 class ModelConfigReq(BaseModel):
     id: str
-    name: str
-    role: str
+    name: str = Field(min_length=1, max_length=120)
+    role: str = Field(min_length=1, max_length=120)
     provider: str = "ollama"
-    model_name: str = "llama3.2:1b"
-    gguf_path: Optional[str] = ""
-    mmproj_path: Optional[str] = ""
-    api_key: Optional[str] = ""
+    model_name: str = Field(default="llama3.2:1b", max_length=512)
+    gguf_path: Optional[str] = Field(default="", max_length=4096)
+    mmproj_path: Optional[str] = Field(default="", max_length=4096)
+    api_key: Optional[str] = Field(default="", max_length=1024)
     enabled: bool = True
     is_moderator: bool = False
-    custom_start_prompt: Optional[str] = None
-    custom_execution_prompt: Optional[str] = None
+    custom_start_prompt: Optional[str] = Field(default=None, max_length=MAX_MESSAGE_CHARS)
+    custom_execution_prompt: Optional[str] = Field(default=None, max_length=MAX_MESSAGE_CHARS)
+
+    @field_validator("id")
+    @classmethod
+    def safe_id(cls, v: str) -> str:
+        return validate_safe_id(v, "id")
+
+    @field_validator("provider")
+    @classmethod
+    def known_provider(cls, v: str) -> str:
+        if v not in PROVIDERS:
+            raise ValueError(f"provider must be one of {sorted(PROVIDERS)}")
+        return v
 
 class ValidatePathReq(BaseModel):
-    path: str
-    mmproj_path: Optional[str] = None
+    path: str = Field(max_length=4096)
+    mmproj_path: Optional[str] = Field(default=None, max_length=4096)
 
 class SearchPathReq(BaseModel):
-    path: str
+    path: str = Field(max_length=4096)
 
 class VoteOverrideReq(BaseModel):
-    vote_id: str
+    vote_id: str = Field(max_length=120)
     action: str
     modified_args: Optional[Dict[str, Any]] = None
 
+    @field_validator("action")
+    @classmethod
+    def known_action(cls, v: str) -> str:
+        if v not in VOTE_ACTIONS:
+            raise ValueError(f"action must be one of {sorted(VOTE_ACTIONS)}")
+        return v
+
 class HireVoteReq(BaseModel):
-    model_id: str
-    model_name: str
-    gguf_url_or_tag: str
-    votes_for: List[str]
-    notes: Optional[str] = ""
+    model_id: str = Field(max_length=200)
+    model_name: str = Field(max_length=200)
+    gguf_url_or_tag: str = Field(max_length=1024)
+    votes_for: List[str] = Field(max_length=64)
+    notes: Optional[str] = Field(default="", max_length=MAX_TEXT_CHARS)
 
 class EvaluateReq(BaseModel):
     candidates: List[Dict[str, Any]]
     task_context: str
 
 class ItineraryTaskReq(BaseModel):
-    title: str
-    description: str
+    title: str = Field(min_length=1, max_length=300)
+    description: str = Field(default="", max_length=MAX_MESSAGE_CHARS)
     priority: str = "medium"
-    assigned_model: Optional[str] = None
+    assigned_model: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("priority")
+    @classmethod
+    def known_priority(cls, v: str) -> str:
+        if v not in TASK_PRIORITIES:
+            raise ValueError(f"priority must be one of {sorted(TASK_PRIORITIES)}")
+        return v
 
 class ItineraryTaskUpdateReq(BaseModel):
-    task_id: str
+    task_id: str = Field(max_length=120)
     status: Optional[str] = None
     priority: Optional[str] = None
-    assigned_model: Optional[str] = None
+    assigned_model: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("status")
+    @classmethod
+    def known_status(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in TASK_STATUSES:
+            raise ValueError(f"status must be one of {sorted(TASK_STATUSES)}")
+        return v
+
+    @field_validator("priority")
+    @classmethod
+    def known_priority(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in TASK_PRIORITIES:
+            raise ValueError(f"priority must be one of {sorted(TASK_PRIORITIES)}")
+        return v
 
 class RosterUpdateReq(BaseModel):
-    schedule: List[str]
+    schedule: List[str] = Field(max_length=100)
 
 @app.get("/api/prompts/templates")
 def get_prompt_templates():
@@ -232,8 +308,8 @@ def get_full_state():
         "phase": memory_mgr.get_phase(),
         "turn_mode": orchestrator.turn_mode,
         "moderator_model_id": orchestrator.moderator_model_id,
-        "models": orchestrator.models,
-        "known_models": orchestrator.known_models,
+        "models": redact_model_configs(orchestrator.models),
+        "known_models": redact_model_configs(orchestrator.known_models),
         "model_statuses": model_mgr.model_statuses,
         "pending_votes": orchestrator.pending_tool_votes,
         "chat_history": orchestrator.chat_history,
@@ -330,16 +406,25 @@ def configure_model(req: ModelConfigReq):
         last_loaded_model_dir = os.path.dirname(resolved)
 
     orchestrator.add_or_update_known_model(m_dict)
-    return {"success": True, "models": orchestrator.models, "known_models": orchestrator.known_models, "last_loaded_dir": last_loaded_model_dir}
+    return {
+        "success": True,
+        "models": redact_model_configs(orchestrator.models),
+        "known_models": redact_model_configs(orchestrator.known_models),
+        "last_loaded_dir": last_loaded_model_dir
+    }
 
 @app.post("/api/models/kick")
 def kick_model(model_id: str):
     res = orchestrator.kick_model_from_room(model_id)
+    if isinstance(res.get("active_models"), dict):
+        res["active_models"] = redact_model_configs(res["active_models"])
     return res
 
 @app.post("/api/models/readd")
 def readd_model(model_id: str):
     res = orchestrator.readd_model_to_room(model_id)
+    if isinstance(res.get("model"), dict):
+        res["model"] = redact_model_config(res["model"])
     return res
 
 @app.post("/api/models/set_moderator")

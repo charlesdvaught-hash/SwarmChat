@@ -4,9 +4,13 @@ services:
   swarmchat:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - PYTHONUNBUFFERED=1
+      # Requests reaching the container are not loopback, so a token is required to use the API.
+      - SWARMCHAT_API_TOKEN=${SWARMCHAT_API_TOKEN:?set SWARMCHAT_API_TOKEN before starting SwarmChat}
+      - SWARMCHAT_ALLOWED_HOSTS=${SWARMCHAT_ALLOWED_HOSTS:-localhost,127.0.0.1,::1}
+      - SWARMCHAT_ALLOWED_ORIGINS=${SWARMCHAT_ALLOWED_ORIGINS:-}
     volumes:
       - .:/app
     restart: unless-stopped
