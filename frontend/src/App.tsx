@@ -125,86 +125,100 @@ export default function App() {
 
   const chatEndRef = useRef<HTMLDivElement>(null);
 
+  // Backend failures are shown to the Admin instead of only reaching the browser console.
+  const [apiError, setApiError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+
+  const describeFailure = async (res: Response): Promise<string> => {
+    try {
+      const body = await res.json();
+      const detail = body?.detail ?? body?.error;
+      if (typeof detail === 'string' && detail) return detail;
+    } catch {
+      // Body was not JSON; fall back to the status line.
+    }
+    return `HTTP ${res.status} ${res.statusText}`.trim();
+  };
+
+  const apiRequest = async <T,>(url: string, init?: RequestInit): Promise<T> => {
+    const res = await fetch(url, init);
+    if (!res.ok) throw new Error(await describeFailure(res));
+    return (await res.json()) as T;
+  };
+
+  const postJson = <T,>(url: string, body: unknown): Promise<T> => apiRequest<T>(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  const post = <T,>(url: string): Promise<T> => apiRequest<T>(url, { method: 'POST' });
+
+  const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+  /** Runs an action, surfacing any failure to the Admin as a labelled banner. */
+  const runAction = async (label: string, action: () => Promise<void>): Promise<boolean> => {
+    try {
+      await action();
+      setApiError(null);
+      return true;
+    } catch (e) {
+      setApiError(`${label} failed: ${errorText(e)}`);
+      return false;
+    }
+  };
+
   const fetchState = async () => {
     try {
-      const res = await fetch('/api/state');
-      if (res.ok) {
-        const data = await res.json();
-        setPhase(data.phase);
-        setModels(data.models || {});
-        setKnownModels(data.known_models || data.models || {});
-        setModelStatuses(data.model_statuses || {});
-        setPendingVotes(data.pending_votes || []);
-        setMessages(data.chat_history || []);
-        setSharedMemory(data.shared_memory || []);
-        setEpisodes(data.episodes || []);
-        setTaskItinerary(data.task_itinerary || []);
-        setActiveTask(data.active_task || null);
-        setFileAuditLog(data.file_audit_log || []);
-        setActiveFileLocks(data.active_file_locks || {});
-        setTurnSchedule(data.turn_schedule || []);
-      }
-      const hwRes = await fetch('/api/hardware');
-      if (hwRes.ok) {
-        setHardware(await hwRes.json());
-      }
-      const depRes = await fetch('/api/dependencies');
-      if (depRes.ok) {
-        setDependencies(await depRes.json());
-      }
+      const data = await apiRequest<any>('/api/state');
+      setPhase(data.phase);
+      setModels(data.models || {});
+      setKnownModels(data.known_models || data.models || {});
+      setModelStatuses(data.model_statuses || {});
+      setPendingVotes(data.pending_votes || []);
+      setMessages(data.chat_history || []);
+      setSharedMemory(data.shared_memory || []);
+      setEpisodes(data.episodes || []);
+      setTaskItinerary(data.task_itinerary || []);
+      setActiveTask(data.active_task || null);
+      setFileAuditLog(data.file_audit_log || []);
+      setActiveFileLocks(data.active_file_locks || {});
+      setTurnSchedule(data.turn_schedule || []);
+      // Failures that happen outside a request (shared memory, background conversation loop).
+      const serverIssue = data.memory_error || data.last_background_error;
+      setConnectionError(serverIssue ? `Server: ${serverIssue}` : null);
 
-      const filesRes = await fetch('/api/workspace/files');
-      if (filesRes.ok) {
-        const fdata = await filesRes.json();
-        setWorkspaceFiles(fdata.items || []);
-      }
-
-      const healthRes = await fetch('/api/evaluate/health');
-      if (healthRes.ok) {
-        const hdata = await healthRes.json();
-        setRoomHealth(hdata.reports || []);
-      }
-
-      const pathsRes = await fetch('/api/models/search_paths');
-      if (pathsRes.ok) {
-        const pdata = await pathsRes.json();
-        setSearchPaths(pdata.search_paths || []);
-      }
+      setHardware(await apiRequest<any>('/api/hardware'));
+      setDependencies(await apiRequest<any>('/api/dependencies'));
+      const fdata = await apiRequest<any>('/api/workspace/files');
+      setWorkspaceFiles(fdata.items || []);
+      const hdata = await apiRequest<any>('/api/evaluate/health');
+      setRoomHealth(hdata.reports || []);
+      const pdata = await apiRequest<any>('/api/models/search_paths');
+      setSearchPaths(pdata.search_paths || []);
     } catch (e) {
-      console.error('Fetch state error:', e);
+      setConnectionError(`Could not refresh state: ${errorText(e)}`);
     }
   };
 
   const handleBrowseFs = async (targetPath?: string) => {
-    try {
-      const url = targetPath ? `/api/fs/browse?path=${encodeURIComponent(targetPath)}` : '/api/fs/browse';
-      const res = await fetch(url);
-      if (res.ok) {
-        const data = await res.json();
-        setFsCurrentPath(data.current_path);
-        setFsParentPath(data.parent_path);
-        setFsDirs(data.directories || []);
-        setFsFiles(data.files || []);
-      }
-    } catch (e) {
-      console.error('Browse filesystem error:', e);
-    }
+    const url = targetPath ? `/api/fs/browse?path=${encodeURIComponent(targetPath)}` : '/api/fs/browse';
+    await runAction('Browsing the server filesystem', async () => {
+      const data = await apiRequest<any>(url);
+      setFsCurrentPath(data.current_path);
+      setFsParentPath(data.parent_path);
+      setFsDirs(data.directories || []);
+      setFsFiles(data.files || []);
+    });
   };
 
   const handleValidatePath = async (p: string, mmP?: string) => {
     if (!p) return;
     try {
-      const res = await fetch('/api/fs/validate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: p, mmproj_path: mmP })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setPathValidationMsg({ valid: data.valid, message: data.message, size_gb: data.file_size_gb });
-      }
+      const data = await postJson<any>('/api/fs/validate', { path: p, mmproj_path: mmP });
+      setPathValidationMsg({ valid: data.valid, message: data.message, size_gb: data.file_size_gb });
     } catch (e) {
-      console.error('Validate path error:', e);
+      setPathValidationMsg({ valid: false, message: `Validation request failed: ${errorText(e)}` });
     }
   };
 
@@ -213,13 +227,13 @@ export default function App() {
     if (!hfQuery.trim()) return;
     setIsSearchingHf(true);
     try {
-      const res = await fetch(`/api/tools/search_hf?query=${encodeURIComponent(hfQuery)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setHfResults(data.models || []);
-      }
+      const data = await apiRequest<any>(`/api/tools/search_hf?query=${encodeURIComponent(hfQuery)}`);
+      setHfResults(data.models || []);
+      setApiError(null);
     } catch (e) {
-      console.error('HF Search error:', e);
+      // An empty list would read as "no such model", so the lookup failure is reported instead.
+      setHfResults([]);
+      setApiError(`HuggingFace search failed: ${errorText(e)}`);
     } finally {
       setIsSearchingHf(false);
     }
@@ -228,7 +242,9 @@ export default function App() {
   const handleInstallEngine = async () => {
     setIsInstallingEngine(true);
     try {
-      await fetch('/api/engine/install', { method: 'POST' });
+      await runAction('Installing the llama-cpp-python engine', async () => {
+        await post('/api/engine/install');
+      });
       await fetchState();
     } finally {
       setIsInstallingEngine(false);
@@ -247,10 +263,8 @@ export default function App() {
 
   const togglePhase = async () => {
     const nextPhase = phase === 'discussion' ? 'execution' : 'discussion';
-    await fetch('/api/phase', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phase: nextPhase })
+    await runAction(`Switching to the ${nextPhase} phase`, async () => {
+      await postJson('/api/phase', { phase: nextPhase });
     });
     fetchState();
   };
@@ -286,11 +300,11 @@ export default function App() {
     setInputText('');
     setShowMentionDropdown(false);
 
-    await fetch('/api/chat/message', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sender: 'Admin', content: text, is_admin: true })
+    const sent = await runAction('Sending your message', async () => {
+      await postJson('/api/chat/message', { sender: 'Admin', content: text, is_admin: true });
     });
+    // A rejected message would otherwise vanish from the composer without a trace.
+    if (!sent) setInputText(text);
 
     fetchState();
   };
@@ -298,7 +312,9 @@ export default function App() {
   const handleStepTurn = async () => {
     setIsStepping(true);
     try {
-      await fetch('/api/chat/step', { method: 'POST' });
+      await runAction('Stepping the next model turn', async () => {
+        await post('/api/chat/step');
+      });
       await fetchState();
     } finally {
       setIsStepping(false);
@@ -306,46 +322,33 @@ export default function App() {
   };
 
   const handleEmergencyStop = async () => {
-    try {
-      await fetch('/api/chat/stop', { method: 'POST' });
+    await runAction('Emergency stop', async () => {
+      await post('/api/chat/stop');
       setIsAutoTurn(false);
-      await fetchState();
-    } catch (e) {
-      console.error('Emergency stop error:', e);
-    }
+    });
+    await fetchState();
   };
 
   const handleRefreshRoster = async () => {
-    try {
-      const res = await fetch('/api/roster/refresh', { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        setTurnSchedule(data.turn_schedule || []);
-      }
-    } catch (e) {
-      console.error('Refresh roster error:', e);
-    }
+    await runAction('Refreshing the turn roster', async () => {
+      const data = await post<any>('/api/roster/refresh');
+      setTurnSchedule(data.turn_schedule || []);
+    });
   };
 
   const handleSaveRoster = async () => {
-    try {
-      await fetch('/api/roster/update', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ schedule: editedRoster })
-      });
-      setShowRosterModal(false);
-      await fetchState();
-    } catch (e) {
-      console.error('Save roster error:', e);
-    }
+    const saved = await runAction('Saving the turn roster', async () => {
+      await postJson('/api/roster/update', { schedule: editedRoster });
+    });
+    if (saved) setShowRosterModal(false);
+    await fetchState();
   };
 
   const handleVoteOverride = async (voteId: string, action: 'approve' | 'reject') => {
-    await fetch('/api/votes/override', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vote_id: voteId, action })
+    await runAction(`Vote override (${action})`, async () => {
+      const data = await postJson<any>('/api/votes/override', { vote_id: voteId, action });
+      // The vote can be recorded while the approved tool itself fails.
+      if (data.executed === false && data.error) throw new Error(data.error);
     });
     fetchState();
   };
@@ -364,26 +367,31 @@ export default function App() {
 
   const handleKickModel = async (modelId: string) => {
     const isMod = models[modelId]?.is_moderator;
-    const res = await fetch(`/api/models/kick?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
-    if (res.ok) {
-      const data = await res.json();
-      if (isMod) {
-        setFormerModId(modelId);
-        setShowModPrompt(true);
-      }
-      fetchState();
+    const kicked = await runAction('Removing the model from the room', async () => {
+      await post(`/api/models/kick?model_id=${encodeURIComponent(modelId)}`);
+    });
+    if (kicked && isMod) {
+      setFormerModId(modelId);
+      setShowModPrompt(true);
     }
+    fetchState();
   };
 
   const handleReaddModel = async (modelId: string) => {
-    await fetch(`/api/models/readd?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
+    await runAction('Re-adding the model to the room', async () => {
+      await post(`/api/models/readd?model_id=${encodeURIComponent(modelId)}`);
+    });
     fetchState();
   };
 
   const handleSelectModerator = async (modelId: string) => {
-    await fetch(`/api/models/set_moderator?model_id=${encodeURIComponent(modelId)}`, { method: 'POST' });
-    setShowModPrompt(false);
-    setFormerModId(null);
+    const assigned = await runAction('Assigning the moderator', async () => {
+      await post(`/api/models/set_moderator?model_id=${encodeURIComponent(modelId)}`);
+    });
+    if (assigned) {
+      setShowModPrompt(false);
+      setFormerModId(null);
+    }
     fetchState();
   };
 
@@ -409,17 +417,16 @@ export default function App() {
       status: 'active'
     };
 
-    await fetch('/api/models/configure', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+    const configured = await runAction('Adding the model', async () => {
+      await postJson('/api/models/configure', payload);
     });
-
-    setNewModelName('');
-    setNewGgufPath('');
-    setNewMmprojPath('');
-    setNewApiKey('');
-    setPathValidationMsg(null);
+    if (configured) {
+      setNewModelName('');
+      setNewGgufPath('');
+      setNewMmprojPath('');
+      setNewApiKey('');
+      setPathValidationMsg(null);
+    }
     fetchState();
   };
 
@@ -472,6 +479,27 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen bg-slate-950 text-slate-100 font-sans">
+      {/* --- BACKEND FAILURE BANNERS --- */}
+      {(apiError || connectionError) && (
+        <div className="shrink-0 z-[70] space-y-1 px-5 pt-2">
+          {apiError && (
+            <div className="flex items-start gap-2 bg-rose-950/80 border border-rose-700 text-rose-200 rounded-xl px-3 py-2 text-xs">
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span className="flex-1 break-words">{apiError}</span>
+              <button onClick={() => setApiError(null)} className="text-rose-300 hover:text-rose-100" aria-label="Dismiss error">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+          {connectionError && (
+            <div className="flex items-start gap-2 bg-amber-950/70 border border-amber-700 text-amber-200 rounded-xl px-3 py-2 text-xs">
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span className="flex-1 break-words">{connectionError}</span>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* --- TOP BANNER: Phase Indicator & Quick Controls --- */}
       <header className="flex items-center justify-between px-5 py-2.5 bg-slate-900/90 border-b border-slate-800 backdrop-blur shrink-0">
         <div className="flex items-center gap-3">
@@ -1358,12 +1386,10 @@ export default function App() {
                     onSubmit={async (e) => {
                       e.preventDefault();
                       if (!customSearchPathInput) return;
-                      await fetch('/api/models/search_paths', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ path: customSearchPathInput })
+                      const added = await runAction('Adding the model directory', async () => {
+                        await postJson('/api/models/search_paths', { path: customSearchPathInput });
                       });
-                      setCustomSearchPathInput('');
+                      if (added) setCustomSearchPathInput('');
                       fetchState();
                     }}
                     className="flex gap-2"
@@ -1526,17 +1552,17 @@ export default function App() {
                       onSubmit={async (e) => {
                         e.preventDefault();
                         if (!newTaskTitle) return;
-                        await fetch('/api/itinerary/task', {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
-                          body: JSON.stringify({
+                        const created = await runAction('Adding the itinerary task', async () => {
+                          await postJson('/api/itinerary/task', {
                             title: newTaskTitle,
                             description: newTaskDesc,
                             priority: newTaskPriority
-                          })
+                          });
                         });
-                        setNewTaskTitle('');
-                        setNewTaskDesc('');
+                        if (created) {
+                          setNewTaskTitle('');
+                          setNewTaskDesc('');
+                        }
                         fetchState();
                       }}
                       className="space-y-3 text-xs"
@@ -1604,10 +1630,8 @@ export default function App() {
                             {task.status !== 'in_progress' && (
                               <button
                                 onClick={async () => {
-                                  await fetch('/api/itinerary/update', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ task_id: task.id, status: 'in_progress' })
+                                  await runAction('Activating the task', async () => {
+                                    await postJson('/api/itinerary/update', { task_id: task.id, status: 'in_progress' });
                                   });
                                   fetchState();
                                 }}
@@ -1619,10 +1643,8 @@ export default function App() {
                             {task.status !== 'completed' && (
                               <button
                                 onClick={async () => {
-                                  await fetch('/api/itinerary/update', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ task_id: task.id, status: 'completed' })
+                                  await runAction('Completing the task', async () => {
+                                    await postJson('/api/itinerary/update', { task_id: task.id, status: 'completed' });
                                   });
                                   fetchState();
                                 }}
@@ -1677,10 +1699,11 @@ export default function App() {
                           key={file.path}
                           onClick={async () => {
                             setSelectedFilePath(file.path);
-                            const res = await fetch(`/api/workspace/file?filepath=${encodeURIComponent(file.path)}`);
-                            if (res.ok) {
-                              const data = await res.json();
+                            try {
+                              const data = await apiRequest<any>(`/api/workspace/file?filepath=${encodeURIComponent(file.path)}`);
                               setSelectedFileContent(data.content || '');
+                            } catch (err) {
+                              setSelectedFileContent(`⚠️ Could not read ${file.path}: ${errorText(err)}`);
                             }
                           }}
                           className={`w-full text-left px-2.5 py-1.5 rounded flex items-center justify-between font-mono text-[11px] ${

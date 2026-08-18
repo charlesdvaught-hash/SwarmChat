@@ -1,5 +1,6 @@
-import os
 import asyncio
+import logging
+import os
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -7,11 +8,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 
+from backend.errors import (
+    MemoryPersistenceError,
+    ModelInvocationError,
+    SwarmChatError,
+)
 from backend.models import ModelManager
 from backend.memory import MemoryManager
 from backend.tools import ToolManager
 from backend.orchestrator import Orchestrator
 from backend.evaluate import EvaluateEngine
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="SwarmChat API", version="1.0.0")
 
@@ -28,6 +36,35 @@ memory_mgr = MemoryManager()
 tool_mgr = ToolManager()
 orchestrator = Orchestrator(model_mgr, memory_mgr, tool_mgr)
 evaluate_engine = EvaluateEngine(model_mgr)
+
+# Background loop tasks are retained so their failures are logged instead of being
+# discarded when the task object is garbage collected.
+background_tasks: set = set()
+last_background_error: Optional[str] = None
+
+
+@app.exception_handler(SwarmChatError)
+async def swarmchat_error_handler(request: Request, exc: SwarmChatError):
+    """Turns backend failures into real error responses instead of 200s that look successful."""
+    logger.error("%s %s failed: %s", request.method, request.url.path, exc)
+    status = 503 if isinstance(exc, ModelInvocationError) else 500
+    return JSONResponse(status_code=status, content={"success": False, "error": str(exc)})
+
+
+def _track_background_task(task: asyncio.Task, description: str):
+    background_tasks.add(task)
+
+    def _on_done(finished: asyncio.Task):
+        background_tasks.discard(finished)
+        if finished.cancelled():
+            return
+        exc = finished.exception()
+        if exc is not None:
+            global last_background_error
+            last_background_error = f"{description}: {exc}"
+            logger.error("Background task failed (%s)", last_background_error, exc_info=exc)
+
+    task.add_done_callback(_on_done)
 
 class PhaseSwitchReq(BaseModel):
     phase: str
@@ -101,10 +138,13 @@ def get_prompt_templates():
 @app.post("/api/prompts/templates")
 def update_prompt_templates(req: PromptTemplateUpdateReq):
     from backend.prompts import prompt_template_mgr
-    prompt_template_mgr.update_templates(
-        start_prompt=req.start_prompt,
-        execution_prompt=req.execution_prompt
-    )
+    try:
+        prompt_template_mgr.update_templates(
+            start_prompt=req.start_prompt,
+            execution_prompt=req.execution_prompt
+        )
+    except MemoryPersistenceError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     return {"success": True, "templates": prompt_template_mgr.templates}
 
 last_loaded_model_dir: Optional[str] = None
@@ -142,7 +182,8 @@ def browse_filesystem(path: Optional[str] = None):
                 if is_gguf or is_mmproj:
                     try:
                         size_mb = round(os.path.getsize(full_p) / (1024 * 1024), 2)
-                    except Exception:
+                    except OSError as e:
+                        logger.warning("Could not stat %s: %s", full_p, e)
                         size_mb = 0.0
 
                     files.append({
@@ -152,8 +193,9 @@ def browse_filesystem(path: Optional[str] = None):
                         "is_gguf": is_gguf,
                         "is_mmproj": is_mmproj
                     })
-    except Exception as e:
-        return {"success": False, "error": str(e), "current_path": abs_target, "last_loaded_dir": last_loaded_model_dir}
+    except OSError as e:
+        logger.warning("Could not browse %s: %s", abs_target, e)
+        raise HTTPException(status_code=400, detail=f"Cannot list '{abs_target}': {e}") from e
 
     directories.sort(key=lambda x: x["name"].lower())
     files.sort(key=lambda x: x["name"].lower())
@@ -200,8 +242,9 @@ def get_search_paths():
 
 @app.post("/api/models/search_paths")
 def add_search_path(req: SearchPathReq):
-    if req.path:
-        model_mgr.add_search_path(req.path)
+    if not req.path or not req.path.strip():
+        raise HTTPException(status_code=400, detail="A non-empty search path is required.")
+    model_mgr.add_search_path(req.path)
     return {
         "success": True,
         "search_paths": model_mgr.get_search_paths(),
@@ -218,12 +261,16 @@ def get_dependencies():
         "ollama": model_mgr.check_ollama_status(),
         "ollama_models": model_mgr.list_ollama_models(),
         "llama_cpp_installed": model_mgr.is_llama_cpp_installed(),
-        "memory_status": "healthy"
+        "memory_status": "degraded" if memory_mgr.last_load_error else "healthy",
+        "memory_error": memory_mgr.last_load_error,
+        "last_background_error": last_background_error
     }
 
 @app.post("/api/engine/install")
 def install_engine():
     res = model_mgr.install_llama_cpp()
+    if not res.get("success"):
+        raise HTTPException(status_code=500, detail=res.get("error", "llama-cpp-python installation failed."))
     return res
 
 @app.get("/api/state")
@@ -246,7 +293,9 @@ def get_full_state():
         "task_itinerary": memory_mgr.get_task_itinerary(),
         "active_task": memory_mgr.get_active_task(),
         "file_audit_log": memory_mgr.get_file_audit_log(),
-        "active_file_locks": memory_mgr.state.get("active_file_locks", {})
+        "active_file_locks": memory_mgr.state.get("active_file_locks", {}),
+        "memory_error": memory_mgr.last_load_error,
+        "last_background_error": last_background_error
     }
 
 @app.post("/api/roster/update")
@@ -274,11 +323,16 @@ def update_itinerary_task(req: ItineraryTaskUpdateReq):
     if req.assigned_model is not None:
         updates["assigned_model"] = req.assigned_model
     updated = memory_mgr.update_itinerary_task(req.task_id, updates)
-    return {"success": updated is not None, "task": updated}
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Itinerary task '{req.task_id}' not found.")
+    return {"success": True, "task": updated}
 
 @app.get("/api/workspace/file")
 def get_workspace_file_content(filepath: str):
-    return tool_mgr.read_file(filepath)
+    res = tool_mgr.read_file(filepath)
+    if not res.get("success"):
+        raise HTTPException(status_code=404, detail=res.get("error", f"Could not read '{filepath}'."))
+    return res
 
 @app.get("/api/workspace/audit")
 def get_workspace_file_audit(filepath: Optional[str] = None):
@@ -295,7 +349,10 @@ def trigger_emergency_stop():
 
 @app.post("/api/phase")
 def set_phase(req: PhaseSwitchReq):
-    new_p = memory_mgr.set_phase(req.phase)
+    try:
+        new_p = memory_mgr.set_phase(req.phase)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return {"success": True, "phase": new_p}
 
 @app.post("/api/chat/message")
@@ -307,15 +364,23 @@ async def send_chat_message(req: ChatMsgReq):
         is_admin=req.is_admin
     )
     # Automatically launch conversation loop in background
-    asyncio.create_task(orchestrator.run_autonomous_loop(max_turns=5))
+    _track_background_task(
+        asyncio.create_task(orchestrator.run_autonomous_loop(max_turns=5)),
+        "autonomous conversation loop"
+    )
     return {"success": True, "message": msg}
 
 @app.post("/api/chat/step")
 async def step_turn(model_id: Optional[str] = None):
     target_id = model_id or orchestrator.get_next_speaker()
     if not target_id:
-        return {"success": False, "message": "No active model available for turn."}
-    msg = await orchestrator.step_model_turn(target_id)
+        raise HTTPException(status_code=409, detail="No active model available for turn.")
+    try:
+        msg = await orchestrator.step_model_turn(target_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e).strip("'")) from e
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     return {"success": True, "speaker_id": target_id, "message": msg}
 
 @app.post("/api/models/configure")
@@ -334,32 +399,46 @@ def configure_model(req: ModelConfigReq):
 
 @app.post("/api/models/kick")
 def kick_model(model_id: str):
-    res = orchestrator.kick_model_from_room(model_id)
-    return res
+    if model_id not in orchestrator.models:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' is not in the chat room.")
+    return orchestrator.kick_model_from_room(model_id)
 
 @app.post("/api/models/readd")
 def readd_model(model_id: str):
     res = orchestrator.readd_model_to_room(model_id)
+    if not res.get("success"):
+        raise HTTPException(status_code=404, detail=res.get("error", f"Model '{model_id}' not found."))
     return res
 
 @app.post("/api/models/set_moderator")
 def set_moderator(model_id: str):
-    orchestrator.set_moderator(model_id)
+    try:
+        orchestrator.set_moderator(model_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e).strip("'")) from e
     return {"success": True, "moderator_model_id": orchestrator.moderator_model_id}
 
 @app.get("/api/tools/search_hf")
 async def search_huggingface(query: str, limit: int = 5):
     res = await tool_mgr.search_huggingface(query, limit=limit)
+    if not res.get("success"):
+        # 502: the upstream provider failed, and the caller must not treat this as "no results".
+        raise HTTPException(status_code=502, detail=res.get("error", "HuggingFace search failed."))
     return res
 
 @app.get("/api/tools/internet_search")
 async def internet_search(query: str, domain_filter: Optional[str] = None):
     res = await tool_mgr.internet_search(query, domain_filter=domain_filter)
+    if not res.get("success"):
+        raise HTTPException(status_code=502, detail=res.get("error", "Internet search failed."))
     return res
 
 @app.post("/api/votes/override")
 def override_vote(req: VoteOverrideReq):
     res = orchestrator.admin_override_vote(req.vote_id, req.action, req.modified_args)
+    if not res.get("success"):
+        status = 404 if "not found" in str(res.get("error", "")).lower() else 400
+        raise HTTPException(status_code=status, detail=res.get("error", "Vote override failed."))
     return res
 
 @app.post("/api/hiring/vote")
@@ -388,7 +467,10 @@ def get_room_health():
 
 @app.get("/api/workspace/files")
 def list_workspace_files(rel_dir: str = "."):
-    return tool_mgr.list_files(rel_dir)
+    res = tool_mgr.list_files(rel_dir)
+    if not res.get("success"):
+        raise HTTPException(status_code=404, detail=res.get("error", f"Could not list '{rel_dir}'."))
+    return res
 
 frontend_dist = os.path.join(os.path.dirname(__file__), "../frontend/dist")
 if os.path.exists(frontend_dist):

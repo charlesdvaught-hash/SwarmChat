@@ -1,11 +1,15 @@
+import logging
 import time
 import random
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
+from backend.errors import DirectiveParseError, ModelInvocationError, SwarmChatError
 from backend.models import ModelManager
 from backend.prompts import get_system_prompt
 from backend.memory import MemoryManager
 from backend.tools import ToolManager
+
+logger = logging.getLogger(__name__)
 
 class Orchestrator:
     def __init__(self, model_manager: ModelManager, memory_manager: MemoryManager, tool_manager: ToolManager):
@@ -83,28 +87,31 @@ class Orchestrator:
         self.last_speech_time: float = time.time()
         self.spoken_models: set = set()  # Tracks models that have spoken at least once
 
+    VALID_TURN_MODES = ("admin_controlled", "moderator_controlled", "round_robin")
+
     def set_turn_mode(self, mode: str):
-        if mode in ["admin_controlled", "moderator_controlled", "round_robin"]:
-            self.turn_mode = mode
+        if mode not in self.VALID_TURN_MODES:
+            raise ValueError(f"Unknown turn mode '{mode}'. Valid modes: {', '.join(self.VALID_TURN_MODES)}.")
+        self.turn_mode = mode
 
     def set_moderator(self, model_id: str):
-        old_mod_id = self.moderator_model_id
-        if model_id in self.models:
-            for m_id, m_cfg in self.models.items():
-                was_mod = m_cfg.get("is_moderator", False)
-                should_be_mod = (m_id == model_id)
-                m_cfg["is_moderator"] = should_be_mod
-                if was_mod and not should_be_mod and m_id != model_id:
-                    # Notify demoted model
-                    self.add_chat_message(
-                        sender="System / Role Manager",
-                        role="System",
-                        content=f"📢 [SYSTEM NOTIFICATION TO @{m_cfg['name']}]: You have been demoted from Moderator / Chief Project Manager status. @{self.models[model_id]['name']} is now the Chief Project Manager.",
-                        is_admin=True
-                    )
-            for m_id, m_cfg in self.known_models.items():
-                m_cfg["is_moderator"] = (m_id == model_id)
-            self.moderator_model_id = model_id
+        if model_id not in self.models:
+            raise KeyError(f"Model '{model_id}' is not in the chat room and cannot be made Moderator.")
+        for m_id, m_cfg in self.models.items():
+            was_mod = m_cfg.get("is_moderator", False)
+            should_be_mod = (m_id == model_id)
+            m_cfg["is_moderator"] = should_be_mod
+            if was_mod and not should_be_mod and m_id != model_id:
+                # Notify demoted model
+                self.add_chat_message(
+                    sender="System / Role Manager",
+                    role="System",
+                    content=f"📢 [SYSTEM NOTIFICATION TO @{m_cfg['name']}]: You have been demoted from Moderator / Chief Project Manager status. @{self.models[model_id]['name']} is now the Chief Project Manager.",
+                    is_admin=True
+                )
+        for m_id, m_cfg in self.known_models.items():
+            m_cfg["is_moderator"] = (m_id == model_id)
+        self.moderator_model_id = model_id
 
     def emergency_stop(self) -> Dict[str, Any]:
         """Halts all active conversation loops, background tasks, and pending tool calls without deleting evidence or history."""
@@ -274,8 +281,10 @@ class Orchestrator:
 
     async def step_model_turn(self, model_id: str) -> Dict[str, Any]:
         model_cfg = self.models.get(model_id)
-        if not model_cfg or not model_cfg["enabled"]:
-            return {"error": "Model not available"}
+        if not model_cfg:
+            raise KeyError(f"Model '{model_id}' is not in the chat room.")
+        if not model_cfg["enabled"]:
+            raise ValueError(f"Model '{model_cfg['name']}' is disabled and cannot take a turn.")
 
         current_phase = self.memory_manager.get_phase()
 
@@ -378,7 +387,19 @@ class Orchestrator:
                 system_prompt=context_prompt,
                 messages=recent_msgs
             )
-        finally:
+        except ModelInvocationError as e:
+            # Surface the failure in the room instead of letting filler text pass as a real contribution.
+            logger.error("Turn failed for %s: %s", model_id, e)
+            self.set_model_live_status(model_id, f"Error: {e}")
+            self.last_speaker_id = model_id
+            return self.add_chat_message(
+                sender=f"System / Model Error ({model_cfg['name']})",
+                role="System",
+                content=f"⚠️ [MODEL ERROR] @{model_cfg['name']} ({model_cfg['role']}) could not respond: {e}",
+                is_admin=True,
+                model_id=model_id
+            )
+        else:
             self.set_model_live_status(model_id, "Idle / Live in Chat")
 
         self.memory_manager.update_token_usage(model_id, len(response_text.split()))
@@ -400,121 +421,57 @@ class Orchestrator:
             self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
 
         if "[UPDATE_CONFIG:" in response_text:
-            try:
-                start = response_text.find("[UPDATE_CONFIG:") + len("[UPDATE_CONFIG:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    raw_cfg = response_text[start:end].strip()
-                    parts = [p.strip() for p in raw_cfg.split(",")]
-                    updates = {}
-                    target_id = model_id
-                    for p in parts:
-                        if "=" in p:
-                            k, v = p.split("=", 1)
-                            k, v = k.strip(), v.strip()
-                            if k == "model_id":
-                                target_id = v
-                            elif k in ["top_p", "temperature", "repeat_penalty"]:
-                                updates[k] = float(v)
-                            elif k == "top_k":
-                                updates[k] = int(v)
-                    if updates and target_id in self.models:
-                        self.models[target_id].update(updates)
-                        if target_id in self.known_models:
-                            self.known_models[target_id].update(updates)
-                        self.memory_manager.add_entry(
-                            author=model_cfg["name"],
-                            content=f"Updated sampling settings for `{target_id}` based on Hugging Face / performance research: {updates}"
-                        )
-            except Exception:
-                pass
+            self._run_directive(
+                "UPDATE_CONFIG", model_cfg,
+                lambda payload: self._apply_config_directive(model_id, model_cfg, payload),
+                self._directive_payload(response_text, "[UPDATE_CONFIG:")
+            )
 
         if "[UPDATE_SPEC:" in response_text:
-            try:
-                start = response_text.find("[UPDATE_SPEC:") + len("[UPDATE_SPEC:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    spec_content = response_text[start:end].strip()
-                    self.memory_manager.update_spec_file(model_id, spec_content)
-            except Exception:
-                pass
+            self._run_directive(
+                "UPDATE_SPEC", model_cfg,
+                lambda payload: self.memory_manager.update_spec_file(model_id, payload),
+                self._directive_payload(response_text, "[UPDATE_SPEC:")
+            )
 
         if "[UPDATE_TASK:" in response_text:
-            try:
-                start = response_text.find("[UPDATE_TASK:") + len("[UPDATE_TASK:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    raw_task = response_text[start:end].strip()
-                    parts = [p.strip() for p in raw_task.split(",")]
-                    kwargs = {}
-                    for p in parts:
-                        if "=" in p:
-                            k, v = p.split("=", 1)
-                            kwargs[k.strip()] = v.strip()
-
-                    task_id = kwargs.get("id")
-                    if task_id and any(t["id"] == task_id for t in self.memory_manager.get_task_itinerary()):
-                        updates = {k: v for k, v in kwargs.items() if k != "id"}
-                        self.memory_manager.update_itinerary_task(task_id, updates)
-                        self.memory_manager.add_entry(
-                            model_cfg["name"],
-                            f"Updated itinerary task '{task_id}': {updates}"
-                        )
-                    else:
-                        title = kwargs.get("title", kwargs.get("description", "New Task"))
-                        desc = kwargs.get("description", title)
-                        priority = kwargs.get("priority", "medium")
-                        status = kwargs.get("status", "pending")
-                        created = self.memory_manager.add_itinerary_task(
-                            title=title,
-                            description=desc,
-                            priority=priority,
-                            assigned_model=kwargs.get("assigned_model", model_id)
-                        )
-                        if status != "pending":
-                            self.memory_manager.update_itinerary_task(created["id"], {"status": status})
-                        self.memory_manager.add_entry(
-                            model_cfg["name"],
-                            f"Created new itinerary task '{created['id']}': {title} (Status: {status})"
-                        )
-            except Exception as e:
-                print(f"Error parsing UPDATE_TASK tag: {e}")
+            self._run_directive(
+                "UPDATE_TASK", model_cfg,
+                lambda payload: self._apply_task_directive(model_id, model_cfg, payload),
+                self._directive_payload(response_text, "[UPDATE_TASK:")
+            )
 
         if "[SEARCH_HF:" in response_text:
-            try:
-                start = response_text.find("[SEARCH_HF:") + len("[SEARCH_HF:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    query = response_text[start:end].strip()
-                    hf_res = await self.tool_manager.search_huggingface(query)
-                    m_list = hf_res.get("models", [])
-                    res_summary = ", ".join([m["model_id"] for m in m_list[:3]])
+            query = self._directive_payload(response_text, "[SEARCH_HF:")
+            if query is None:
+                self._report_directive_failure("SEARCH_HF", model_cfg, "missing closing ']'")
+            else:
+                hf_res = await self.tool_manager.search_huggingface(query)
+                if hf_res.get("success"):
+                    res_summary = ", ".join([m["model_id"] for m in hf_res.get("models", [])[:3]])
                     self.memory_manager.add_entry(
                         model_cfg["name"],
                         f"HuggingFace search for '{query}' returned candidate models: {res_summary}"
                     )
-            except Exception:
-                pass
+                else:
+                    self._report_directive_failure(
+                        "SEARCH_HF", model_cfg,
+                        f"HuggingFace search for '{query}' failed: {hf_res.get('error', 'unknown error')}"
+                    )
 
         if "[JOURNAL:" in response_text:
-            try:
-                start = response_text.find("[JOURNAL:") + len("[JOURNAL:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    journal_content = response_text[start:end].strip()
-                    self.memory_manager.record_model_nap(model_id, journal_content)
-            except Exception:
-                pass
+            self._run_directive(
+                "JOURNAL", model_cfg,
+                lambda payload: self.memory_manager.record_model_nap(model_id, payload),
+                self._directive_payload(response_text, "[JOURNAL:")
+            )
 
         if "[LOG_TO_MEMORY:" in response_text:
-            try:
-                start = response_text.find("[LOG_TO_MEMORY:") + len("[LOG_TO_MEMORY:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    mem_content = response_text[start:end].strip()
-                    self.memory_manager.add_entry(model_cfg["name"], mem_content)
-            except Exception:
-                pass
+            self._run_directive(
+                "LOG_TO_MEMORY", model_cfg,
+                lambda payload: self.memory_manager.add_entry(model_cfg["name"], payload),
+                self._directive_payload(response_text, "[LOG_TO_MEMORY:")
+            )
 
         if "[REQUEST_NAP]" in response_text and "[JOURNAL:" not in response_text:
             self.memory_manager.record_model_nap(model_id, f"{model_cfg['name']} completed a context nap.")
@@ -530,6 +487,116 @@ class Orchestrator:
         self.last_speaker_id = model_id
         return msg
 
+    @staticmethod
+    def _directive_payload(response_text: str, opening_token: str) -> Optional[str]:
+        """Extracts an inline directive's payload, or None when the directive is unterminated."""
+        start = response_text.find(opening_token) + len(opening_token)
+        end = response_text.find("]", start)
+        if end == -1:
+            return None
+        return response_text[start:end].strip()
+
+    def _report_directive_failure(self, directive: str, model_cfg: Dict[str, Any], reason: str):
+        """Announces a dropped directive so an unapplied instruction is never invisible."""
+        logger.warning("Directive [%s] from %s failed: %s", directive, model_cfg.get("name"), reason)
+        self.add_chat_message(
+            sender="System / Directive Parser",
+            role="System",
+            content=f"⚠️ [DIRECTIVE IGNORED] @{model_cfg.get('name')}'s [{directive}] directive was not applied: {reason}",
+            is_admin=True
+        )
+
+    def _run_directive(
+        self,
+        directive: str,
+        model_cfg: Dict[str, Any],
+        handler: Callable[[str], Any],
+        payload: Optional[str]
+    ):
+        if payload is None:
+            self._report_directive_failure(directive, model_cfg, "missing closing ']'")
+            return
+        try:
+            handler(payload)
+        except (SwarmChatError, ValueError, KeyError, TypeError, OSError) as e:
+            self._report_directive_failure(directive, model_cfg, str(e))
+
+    def _apply_config_directive(self, model_id: str, model_cfg: Dict[str, Any], payload: str):
+        """Applies an [UPDATE_CONFIG: key=value, ...] directive, rejecting malformed payloads loudly."""
+        numeric_keys = {"top_p": float, "temperature": float, "repeat_penalty": float, "top_k": int}
+        updates: Dict[str, Any] = {}
+        target_id = model_id
+        unknown_keys: List[str] = []
+
+        for part in [p.strip() for p in payload.split(",") if p.strip()]:
+            if "=" not in part:
+                raise DirectiveParseError(f"segment '{part}' is not a key=value pair")
+            k, v = (s.strip() for s in part.split("=", 1))
+            if k == "model_id":
+                target_id = v
+            elif k in numeric_keys:
+                try:
+                    updates[k] = numeric_keys[k](v)
+                except ValueError as e:
+                    raise DirectiveParseError(f"'{k}={v}' is not a valid {numeric_keys[k].__name__}") from e
+            else:
+                unknown_keys.append(k)
+
+        if unknown_keys:
+            raise DirectiveParseError(f"unsupported setting(s): {', '.join(unknown_keys)}")
+        if not updates:
+            raise DirectiveParseError("no supported sampling settings were provided")
+        if target_id not in self.models:
+            raise DirectiveParseError(f"target model '{target_id}' is not in the chat room")
+
+        self.models[target_id].update(updates)
+        if target_id in self.known_models:
+            self.known_models[target_id].update(updates)
+        self.memory_manager.add_entry(
+            author=model_cfg["name"],
+            content=f"Updated sampling settings for `{target_id}` based on Hugging Face / performance research: {updates}"
+        )
+
+    def _apply_task_directive(self, model_id: str, model_cfg: Dict[str, Any], payload: str):
+        """Applies an [UPDATE_TASK: key=value, ...] directive, updating an existing task or creating one."""
+        kwargs: Dict[str, str] = {}
+        for part in [p.strip() for p in payload.split(",") if p.strip()]:
+            if "=" not in part:
+                raise DirectiveParseError(f"segment '{part}' is not a key=value pair")
+            k, v = (s.strip() for s in part.split("=", 1))
+            kwargs[k] = v
+
+        if not kwargs:
+            raise DirectiveParseError("no task fields were provided")
+
+        task_id = kwargs.get("id")
+        if task_id and any(t["id"] == task_id for t in self.memory_manager.get_task_itinerary()):
+            updates = {k: v for k, v in kwargs.items() if k != "id"}
+            self.memory_manager.update_itinerary_task(task_id, updates)
+            self.memory_manager.add_entry(
+                model_cfg["name"],
+                f"Updated itinerary task '{task_id}': {updates}"
+            )
+            return
+
+        if task_id:
+            raise DirectiveParseError(f"itinerary task '{task_id}' does not exist")
+
+        title = kwargs.get("title", kwargs.get("description", "New Task"))
+        status = kwargs.get("status", "pending")
+        created = self.memory_manager.add_itinerary_task(
+            title=title,
+            description=kwargs.get("description", title),
+            priority=kwargs.get("priority", "medium"),
+            assigned_model=kwargs.get("assigned_model", model_id)
+        )
+        if status != "pending":
+            self.memory_manager.update_itinerary_task(created["id"], {"status": status})
+        self.memory_manager.add_entry(
+            model_cfg["name"],
+            f"Created new itinerary task '{created['id']}': {title} (Status: {status})"
+        )
+
     async def run_autonomous_loop(self, max_turns: int = 5):
         if self.loop_active:
             return
@@ -544,7 +611,21 @@ class Orchestrator:
                 # Manage VRAM allocation prior to turn (ensure Moderator gets priority if VRAM is tight)
                 self.manage_vram_allocation(next_speaker)
 
-                res = await self.step_model_turn(next_speaker)
+                try:
+                    res = await self.step_model_turn(next_speaker)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Without this the exception would die with the background task and the UI
+                    # would keep showing an apparently healthy, silently stalled loop.
+                    logger.exception("Autonomous loop aborted while stepping %s", next_speaker)
+                    self.add_chat_message(
+                        sender="System / Conversation Loop",
+                        role="System",
+                        content=f"🛑 [LOOP HALTED] The conversation loop stopped while @{next_speaker} was taking a turn: {e}",
+                        is_admin=True
+                    )
+                    break
                 turns += 1
 
                 # If model indicated consensus / execution readiness or requested pause, pause loop
@@ -570,13 +651,22 @@ class Orchestrator:
             mod_cfg = self.models[mod_id]
             mod_path = mod_cfg.get("gguf_path") or mod_cfg.get("model_name", "")
             if mod_path and mod_id not in self.model_manager.gguf_instances:
-                self.model_manager.load_gguf_model(
-                    mod_id,
-                    mod_path,
-                    max_tokens=mod_cfg.get("max_context_tokens", 2048),
-                    mmproj_path=mod_cfg.get("mmproj_path"),
-                    force_device="gpu"
-                )
+                try:
+                    self.model_manager.load_gguf_model(
+                        mod_id,
+                        mod_path,
+                        max_tokens=mod_cfg.get("max_context_tokens", 2048),
+                        mmproj_path=mod_cfg.get("mmproj_path"),
+                        force_device="gpu"
+                    )
+                except ModelInvocationError as e:
+                    # The status board records the error; announce it so the room isn't left guessing.
+                    self.add_chat_message(
+                        sender="System / Resource Manager",
+                        role="System",
+                        content=f"⚠️ [VRAM PRELOAD FAILED] Moderator model `{mod_id}` could not be loaded into VRAM: {e}",
+                        is_admin=True
+                    )
 
         # If VRAM headroom is tight (< 1.5 GB), offload non-active models to RAM or unload them
         if hw.get("vram_free_gb", 0) < 1.5:
@@ -608,25 +698,43 @@ class Orchestrator:
 
         if risk == "low":
             exec_res = self._execute_tool_sync(tool_name, args, caller_id=model_id)
-            vote_req["status"] = "executed"
+            vote_req["status"] = "executed" if exec_res.get("success") else "failed"
             vote_req["result"] = exec_res
+            if not exec_res.get("success"):
+                vote_req["error"] = exec_res.get("error", "Tool execution failed.")
             return vote_req
 
         self.pending_tool_votes.append(vote_req)
         return vote_req
 
     def _execute_tool_sync(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
+        """Runs a tool from synchronous code.
+
+        Loop discovery is separated from tool execution so a failing tool is never silently
+        retried - and therefore executed twice - by a catch-all fallback.
+        """
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Run in existing event loop
-                import nest_asyncio
-                nest_asyncio.apply()
-                return loop.run_until_complete(self._execute_tool_async(tool_name, args, caller_id))
-            else:
-                return loop.run_until_complete(self._execute_tool_async(tool_name, args, caller_id))
-        except Exception:
+            running_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is None:
             return asyncio.run(self._execute_tool_async(tool_name, args, caller_id))
+
+        try:
+            import nest_asyncio
+        except ImportError as e:
+            logger.error("Cannot run tool '%s' inside a running event loop: %s", tool_name, e)
+            return {
+                "success": False,
+                "error": (
+                    f"Tool '{tool_name}' was invoked synchronously from a running event loop, "
+                    "which requires the 'nest_asyncio' package."
+                )
+            }
+
+        nest_asyncio.apply(running_loop)
+        return running_loop.run_until_complete(self._execute_tool_async(tool_name, args, caller_id))
 
     async def _execute_tool_async(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
         # Lock write tools during discussion phase
@@ -710,6 +818,9 @@ class Orchestrator:
                 self.set_model_live_status(caller_id, "Reviewing git diff")
                 return self.tool_manager.git_diff()
             return {"success": False, "error": f"Unknown tool: {tool_name}"}
+        except Exception as e:
+            logger.exception("Tool '%s' raised while running for %s", tool_name, caller_id)
+            return {"success": False, "error": f"Tool '{tool_name}' failed: {e}"}
         finally:
             self.set_model_live_status(caller_id, "Idle / Live in Chat")
 
@@ -720,10 +831,17 @@ class Orchestrator:
                     req["status"] = "approved"
                     args = modified_args or req["args"]
                     exec_res = self._execute_tool_sync(req["tool_name"], args, caller_id=req.get("model_id", "Admin"))
-                    req["status"] = "executed"
+                    tool_ok = bool(exec_res.get("success"))
+                    req["status"] = "executed" if tool_ok else "failed"
                     req["result"] = exec_res
-                    return {"success": True, "executed": True, "result": exec_res}
+                    return {
+                        "success": tool_ok,
+                        "executed": True,
+                        "result": exec_res,
+                        "error": None if tool_ok else exec_res.get("error", "Tool execution failed.")
+                    }
                 elif action == "reject":
                     req["status"] = "rejected"
                     return {"success": True, "status": "rejected"}
-        return {"success": False, "error": "Vote ID not found"}
+                return {"success": False, "error": f"Unknown vote action '{action}'. Use 'approve' or 'reject'."}
+        return {"success": False, "error": f"Vote ID '{vote_id}' not found"}
