@@ -53,6 +53,7 @@ export default function App() {
   const [dependencies, setDependencies] = useState<any>(null);
   const [isInstallingEngine, setIsInstallingEngine] = useState(false);
   const [selectedErrorModel, setSelectedErrorModel] = useState<string | null>(null);
+  const [selectedParticipantModel, setSelectedParticipantModel] = useState<string | null>(null);
   
   // UI Panels & Modals
   const [showSetup, setShowSetup] = useState(false);
@@ -563,6 +564,17 @@ export default function App() {
                 <Cpu className="w-3.5 h-3.5 text-slate-400" />
                 <span>RAM: {hardware.ram_available_gb}GB</span>
               </div>
+              <div className="h-3 w-px bg-slate-700" />
+              <div className="flex items-center gap-1 text-cyan-300">
+                <Zap className="w-3.5 h-3.5 text-cyan-400" />
+                <span>
+                  VRAM: {hardware.vram_free_gb ?? 0}GB
+                  {hardware.vram_total_gb ? ` / ${hardware.vram_total_gb}GB` : ''}
+                </span>
+                {hardware.gpu_name && (
+                  <span className="text-[10px] text-slate-400 font-mono">({hardware.gpu_name})</span>
+                )}
+              </div>
             </div>
           )}
 
@@ -816,7 +828,8 @@ export default function App() {
                 return (
                   <div
                     key={m.id}
-                    className="bg-slate-950 border border-slate-800/80 rounded-xl p-3 flex flex-col gap-2 relative group"
+                    onClick={() => setSelectedParticipantModel(m.id)}
+                    className="bg-slate-950 border border-slate-800/80 rounded-xl p-3 flex flex-col gap-2 relative group cursor-pointer hover:border-cyan-500/50 transition"
                   >
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
@@ -854,25 +867,40 @@ export default function App() {
                         <span>Role: </span>
                         <span className="text-slate-200 font-medium">{m.role}</span>
                       </div>
-                      {tokPerSec > 0 && (
-                        <div className="text-[10px] text-cyan-400 font-mono bg-cyan-950/60 border border-cyan-800/40 px-1.5 py-0.5 rounded">
-                          {tokPerSec} tok/s
-                        </div>
-                      )}
+                      <div className="flex items-center gap-1">
+                        {st.vram_used_gb > 0 && (
+                          <span className="text-[10px] text-cyan-300 font-mono bg-cyan-950/80 border border-cyan-700/60 px-1.5 py-0.5 rounded">
+                            {st.vram_used_gb} GB VRAM
+                          </span>
+                        )}
+                        {tokPerSec > 0 && (
+                          <div className="text-[10px] text-cyan-400 font-mono bg-cyan-950/60 border border-cyan-800/40 px-1.5 py-0.5 rounded">
+                            {tokPerSec} tok/s
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     {/* Live Truth-Backed Status Indicator (Discord Style) */}
-                    <div className={`text-[11px] font-medium flex items-center gap-1.5 px-2 py-0.5 rounded-md border ${statusBgBox}`}>
-                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColorClass}`} />
-                      <span className="truncate">{statusBadgeText}</span>
+                    <div className={`text-[11px] font-medium flex items-center justify-between px-2 py-0.5 rounded-md border ${statusBgBox}`}>
+                      <div className="flex items-center gap-1.5 truncate">
+                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColorClass}`} />
+                        <span className="truncate">{statusBadgeText}</span>
+                      </div>
+                      <span className="text-[10px] uppercase font-mono font-bold shrink-0 ml-1">
+                        {st.location || (m.provider === 'gguf_local' ? 'VRAM/RAM' : 'Cloud')}
+                      </span>
                     </div>
 
-                    <div className="text-[11px] text-slate-500 truncate" title={m.gguf_path || m.model_name}>
-                      {m.provider === 'gguf_local' ? (
-                        <code>File: {m.gguf_path || m.model_name}</code>
-                      ) : (
-                        <code>Model: {m.model_name}</code>
-                      )}
+                    <div className="text-[11px] text-slate-500 truncate flex items-center justify-between" title={m.gguf_path || m.model_name}>
+                      <span className="truncate">
+                        {m.provider === 'gguf_local' ? (
+                          <code>File: {m.gguf_path || m.model_name}</code>
+                        ) : (
+                          <code>Model: {m.model_name}</code>
+                        )}
+                      </span>
+                      <span className="text-[10px] text-cyan-400 underline shrink-0 ml-1">Stats & Details</span>
                     </div>
                   </div>
                 );
@@ -881,6 +909,105 @@ export default function App() {
           </aside>
         )}
       </div>
+
+      {/* --- PARTICIPANT STATS & DETAILS DRAWER / MODAL --- */}
+      {selectedParticipantModel && models[selectedParticipantModel] && (
+        <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 shadow-xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <BrainCircuit className="w-5 h-5 text-cyan-400" />
+                <h3 className="font-bold text-base text-slate-100">
+                  {models[selectedParticipantModel].name}
+                </h3>
+                {models[selectedParticipantModel].is_moderator && (
+                  <span className="text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded-full">
+                    👑 Moderator
+                  </span>
+                )}
+              </div>
+              <button onClick={() => setSelectedParticipantModel(null)} className="text-slate-400 hover:text-slate-200">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              {/* Hardware & Location Badges */}
+              <div className="grid grid-cols-2 gap-2 bg-slate-950 p-3 rounded-xl border border-slate-800">
+                <div>
+                  <span className="text-slate-500 text-[10px] uppercase font-semibold block">Execution Location</span>
+                  <span className="font-mono text-cyan-300 font-semibold text-sm">
+                    {modelStatuses[selectedParticipantModel]?.location || 'VRAM / RAM'}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 text-[10px] uppercase font-semibold block">VRAM Usage</span>
+                  <span className="font-mono text-emerald-300 font-semibold text-sm">
+                    {modelStatuses[selectedParticipantModel]?.vram_used_gb ?? 0} GB
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 text-[10px] uppercase font-semibold block">Inference Speed</span>
+                  <span className="font-mono text-cyan-300 font-semibold text-sm">
+                    {modelStatuses[selectedParticipantModel]?.tok_per_sec || 0} tok/s
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 text-[10px] uppercase font-semibold block">Assigned Role</span>
+                  <span className="font-semibold text-slate-200 text-sm">
+                    {models[selectedParticipantModel].role}
+                  </span>
+                </div>
+              </div>
+
+              {/* Status and Configuration */}
+              <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1 font-mono text-[11px]">
+                <div className="text-slate-400">
+                  Provider: <strong className="text-slate-200">{models[selectedParticipantModel].provider}</strong>
+                </div>
+                <div className="text-slate-400 truncate">
+                  Model Path/Tag: <code className="text-cyan-300">{models[selectedParticipantModel].gguf_path || models[selectedParticipantModel].model_name}</code>
+                </div>
+                {modelStatuses[selectedParticipantModel]?.error && (
+                  <div className="text-rose-400 mt-2 bg-rose-950/40 p-2 rounded border border-rose-800">
+                    Error: {modelStatuses[selectedParticipantModel].error}
+                  </div>
+                )}
+              </div>
+
+              {/* Recent Activity & File Edits */}
+              <div className="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-2">
+                <h4 className="font-semibold text-slate-300 text-[11px] uppercase tracking-wider">
+                  Recent Edits & Audit Activity
+                </h4>
+                {fileAuditLog.filter(log => log.author === models[selectedParticipantModel]?.name || log.author === selectedParticipantModel).length === 0 ? (
+                  <div className="text-slate-500 text-[11px]">No file edits recorded by this model yet.</div>
+                ) : (
+                  <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                    {fileAuditLog
+                      .filter(log => log.author === models[selectedParticipantModel]?.name || log.author === selectedParticipantModel)
+                      .map((log) => (
+                        <div key={log.id} className="text-[10px] font-mono text-slate-300 bg-slate-900 p-2 rounded border border-slate-800">
+                          <div><strong className="text-emerald-400">Modified:</strong> <code>{log.filepath}</code></div>
+                          <div className="text-slate-400 truncate mt-0.5">{log.diff_snippet}</div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="pt-2 border-t border-slate-800 flex justify-end">
+              <button
+                onClick={() => setSelectedParticipantModel(null)}
+                className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs px-4 py-2 rounded-xl"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* --- MODEL TROUBLESHOOTING / ERROR DETAIL MODAL --- */}
       {selectedErrorModel && (

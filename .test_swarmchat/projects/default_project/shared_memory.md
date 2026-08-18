@@ -1,7 +1,7 @@
 # 🧠 SwarmChat Continuous Shared Memory Archive — Project: `default_project`
 **Session ID:** `default_session`
 **Current Phase:** `EXECUTION`
-**Last Phase Switch:** 2026-08-18 02:14:38
+**Last Phase Switch:** 2026-08-18 04:28:20
 
 ---
 ## 📌 Key Decisions & Shared Memory Entries
@@ -81,6 +81,30 @@
 - **[02:14:38] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
 - **[02:14:38] Architect:** Test decision
 - **[02:14:38] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
+- **[03:59:37] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
+- **[03:59:37] Architect:** Test decision
+- **[03:59:37] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
+- **[03:59:37] Architect:** Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}
+- **[03:59:37] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
+- **[03:59:37] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
+- **[04:25:05] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
+- **[04:25:05] Architect:** Test decision
+- **[04:25:05] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
+- **[04:25:05] Architect:** Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}
+- **[04:25:05] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
+- **[04:25:05] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
+- **[04:25:51] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
+- **[04:25:51] Architect:** Test decision
+- **[04:25:51] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
+- **[04:25:51] Architect:** Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}
+- **[04:25:51] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
+- **[04:25:51] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
+- **[04:28:20] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
+- **[04:28:20] Architect:** Test decision
+- **[04:28:20] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
+- **[04:28:20] Architect:** Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}
+- **[04:28:20] System State Machine:** Phase switched from 'EXECUTION' to 'DISCUSSION'.
+- **[04:28:20] System State Machine:** Phase switched from 'DISCUSSION' to 'EXECUTION'.
 
 ---
 ## 📦 Episodes & Thread Checkpoints (NAC Architecture)

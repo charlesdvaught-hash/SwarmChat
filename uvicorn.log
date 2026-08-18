@@ -1,14 +1,30 @@
-INFO:     Started server process [194736]
+INFO:     Started server process [97016]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-INFO:     127.0.0.1:36126 - "GET /api/state HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET / HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /assets/index-6o-fawmA.js HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54618 - "GET /assets/index-B8JSji7I.css HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/state HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/hardware HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/dependencies HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/workspace/files HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/evaluate/health HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     127.0.0.1:46606 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET /assets/index-6o-fawmA.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46002 - "GET /assets/index-B8JSji7I.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45994 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /assets/index-B-4std31.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46128 - "GET /assets/index-LUYMvrDq.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46112 - "GET /api/models/search_paths HTTP/1.1" 200 OK

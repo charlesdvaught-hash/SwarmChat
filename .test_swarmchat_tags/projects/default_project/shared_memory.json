@@ -26,6 +26,54 @@
       "timestamp": 1787019281.05885,
       "author": "Moderator System (model_architect)",
       "content": "Model `model_architect` took a nap / refreshed context. Shared summary: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+    },
+    {
+      "id": "mem_1787025579921",
+      "timestamp": 1787025579.9218888,
+      "author": "Model (model_architect)",
+      "content": "\ud83d\udce6 [EPISODE CHECKPOINT #ep_1787025579921] Context Nap Handoff: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+    },
+    {
+      "id": "mem_1787025579923",
+      "timestamp": 1787025579.9231613,
+      "author": "Moderator System (model_architect)",
+      "content": "Model `model_architect` took a nap / refreshed context. Shared summary: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+    },
+    {
+      "id": "mem_1787027107787",
+      "timestamp": 1787027107.7876003,
+      "author": "Model (model_architect)",
+      "content": "\ud83d\udce6 [EPISODE CHECKPOINT #ep_1787027107787] Context Nap Handoff: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+    },
+    {
+      "id": "mem_1787027107789",
+      "timestamp": 1787027107.7894,
+      "author": "Moderator System (model_architect)",
+      "content": "Model `model_architect` took a nap / refreshed context. Shared summary: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+    },
+    {
+      "id": "mem_1787027153996",
+      "timestamp": 1787027153.996077,
+      "author": "Model (model_architect)",
+      "content": "\ud83d\udce6 [EPISODE CHECKPOINT #ep_1787027153996] Context Nap Handoff: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+    },
+    {
+      "id": "mem_1787027153998",
+      "timestamp": 1787027153.998303,
+      "author": "Moderator System (model_architect)",
+      "content": "Model `model_architect` took a nap / refreshed context. Shared summary: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+    },
+    {
+      "id": "mem_1787027303419",
+      "timestamp": 1787027303.4193816,
+      "author": "Model (model_architect)",
+      "content": "\ud83d\udce6 [EPISODE CHECKPOINT #ep_1787027303419] Context Nap Handoff: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+    },
+    {
+      "id": "mem_1787027303421",
+      "timestamp": 1787027303.4212043,
+      "author": "Moderator System (model_architect)",
+      "content": "Model `model_architect` took a nap / refreshed context. Shared summary: Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
     }
   ],
   "model_journals": {
@@ -36,6 +84,22 @@
       },
       {
         "timestamp": 1787019281.0567026,
+        "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+      },
+      {
+        "timestamp": 1787025579.9215257,
+        "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+      },
+      {
+        "timestamp": 1787027107.7871778,
+        "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+      },
+      {
+        "timestamp": 1787027153.9958105,
+        "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
+      },
+      {
+        "timestamp": 1787027303.419105,
         "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory."
       }
     ]
@@ -55,6 +119,46 @@
     {
       "id": "ep_1787019281056",
       "timestamp": 1787019281.0569654,
+      "author": "Model (model_architect)",
+      "action": "Context Nap Handoff",
+      "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory.",
+      "thread_name": "model_architect",
+      "modified_files": [],
+      "source_threads": []
+    },
+    {
+      "id": "ep_1787025579921",
+      "timestamp": 1787025579.921882,
+      "author": "Model (model_architect)",
+      "action": "Context Nap Handoff",
+      "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory.",
+      "thread_name": "model_architect",
+      "modified_files": [],
+      "source_threads": []
+    },
+    {
+      "id": "ep_1787027107787",
+      "timestamp": 1787027107.7875934,
+      "author": "Model (model_architect)",
+      "action": "Context Nap Handoff",
+      "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory.",
+      "thread_name": "model_architect",
+      "modified_files": [],
+      "source_threads": []
+    },
+    {
+      "id": "ep_1787027153996",
+      "timestamp": 1787027153.9960701,
+      "author": "Model (model_architect)",
+      "action": "Context Nap Handoff",
+      "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory.",
+      "thread_name": "model_architect",
+      "modified_files": [],
+      "source_threads": []
+    },
+    {
+      "id": "ep_1787027303419",
+      "timestamp": 1787027303.4193754,
       "author": "Model (model_architect)",
       "action": "Context Nap Handoff",
       "summary": "Context refresh checkpoint for Architect (Architect): Active project 'default_project'. Current task: 'Initial Task'. Key contributions logged to shared memory.",
@@ -83,12 +187,52 @@
       "assigned_model": null,
       "created_at": 1787019281.0557833,
       "updated_at": 1787019281.0557835
+    },
+    {
+      "id": "task_1787025579920",
+      "title": "Initial Task",
+      "description": "Task description",
+      "priority": "medium",
+      "status": "pending",
+      "assigned_model": null,
+      "created_at": 1787025579.9201188,
+      "updated_at": 1787025579.920119
+    },
+    {
+      "id": "task_1787027107785",
+      "title": "Initial Task",
+      "description": "Task description",
+      "priority": "medium",
+      "status": "pending",
+      "assigned_model": null,
+      "created_at": 1787027107.785448,
+      "updated_at": 1787027107.7854486
+    },
+    {
+      "id": "task_1787027153994",
+      "title": "Initial Task",
+      "description": "Task description",
+      "priority": "medium",
+      "status": "pending",
+      "assigned_model": null,
+      "created_at": 1787027153.9943304,
+      "updated_at": 1787027153.9943306
+    },
+    {
+      "id": "task_1787027303417",
+      "title": "Initial Task",
+      "description": "Task description",
+      "priority": "medium",
+      "status": "pending",
+      "assigned_model": null,
+      "created_at": 1787027303.417855,
+      "updated_at": 1787027303.417855
     }
   ],
   "file_audit_log": [],
   "active_file_locks": {},
   "tokens_used": {
-    "model_architect": 7
+    "model_architect": 5
   },
   "session_id": "default_session"
 }
