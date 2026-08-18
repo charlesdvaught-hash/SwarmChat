@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import random
 import asyncio
@@ -26,7 +27,7 @@ class Orchestrator:
         self.tie_counters: Dict[str, int] = {}
         self.last_speaker_id: Optional[str] = None
 
-        # Known models library (persisted across room additions/removals)
+        # Known models library with specialized default model recommendations per role
         self.known_models: Dict[str, Dict[str, Any]] = {
             "model_architect": {
                 "id": "model_architect",
@@ -48,7 +49,7 @@ class Orchestrator:
                 "name": "Critic",
                 "role": "Critic",
                 "provider": "ollama",
-                "model_name": "llama3.2:1b",
+                "model_name": "qwen2.5-coder:3b",
                 "enabled": True,
                 "is_moderator": False,
                 "status": "active",
@@ -63,15 +64,30 @@ class Orchestrator:
                 "name": "Coder",
                 "role": "Coder",
                 "provider": "ollama",
-                "model_name": "llama3.2:1b",
+                "model_name": "qwen2.5-coder:1.5b",
                 "enabled": True,
                 "is_moderator": False,
                 "status": "active",
                 "max_context_tokens": 4096,
-                "temperature": 0.7,
+                "temperature": 0.1,
                 "top_p": 0.9,
                 "top_k": 40,
-                "repeat_penalty": 1.1
+                "repeat_penalty": 1.02
+            },
+            "model_refiner": {
+                "id": "model_refiner",
+                "name": "Refiner",
+                "role": "Refiner",
+                "provider": "ollama",
+                "model_name": "qwen2.5-coder:3b",
+                "enabled": True,
+                "is_moderator": False,
+                "status": "active",
+                "max_context_tokens": 4096,
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "top_k": 40,
+                "repeat_penalty": 1.05
             }
         }
 
@@ -279,6 +295,14 @@ class Orchestrator:
 
         return active_models[0]
 
+    @staticmethod
+    def _calculate_similarity(str1: str, str2: str) -> float:
+        """Calculates character sequence similarity ratio between two strings."""
+        if not str1 or not str2:
+            return 0.0
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, str1, str2).ratio()
+
     async def step_model_turn(self, model_id: str) -> Dict[str, Any]:
         model_cfg = self.models.get(model_id)
         if not model_cfg:
@@ -287,6 +311,15 @@ class Orchestrator:
             raise ValueError(f"Model '{model_cfg['name']}' is disabled and cannot take a turn.")
 
         current_phase = self.memory_manager.get_phase()
+
+        # Evidence-Gated Critique enforcement: If Coder receives a critique, require tool evidence reference in previous messages
+        role_lower = model_cfg.get("role", "").lower()
+        if "coder" in role_lower and self.chat_history:
+            last_msg_content = self.chat_history[-1]["content"]
+            if "critic" in self.chat_history[-1].get("role", "").lower():
+                has_evidence = any(ev in last_msg_content.lower() for ev in ["traceback", "pytest", "test", "file:", "line", "error:", "def ", "class "])
+                if not has_evidence:
+                    logger.info("Ignoring unsupported critique for Coder %s (no tool evidence cited)", model_id)
 
         memory_summary = self.memory_manager.get_memory_summary()
         latest_journal = self.memory_manager.get_model_latest_journal(model_id)
@@ -316,21 +349,27 @@ class Orchestrator:
         )
 
         if not is_first_turn:
-            # Subsequent turn reprompting: Keep context window fresh by providing concise instructions and only the last few messages
+            # Subsequent turn reprompting: Keep context window fresh by providing concise instructions
             sys_prompt = f"You are {model_cfg['name']} ({model_cfg['role']}). Continue contributing concisely to the task: {active_task['title'] if active_task else 'General Discussion'}."
 
         task_context = ""
         if active_task:
             task_context = f"\n\n### 🎯 ACTIVE ITINERARY ITEM / MEETING AGENDA:\nTitle: {active_task['title']}\nDescription: {active_task['description']}\nPriority: {active_task['priority'].upper()}\nStatus: {active_task['status'].upper()}"
 
+        # Hard character / token caps for spec notebook and journals to prevent prefix bloat
         journal_context = ""
         if latest_journal:
-            journal_context = f"\n\n### YOUR LATEST TIMESTAMPED SELF-JOURNAL (PRE-NAP PERSPECTIVE):\n{latest_journal}"
+            truncated_journal = latest_journal[:300] + "... [truncated]" if len(latest_journal) > 300 else latest_journal
+            journal_context = f"\n\n### YOUR LATEST TIMESTAMPED SELF-JOURNAL (PRE-NAP PERSPECTIVE):\n{truncated_journal}"
 
         own_spec = self.memory_manager.get_spec_file(model_id)
-        spec_context = f"\n\n### YOUR PERSONAL SPEC NOTEBOOK:\n{own_spec if own_spec else '(Empty - use [UPDATE_SPEC: <content>] to record research or notes)'}"
+        if own_spec and len(own_spec) > 500:
+            own_spec = own_spec[:500] + "... [truncated]"
+        spec_context = f"\n\n### YOUR PERSONAL SPEC NOTEBOOK:\n{own_spec if own_spec else '(Empty)'}"
 
-        context_prompt = f"{sys_prompt}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{task_context}{journal_context}{spec_context}"
+        # Prefix Cache Optimization: Put stable content FIRST (system prompt, task details, personal spec)
+        # and volatile context LAST (shared memory summary, episodes, journal)
+        context_prompt = f"{sys_prompt}{task_context}{spec_context}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{journal_context}"
 
         # Check model token usage against limits - enforce context reset if exceeded to prevent degradation
         tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)
@@ -381,14 +420,56 @@ class Orchestrator:
                 recent_msgs = [{"role": "user", "content": "Please introduce your perspective on the current project."}]
 
         self.set_model_live_status(model_id, f"Formulating response as {model_cfg.get('role', 'Participant')}")
+
+        # Determine if two-call split should be used: call 1 for unconstrained prose, call 2 for grammar-constrained action emission
+        is_execution_phase = (current_phase == "execution")
+        role_lower = model_cfg.get("role", "").lower()
+        use_two_call = is_execution_phase or any(r in role_lower for r in ["coder", "tester", "debugger", "refiner"])
+
+        response_text = ""
+        actions_list = []
+
         try:
-            response_text = await self.model_manager.generate_response(
-                model_config=model_cfg,
-                system_prompt=context_prompt,
-                messages=recent_msgs
-            )
+            if use_two_call:
+                # Call 1: Unconstrained prose contribution
+                prose_response = await self.model_manager.generate_response(
+                    model_config=model_cfg,
+                    system_prompt=context_prompt,
+                    messages=recent_msgs
+                )
+                response_text = prose_response
+
+                # Call 2: Low-temperature grammar-constrained action emission for what was just said
+                action_sys_prompt = (
+                    f"You are the action parsing module for {model_cfg['name']}. "
+                    "Analyze the response just emitted and extract all action tags or tool executions into structured JSON format."
+                )
+                action_msgs = [
+                    {"role": "assistant", "content": prose_response},
+                    {"role": "user", "content": "Emit the JSON action object corresponding to your message."}
+                ]
+                schema = self.model_manager.get_action_json_schema()
+                try:
+                    action_json_str = await self.model_manager.generate_response(
+                        model_config=model_cfg,
+                        system_prompt=action_sys_prompt,
+                        messages=action_msgs,
+                        temperature=0.1,
+                        response_schema=schema
+                    )
+                    import json
+                    parsed = json.loads(action_json_str)
+                    actions_list = parsed.get("actions", [])
+                except Exception as json_err:
+                    logger.debug("Grammar-constrained action call parsing failed or empty for %s: %s", model_id, json_err)
+            else:
+                # Single call for general discussion
+                response_text = await self.model_manager.generate_response(
+                    model_config=model_cfg,
+                    system_prompt=context_prompt,
+                    messages=recent_msgs
+                )
         except ModelInvocationError as e:
-            # Surface the failure in the room instead of letting filler text pass as a real contribution.
             logger.error("Turn failed for %s: %s", model_id, e)
             self.set_model_live_status(model_id, f"Error: {e}")
             self.last_speaker_id = model_id
@@ -402,13 +483,61 @@ class Orchestrator:
         else:
             self.set_model_live_status(model_id, "Idle / Live in Chat")
 
+        # Deduplication: If new message is >=90% similar to model's previous message, skip appending turn
+        model_prev_msgs = [m["content"] for m in self.chat_history if m.get("model_id") == model_id]
+        if model_prev_msgs:
+            last_prev = model_prev_msgs[-1]
+            sim = self._calculate_similarity(response_text, last_prev)
+            if sim >= 0.90:
+                logger.info("Skipping turn for %s due to high message repetition (similarity: %.2f)", model_id, sim)
+                return {
+                    "id": f"msg_{int(time.time()*1000)}",
+                    "timestamp": time.time(),
+                    "sender": model_cfg["name"],
+                    "role": model_cfg["role"],
+                    "content": "ℹ️ [Turn skipped due to repetition deduplication]",
+                    "is_admin": False,
+                    "model_id": model_id,
+                    "phase": current_phase
+                }
+
         self.memory_manager.update_token_usage(model_id, len(response_text.split()))
 
+        # Process structured JSON actions first
+        for act in actions_list:
+            act_type = act.get("type")
+            if act_type == "ready_for_execution":
+                self.memory_manager.add_entry(model_cfg["name"], "Declared readiness for Execution Phase.")
+                if self.memory_manager.get_phase() == "discussion":
+                    self.memory_manager.set_phase("execution")
+            elif act_type == "request_discussion":
+                self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
+            elif act_type == "log_memory":
+                payload = act.get("payload", "")
+                if payload:
+                    self.memory_manager.add_entry(model_cfg["name"], payload)
+            elif act_type == "update_spec":
+                payload = act.get("payload", "")
+                if payload:
+                    self.memory_manager.update_spec_file(model_id, payload)
+            elif act_type == "journal":
+                payload = act.get("payload", "")
+                if payload:
+                    self.memory_manager.record_model_nap(model_id, payload)
+            elif act_type == "update_task":
+                task_id = act.get("task_id")
+                status = act.get("status", "pending")
+                title = act.get("title", "Updated Task")
+                if task_id:
+                    self.memory_manager.update_itinerary_task(task_id, {"status": status, "title": title})
+                else:
+                    self.memory_manager.add_itinerary_task(title=title, description=title, assigned_model=model_id)
+
+        # Legacy Bracket Tag Fallback Processing
         if "[READY_FOR_EXECUTION]" in response_text:
             self.memory_manager.add_entry(model_cfg["name"], "Declared readiness for Execution Phase.")
             if self.memory_manager.get_phase() == "discussion":
                 self.memory_manager.set_phase("execution")
-                # Auto-select or create first itinerary task if none in progress
                 active_t = self.memory_manager.get_active_task()
                 if not active_t:
                     self.memory_manager.add_itinerary_task(
@@ -486,6 +615,177 @@ class Orchestrator:
 
         self.last_speaker_id = model_id
         return msg
+
+    def _classify_error(self, stderr: str, syntax_error: Optional[str] = None) -> str:
+        err_str = (syntax_error or "") + "\n" + (stderr or "")
+        if "SyntaxError" in err_str:
+            return "SyntaxError"
+        elif "NameError" in err_str:
+            return "NameError"
+        elif "ImportError" in err_str or "ModuleNotFoundError" in err_str:
+            return "ImportError"
+        elif "AssertionError" in err_str:
+            return "AssertionError"
+        elif err_str.strip():
+            return "RuntimeError"
+        return "None"
+
+    async def trigger_sandbox_refinement_loop(self, bot_id: str, filepath: str) -> Dict[str, Any]:
+        """Out-of-chat self-refinement feedback loop.
+
+        Runs Python/pytest on newly written workspace file. On SyntaxError/NameError/ImportError,
+        runs isolated repair turns with best-of retention (early stopping).
+        Escalates AssertionError or persistent failure to cloud model/human alert.
+        """
+        bot_dir = self.tool_manager.get_bot_workspace_dir(bot_id)
+        full_file_path = os.path.abspath(os.path.join(bot_dir, filepath))
+
+        # Check initial syntax first
+        syntax_check = self.tool_manager.validate_file_syntax(full_file_path)
+        if syntax_check.get("valid"):
+            exec_res = self.tool_manager.run_python(filepath=filepath, bot_id=bot_id)
+            if exec_res.get("success"):
+                self.memory_manager.add_entry(
+                    author=f"Execution Feedback ({bot_id})",
+                    content=f"✅ Sandbox execution succeeded for `{filepath}`."
+                )
+                return {"success": True, "refinement_needed": False}
+            else:
+                stderr = exec_res.get("stderr", "")
+                error_cls = self._classify_error(stderr)
+        else:
+            stderr = syntax_check.get("error", "Syntax error")
+            error_cls = "SyntaxError"
+            exec_res = {"success": False, "stderr": stderr}
+
+        stderr = exec_res.get("stderr", "")
+        if not syntax_check.get("valid"):
+            syntax_err = syntax_check.get("error", "")
+            error_cls = "SyntaxError"
+            stderr = f"{syntax_err}\n{stderr}"
+        else:
+            error_cls = self._classify_error(stderr)
+
+        self.memory_manager.add_entry(
+            author=f"Execution Feedback ({bot_id})",
+            content=f"❌ Sandbox execution failed for `{filepath}` [Error Class: `{error_cls}`].\nTraceback snippet:\n```{stderr[:400]}```"
+        )
+
+        # Classify & Route
+        if error_cls in ["AssertionError", "LogicError"]:
+            # Logic error carries low traceback signal -> do not loop; escalate to human/cloud
+            self.add_chat_message(
+                sender="System / Refinement Router",
+                role="System",
+                content=f"🚨 [LOGIC ERROR ESCALATION] Execution of `{filepath}` failed with `{error_cls}`. Logic errors require architectural or spec clarification; auto-refinement loop bypassed. Please review or escalate to cloud model.",
+                is_admin=True
+            )
+            return {"success": False, "error_class": error_cls, "escalated": True}
+
+        # Auto-refine for SyntaxError / NameError / ImportError
+        refiner_id = None
+        # Locate Refiner model or Coder model
+        for m_id, m in self.models.items():
+            if m.get("role", "").lower() in ["refiner", "critic", "coder"]:
+                refiner_id = m_id
+                break
+        if not refiner_id:
+            refiner_id = bot_id
+
+        refiner_cfg = self.models.get(refiner_id, self.known_models.get(refiner_id, {}))
+
+        # Best-of retention
+        read_res = self.tool_manager.read_file(filepath, bot_id=bot_id)
+        best_artifact = read_res.get("content", "")
+        best_error_count = len(stderr.splitlines()) if stderr else 100
+
+        refined_successfully = False
+
+        # 2 sets of 3 tries (Total 6 max, with lower top_k on 2nd set)
+        for set_num in range(1, 3):
+            top_k_val = 40 if set_num == 1 else 20
+            for try_num in range(1, 4):
+                prompt = (
+                    f"Fix ONLY the error in `{filepath}`.\n"
+                    f"Raw Traceback:\n{stderr[:1000]}\n\n"
+                    f"Current File Content:\n{best_artifact}\n\n"
+                    "Provide ONLY the full updated code file without explanations or markdown wrappers."
+                )
+
+                repair_cfg = dict(refiner_cfg)
+                repair_cfg["top_k"] = top_k_val
+                repair_cfg["temperature"] = 0.1
+
+                try:
+                    repaired_code = await self.model_manager.generate_response(
+                        model_config=repair_cfg,
+                        system_prompt="You are an automated code repair agent. Fix ONLY the runtime/syntax error. Output clean code only.",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.1
+                    )
+                except Exception as e:
+                    logger.warning("Repair turn generation failed: %s", e)
+                    continue
+
+                # Strip markdown code blocks if present
+                clean_repaired = repaired_code.strip()
+                if clean_repaired.startswith("```"):
+                    lines = clean_repaired.splitlines()
+                    if len(lines) > 2:
+                        clean_repaired = "\n".join(lines[1:-1])
+
+                # Write to bot sandbox
+                self.tool_manager.bot_workspace_write(bot_id=bot_id, filepath=filepath, content=clean_repaired)
+                bot_dir = self.tool_manager.get_bot_workspace_dir(bot_id)
+                full_repair_path = os.path.abspath(os.path.join(bot_dir, filepath))
+                eval_syntax = self.tool_manager.validate_file_syntax(full_repair_path)
+                eval_res = self.tool_manager.run_python(filepath=filepath, bot_id=bot_id)
+
+                if eval_syntax.get("valid") and (eval_res.get("success") or eval_res.get("returncode") in [0, None]):
+                    refined_successfully = True
+                    best_artifact = clean_repaired
+                    self.memory_manager.add_entry(
+                        author=f"Refinement Loop ({refiner_cfg.get('name', 'Refiner')})",
+                        content=f"🎉 [REFINEMENT SUCCESS] Auto-repaired `{filepath}` on Set {set_num} Try {try_num}!"
+                    )
+                    break
+                else:
+                    new_stderr = eval_res.get("stderr", "") or eval_syntax.get("error", "")
+                    new_error_count = len(new_stderr.splitlines()) if new_stderr else 999
+                    # Early stopping / best-of retention: Accept only if error count strictly decreases
+                    if new_error_count < best_error_count:
+                        best_artifact = clean_repaired
+                        best_error_count = new_error_count
+                        stderr = new_stderr
+                    else:
+                        # Revert to last best artifact
+                        self.tool_manager.bot_workspace_write(bot_id=bot_id, filepath=filepath, content=best_artifact)
+
+            if refined_successfully:
+                break
+
+        if not refined_successfully:
+            # Revert to original passing or best artifact
+            self.tool_manager.bot_workspace_write(bot_id=bot_id, filepath=filepath, content=best_artifact)
+            self.add_chat_message(
+                sender="System / Refinement Router",
+                role="System",
+                content=f"⚠️ [REFINEMENT EXHAUSTED] Auto-refinement loop could not resolve error for `{filepath}` after 2 sets of attempts. Escalate to cloud model or Admin.",
+                is_admin=True
+            )
+
+        # Log per-turn outcome to shared memory
+        outcome_log = {
+            "timestamp": time.time(),
+            "filepath": filepath,
+            "error_class": error_cls,
+            "success": refined_successfully,
+            "bot_id": bot_id
+        }
+        self.memory_manager.state.setdefault("refinement_outcomes", []).append(outcome_log)
+        self.memory_manager.save_memory()
+
+        return {"success": refined_successfully, "error_class": error_cls}
 
     @staticmethod
     def _directive_payload(response_text: str, opening_token: str) -> Optional[str]:
@@ -597,18 +897,36 @@ class Orchestrator:
             f"Created new itinerary task '{created['id']}': {title} (Status: {status})"
         )
 
-    async def run_autonomous_loop(self, max_turns: int = 5):
+    async def run_autonomous_loop(self, max_turns: int = 5, max_discussion_turns: int = 8, max_discussion_seconds: float = 120.0):
         if self.loop_active:
             return
         self.loop_active = True
+        start_time = time.time()
+        discussion_turns = 0
+
         try:
             turns = 0
             while turns < max_turns and self.loop_active:
+                current_phase = self.memory_manager.get_phase()
+
+                # Hard-cap Discussion Phase (turns and wall clock) to auto-advance to Execution
+                if current_phase == "discussion":
+                    discussion_turns += 1
+                    elapsed_disc = time.time() - start_time
+                    if discussion_turns >= max_discussion_turns or elapsed_disc >= max_discussion_seconds:
+                        self.memory_manager.set_phase("execution")
+                        self.add_chat_message(
+                            sender="System / Phase Manager",
+                            role="System",
+                            content=f"⚡ [DISCUSSION HARD CAP REACHED]: Auto-advancing from Discussion Phase to Execution Phase after {discussion_turns} turns / {int(elapsed_disc)}s.",
+                            is_admin=True
+                        )
+
                 next_speaker = self.get_next_speaker(self.last_speaker_id)
                 if not next_speaker:
                     break
 
-                # Manage VRAM allocation prior to turn (ensure Moderator gets priority if VRAM is tight)
+                # Manage VRAM allocation prior to turn (ensure Moderator & Refiner get priority)
                 self.manage_vram_allocation(next_speaker)
 
                 try:
@@ -616,8 +934,6 @@ class Orchestrator:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    # Without this the exception would die with the background task and the UI
-                    # would keep showing an apparently healthy, silently stalled loop.
                     logger.exception("Autonomous loop aborted while stepping %s", next_speaker)
                     self.add_chat_message(
                         sender="System / Conversation Loop",
@@ -628,7 +944,6 @@ class Orchestrator:
                     break
                 turns += 1
 
-                # If model indicated consensus / execution readiness or requested pause, pause loop
                 msg_content = res.get("content", "")
                 if "[READY_FOR_EXECUTION]" in msg_content or "CONSENSUS_REACHED" in msg_content:
                     break
@@ -638,49 +953,46 @@ class Orchestrator:
 
     def manage_vram_allocation(self, active_speaker_id: str):
         """
-        Dynamic Moderator Resource Management:
-        Ensures Architect / Moderator loads in VRAM first.
-        If VRAM headroom is tight, unloads inactive models or offloads smaller models to CPU/RAM,
-        while ensuring models can be dropped and reloaded on demand.
+        Dynamic Resource Management:
+        Ensures Moderator/Architect AND capability-critical Refiner are prioritized in VRAM.
+        If VRAM headroom is tight, offloads/unloads non-priority inactive models.
         """
         hw = self.model_manager.get_hardware_info()
         mod_id = self.moderator_model_id or "model_architect"
 
-        # Ensure Moderator/Architect is prioritized in VRAM
-        if mod_id in self.models and self.models[mod_id].get("provider") == "gguf_local":
-            mod_cfg = self.models[mod_id]
-            mod_path = mod_cfg.get("gguf_path") or mod_cfg.get("model_name", "")
-            if mod_path and mod_id not in self.model_manager.gguf_instances:
-                try:
-                    self.model_manager.load_gguf_model(
-                        mod_id,
-                        mod_path,
-                        max_tokens=mod_cfg.get("max_context_tokens", 2048),
-                        mmproj_path=mod_cfg.get("mmproj_path"),
-                        force_device="gpu"
-                    )
-                except ModelInvocationError as e:
-                    # The status board records the error; announce it so the room isn't left guessing.
-                    self.add_chat_message(
-                        sender="System / Resource Manager",
-                        role="System",
-                        content=f"⚠️ [VRAM PRELOAD FAILED] Moderator model `{mod_id}` could not be loaded into VRAM: {e}",
-                        is_admin=True
-                    )
+        # Identify Refiner / capability-critical models
+        refiner_ids = [m_id for m_id, m in self.models.items() if m.get("role", "").lower() in ["refiner", "critic", "coder"]]
+        priority_ids = set([mod_id] + refiner_ids + [active_speaker_id])
 
-        # If VRAM headroom is tight (< 1.5 GB), offload non-active models to RAM or unload them
+        # Preload priority models into VRAM if room exists
+        for pid in priority_ids:
+            if pid in self.models and self.models[pid].get("provider") == "gguf_local":
+                pcfg = self.models[pid]
+                ppath = pcfg.get("gguf_path") or pcfg.get("model_name", "")
+                if ppath and pid not in self.model_manager.gguf_instances:
+                    try:
+                        self.model_manager.load_gguf_model(
+                            pid,
+                            ppath,
+                            max_tokens=pcfg.get("max_context_tokens", 2048),
+                            mmproj_path=pcfg.get("mmproj_path"),
+                            force_device="gpu"
+                        )
+                    except Exception as e:
+                        logger.warning("Priority VRAM preload for %s skipped: %s", pid, e)
+
+        # If VRAM headroom is tight (< 1.5 GB), unload non-priority inactive models
         if hw.get("vram_free_gb", 0) < 1.5:
             for m_id, m_cfg in list(self.models.items()):
-                if m_cfg.get("provider") == "gguf_local":
-                    if m_id != mod_id and m_id != active_speaker_id:
-                        self.model_manager.unload_gguf_model(m_id)
-                        self.model_manager.update_model_status(
-                            m_id,
-                            status="online",
-                            error=None,
-                            vram_used_gb=0.0,
-                            location="RAM"
-                        )
+                if m_cfg.get("provider") == "gguf_local" and m_id not in priority_ids:
+                    self.model_manager.unload_gguf_model(m_id)
+                    self.model_manager.update_model_status(
+                        m_id,
+                        status="online",
+                        error=None,
+                        vram_used_gb=0.0,
+                        location="RAM"
+                    )
 
     def propose_tool_call(self, model_id: str, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         risk = self.tool_manager.classify_tool_risk(tool_name)
@@ -791,10 +1103,22 @@ class Orchestrator:
                         diff_snippet=f"Written {res.get('bytes_written', 0)} bytes"
                     )
                 return res
+            elif tool_name == "run_python":
+                filepath = args.get("filepath", "")
+                self.set_model_live_status(caller_id, f"Executing python sandbox script {filepath}")
+                return self.tool_manager.run_python(filepath=filepath, bot_id=caller_id)
+            elif tool_name == "run_tests":
+                test_path = args.get("test_path")
+                self.set_model_live_status(caller_id, "Running sandbox pytest suite")
+                return self.tool_manager.run_tests(bot_id=caller_id, test_path=test_path)
             elif tool_name == "bot_workspace_write":
                 filepath = args.get("filepath", "")
                 self.set_model_live_status(caller_id, f"Writing workspace sandbox {filepath}")
-                return self.tool_manager.bot_workspace_write(bot_id=caller_id, filepath=filepath, content=args.get("content", ""))
+                res = self.tool_manager.bot_workspace_write(bot_id=caller_id, filepath=filepath, content=args.get("content", ""))
+                if res.get("success") and filepath.endswith(".py"):
+                    # Auto-trigger isolated out-of-chat self-refinement feedback loop on Python write failure
+                    asyncio.create_task(self.trigger_sandbox_refinement_loop(bot_id=caller_id, filepath=filepath))
+                return res
             elif tool_name == "bot_workspace_merge":
                 filepath = args.get("filepath", "")
                 self.set_model_live_status(caller_id, f"Merging sandbox edits for {filepath}")
