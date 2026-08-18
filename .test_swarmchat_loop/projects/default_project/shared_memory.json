@@ -11,8 +11,8 @@
   "file_audit_log": [],
   "active_file_locks": {},
   "tokens_used": {
-    "model_coder": 30,
-    "model_architect": 30
+    "model_coder": 45,
+    "model_architect": 45
   },
   "session_id": "default_session"
 }
