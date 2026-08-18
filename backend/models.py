@@ -6,6 +6,8 @@ import subprocess
 import httpx
 from typing import Dict, Any, List, Optional
 
+from backend.utils import bytes_to_gb, file_size_gb, is_existing_file
+
 class ModelManager:
     def __init__(self, ollama_host: str = "http://localhost:11434"):
         self.ollama_host = ollama_host
@@ -43,7 +45,7 @@ class ModelManager:
         raw_path = raw_path.strip()
 
         # 1. Direct path check
-        if os.path.exists(raw_path) and os.path.isfile(raw_path):
+        if is_existing_file(raw_path):
             return os.path.abspath(raw_path)
 
         basename = os.path.basename(raw_path)
@@ -51,13 +53,9 @@ class ModelManager:
 
         # 2. Search in search_dirs for direct join or basename join
         for sdir in search_dirs:
-            candidate1 = os.path.join(sdir, raw_path)
-            if os.path.exists(candidate1) and os.path.isfile(candidate1):
-                return os.path.abspath(candidate1)
-
-            candidate2 = os.path.join(sdir, basename)
-            if os.path.exists(candidate2) and os.path.isfile(candidate2):
-                return os.path.abspath(candidate2)
+            for candidate in (os.path.join(sdir, raw_path), os.path.join(sdir, basename)):
+                if is_existing_file(candidate):
+                    return os.path.abspath(candidate)
 
         # 3. Case-insensitive basename search in search_dirs
         for sdir in search_dirs:
@@ -194,12 +192,12 @@ class ModelManager:
 
             llm = llama_cpp.Llama(**kwargs)
             self.gguf_instances[model_id] = llm
-            file_size_gb = round(os.path.getsize(resolved_gguf) / (1024 ** 3), 2)
+            size_gb = file_size_gb(resolved_gguf)
             self.update_model_status(
                 model_id,
                 status="online",
                 error=None,
-                vram_used_gb=file_size_gb if location == "VRAM" else 0.0,
+                vram_used_gb=size_gb if location == "VRAM" else 0.0,
                 location=location
             )
             return llm
@@ -213,8 +211,8 @@ class ModelManager:
 
     def get_hardware_info(self) -> Dict[str, Any]:
         mem = psutil.virtual_memory()
-        total_ram_gb = round(mem.total / (1024 ** 3), 2)
-        avail_ram_gb = round(mem.available / (1024 ** 3), 2)
+        total_ram_gb = bytes_to_gb(mem.total)
+        avail_ram_gb = bytes_to_gb(mem.available)
         ram_percent = mem.percent
 
         vram_free_gb = 0.0
@@ -256,23 +254,25 @@ class ModelManager:
             "ollama_available": self.check_ollama_status()
         }
 
-    def check_ollama_status(self) -> bool:
+    def _ollama_get(self, endpoint: str, timeout: float) -> Optional[httpx.Response]:
         try:
-            resp = httpx.get(f"{self.ollama_host}/api/version", timeout=1.5)
-            return resp.status_code == 200
+            return httpx.get(f"{self.ollama_host}{endpoint}", timeout=timeout)
         except Exception:
-            return False
+            return None
+
+    def check_ollama_status(self) -> bool:
+        resp = self._ollama_get("/api/version", timeout=1.5)
+        return resp is not None and resp.status_code == 200
 
     def list_ollama_models(self) -> List[str]:
         if not self.check_ollama_status():
             return []
-        try:
-            resp = httpx.get(f"{self.ollama_host}/api/tags", timeout=2.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                return [m["name"] for m in data.get("models", [])]
-        except Exception:
-            pass
+        resp = self._ollama_get("/api/tags", timeout=2.0)
+        if resp is not None and resp.status_code == 200:
+            try:
+                return [m["name"] for m in resp.json().get("models", [])]
+            except Exception:
+                pass
         return []
 
     def can_load_model(self, estimated_size_gb: float) -> Dict[str, Any]:

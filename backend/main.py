@@ -12,6 +12,7 @@ from backend.memory import MemoryManager
 from backend.tools import ToolManager
 from backend.orchestrator import Orchestrator
 from backend.evaluate import EvaluateEngine
+from backend.utils import file_size_gb, file_size_mb
 
 app = FastAPI(title="SwarmChat API", version="1.0.0")
 
@@ -140,10 +141,7 @@ def browse_filesystem(path: Optional[str] = None):
 
                 # In Server Filesystem Explorer, show ONLY model files (GGUF/bin/mmproj) and folders
                 if is_gguf or is_mmproj:
-                    try:
-                        size_mb = round(os.path.getsize(full_p) / (1024 * 1024), 2)
-                    except Exception:
-                        size_mb = 0.0
+                    size_mb = file_size_mb(full_p)
 
                     files.append({
                         "name": entry,
@@ -175,7 +173,7 @@ def validate_model_path(req: ValidatePathReq):
     valid = resolved_gguf is not None
     size_gb = 0.0
     if resolved_gguf and os.path.exists(resolved_gguf):
-        size_gb = round(os.path.getsize(resolved_gguf) / (1024 ** 3), 2)
+        size_gb = file_size_gb(resolved_gguf)
 
     msg = f"Path valid. Absolute location: '{resolved_gguf}' ({size_gb} GB)" if valid else f"File not found in path or search directories. Path: '{req.path}'"
     if req.mmproj_path:

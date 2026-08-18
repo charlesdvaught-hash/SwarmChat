@@ -6,6 +6,8 @@ import py_compile
 import httpx
 from typing import Dict, Any, List, Optional
 
+from backend.utils import failure, guarded, read_text_file, write_text_file
+
 class ToolManager:
     def __init__(self, workspace_root: str = "."):
         self.workspace_root = os.path.abspath(workspace_root)
@@ -54,71 +56,64 @@ class ToolManager:
             return "high"
         return "consequential"
 
-    def read_file(self, filepath: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
+    def _resolve_path(self, rel_path: str, bot_id: Optional[str] = None) -> str:
+        """Resolves a relative path inside the bot sandbox, falling back to the main workspace."""
         root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
-        full_path = os.path.abspath(os.path.join(root, filepath))
+        full_path = os.path.abspath(os.path.join(root, rel_path))
         if not os.path.exists(full_path):
-            # Fallback to main workspace if not in bot workspace
-            full_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
+            full_path = os.path.abspath(os.path.join(self.workspace_root, rel_path))
+        return full_path
+
+    @guarded
+    def read_file(self, filepath: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
+        full_path = self._resolve_path(filepath, bot_id)
 
         if not self._is_safe_path(full_path, self.workspace_root) and not self._is_safe_path(full_path, self.bot_workspaces_dir):
-            return {"success": False, "error": "Access outside workspace denied."}
+            return failure("Access outside workspace denied.")
         if not os.path.exists(full_path):
-            return {"success": False, "error": f"File not found: {filepath}"}
-        try:
-            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            return {"success": True, "filepath": filepath, "content": content}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            return failure(f"File not found: {filepath}")
+        return {"success": True, "filepath": filepath, "content": read_text_file(full_path)}
 
+    @guarded
     def list_files(self, rel_dir: str = ".", bot_id: Optional[str] = None) -> Dict[str, Any]:
-        root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
-        full_path = os.path.abspath(os.path.join(root, rel_dir))
-        if not os.path.exists(full_path):
-            full_path = os.path.abspath(os.path.join(self.workspace_root, rel_dir))
+        full_path = self._resolve_path(rel_dir, bot_id)
 
-        try:
-            items = []
-            for entry in os.listdir(full_path):
-                if entry.startswith(".") or entry in ["node_modules", "__pycache__", "venv"]:
-                    continue
-                p = os.path.join(full_path, entry)
-                items.append({
-                    "name": entry,
-                    "is_dir": os.path.isdir(p),
-                    "path": os.path.relpath(p, self.workspace_root)
-                })
-            return {"success": True, "items": items}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        items = []
+        for entry in os.listdir(full_path):
+            if entry.startswith(".") or entry in ["node_modules", "__pycache__", "venv"]:
+                continue
+            p = os.path.join(full_path, entry)
+            items.append({
+                "name": entry,
+                "is_dir": os.path.isdir(p),
+                "path": os.path.relpath(p, self.workspace_root)
+            })
+        return {"success": True, "items": items}
 
+    @guarded
     def search_workspace(self, query: str) -> Dict[str, Any]:
         results = []
-        try:
-            for root, dirs, files in os.walk(self.workspace_root):
-                dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ["node_modules", "__pycache__", "venv"]]
-                for file in files:
-                    if file.startswith("."):
-                        continue
-                    filepath = os.path.join(root, file)
-                    rel_path = os.path.relpath(filepath, self.workspace_root)
-                    try:
-                        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                            for idx, line in enumerate(f, 1):
-                                if query.lower() in line.lower():
-                                    results.append({
-                                        "filepath": rel_path,
-                                        "line": idx,
-                                        "content": line.strip()
-                                    })
-                                    if len(results) >= 50:
-                                        break
-                    except Exception:
-                        pass
-            return {"success": True, "query": query, "results": results}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        for root, dirs, files in os.walk(self.workspace_root):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ["node_modules", "__pycache__", "venv"]]
+            for file in files:
+                if file.startswith("."):
+                    continue
+                filepath = os.path.join(root, file)
+                rel_path = os.path.relpath(filepath, self.workspace_root)
+                try:
+                    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                        for idx, line in enumerate(f, 1):
+                            if query.lower() in line.lower():
+                                results.append({
+                                    "filepath": rel_path,
+                                    "line": idx,
+                                    "content": line.strip()
+                                })
+                                if len(results) >= 50:
+                                    break
+                except Exception:
+                    pass
+        return {"success": True, "query": query, "results": results}
 
     async def internet_search(self, query: str, domain_filter: Optional[str] = None) -> Dict[str, Any]:
         domains = self.allowed_domains
@@ -209,20 +204,18 @@ class ToolManager:
             ]
         }
 
-    def git_status(self) -> Dict[str, Any]:
-        try:
-            res = subprocess.check_output(["git", "status", "--porcelain"], cwd=self.workspace_root, text=True)
-            branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=self.workspace_root, text=True).strip()
-            return {"success": True, "branch": branch, "changes": res.strip().split("\n") if res.strip() else []}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    def _git_output(self, *args: str) -> str:
+        return subprocess.check_output(["git", *args], cwd=self.workspace_root, text=True)
 
+    @guarded
+    def git_status(self) -> Dict[str, Any]:
+        res = self._git_output("status", "--porcelain")
+        branch = self._git_output("branch", "--show-current").strip()
+        return {"success": True, "branch": branch, "changes": res.strip().split("\n") if res.strip() else []}
+
+    @guarded
     def git_diff(self) -> Dict[str, Any]:
-        try:
-            res = subprocess.check_output(["git", "diff"], cwd=self.workspace_root, text=True)
-            return {"success": True, "diff": res}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        return {"success": True, "diff": self._git_output("diff")}
 
     def validate_file_syntax(self, full_path: str) -> Dict[str, Any]:
         """Validates Python/JSON file syntax prior to merging."""
@@ -234,36 +227,32 @@ class ToolManager:
                 return {"valid": False, "error": f"Python syntax error: {str(e)}"}
         elif full_path.endswith(".json"):
             try:
-                with open(full_path, "r", encoding="utf-8") as f:
-                    json.load(f)
+                json.loads(read_text_file(full_path, errors="strict"))
                 return {"valid": True}
             except Exception as e:
                 return {"valid": False, "error": f"JSON syntax error: {str(e)}"}
         return {"valid": True}
 
+    @guarded
     def bot_workspace_write(self, bot_id: str, filepath: str, content: str) -> Dict[str, Any]:
         """Writes file to the bot's isolated workspace sandbox."""
         bot_dir = self.get_bot_workspace_dir(bot_id)
         full_path = os.path.abspath(os.path.join(bot_dir, filepath))
         if not self._is_safe_path(full_path, bot_dir):
-            return {"success": False, "error": "Access outside bot workspace denied."}
-        try:
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            return failure("Access outside bot workspace denied.")
 
-            # Syntax verification
-            syntax_res = self.validate_file_syntax(full_path)
-            return {
-                "success": syntax_res["valid"],
-                "filepath": filepath,
-                "bytes_written": len(content),
-                "bot_id": bot_id,
-                "syntax_valid": syntax_res["valid"],
-                "syntax_error": syntax_res.get("error")
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        bytes_written = write_text_file(full_path, content)
+
+        # Syntax verification
+        syntax_res = self.validate_file_syntax(full_path)
+        return {
+            "success": syntax_res["valid"],
+            "filepath": filepath,
+            "bytes_written": bytes_written,
+            "bot_id": bot_id,
+            "syntax_valid": syntax_res["valid"],
+            "syntax_error": syntax_res.get("error")
+        }
 
     def bot_workspace_merge_to_main(self, bot_id: str, filepath: str) -> Dict[str, Any]:
         """Validates and merges a file from bot workspace into main repository with git commit / rollback."""
@@ -272,11 +261,11 @@ class ToolManager:
         dest_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
 
         if not os.path.exists(src_path):
-            return {"success": False, "error": f"File '{filepath}' does not exist in bot workspace '{bot_id}'."}
+            return failure(f"File '{filepath}' does not exist in bot workspace '{bot_id}'.")
 
         syntax_res = self.validate_file_syntax(src_path)
         if not syntax_res["valid"]:
-            return {"success": False, "error": f"Merge rejected due to syntax error: {syntax_res.get('error')}"}
+            return failure(f"Merge rejected due to syntax error: {syntax_res.get('error')}")
 
         try:
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
@@ -303,29 +292,25 @@ class ToolManager:
             }
         except Exception as e:
             # Rollback file copy
-            return {"success": False, "error": f"Merge failed with error: {str(e)}"}
+            return failure(f"Merge failed with error: {str(e)}")
 
+    @guarded
     def copy_file(self, src: str, dest: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
         """Copies or clones a file within the workspace or bot sandbox."""
         root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
-        full_src = os.path.abspath(os.path.join(root, src))
-        if not os.path.exists(full_src):
-            full_src = os.path.abspath(os.path.join(self.workspace_root, src))
-
+        full_src = self._resolve_path(src, bot_id)
         full_dest = os.path.abspath(os.path.join(root, dest))
         if not self._is_safe_path(full_src) or not self._is_safe_path(full_dest):
-            return {"success": False, "error": "Copy operations outside workspace are denied."}
+            return failure("Copy operations outside workspace are denied.")
 
         if not os.path.exists(full_src):
-            return {"success": False, "error": f"Source file '{src}' does not exist."}
+            return failure(f"Source file '{src}' does not exist.")
 
-        try:
-            os.makedirs(os.path.dirname(full_dest), exist_ok=True)
-            shutil.copy2(full_src, full_dest)
-            return {"success": True, "src": src, "dest": dest}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        os.makedirs(os.path.dirname(full_dest), exist_ok=True)
+        shutil.copy2(full_src, full_dest)
+        return {"success": True, "src": src, "dest": dest}
 
+    @guarded
     def write_file(self, filepath: str, content: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
         """Standard write tool. If bot_id is provided, writes to bot workspace first."""
         if bot_id:
@@ -338,30 +323,22 @@ class ToolManager:
 
         full_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
         if not self._is_safe_path(full_path):
-            return {"success": False, "error": "Access outside workspace denied."}
-        try:
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return {"success": True, "filepath": filepath, "bytes_written": len(content)}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            return failure("Access outside workspace denied.")
+        return {"success": True, "filepath": filepath, "bytes_written": write_text_file(full_path, content)}
 
+    @guarded
     def run_terminal_cmd(self, command: str) -> Dict[str, Any]:
-        try:
-            res = subprocess.run(
-                command,
-                shell=True,
-                cwd=self.workspace_root,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            return {
-                "success": res.returncode == 0,
-                "returncode": res.returncode,
-                "stdout": res.stdout,
-                "stderr": res.stderr
-            }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        res = subprocess.run(
+            command,
+            shell=True,
+            cwd=self.workspace_root,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return {
+            "success": res.returncode == 0,
+            "returncode": res.returncode,
+            "stdout": res.stdout,
+            "stderr": res.stderr
+        }

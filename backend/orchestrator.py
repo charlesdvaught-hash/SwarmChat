@@ -6,6 +6,32 @@ from backend.models import ModelManager
 from backend.prompts import get_system_prompt
 from backend.memory import MemoryManager
 from backend.tools import ToolManager
+from backend.utils import extract_directive, timestamped_id
+
+DEFAULT_SAMPLING = {
+    "max_context_tokens": 4096,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 40,
+    "repeat_penalty": 1.1
+}
+
+
+def default_model_config(model_id: str, name: str, role: str, is_moderator: bool = False, **overrides: Any) -> Dict[str, Any]:
+    """Builds a roster entry with the shared provider/sampling defaults applied."""
+    return {
+        "id": model_id,
+        "name": name,
+        "role": role,
+        "provider": "ollama",
+        "model_name": "llama3.2:1b",
+        "enabled": True,
+        "is_moderator": is_moderator,
+        "status": "active",
+        **DEFAULT_SAMPLING,
+        **overrides
+    }
+
 
 class Orchestrator:
     def __init__(self, model_manager: ModelManager, memory_manager: MemoryManager, tool_manager: ToolManager):
@@ -24,51 +50,9 @@ class Orchestrator:
 
         # Known models library (persisted across room additions/removals)
         self.known_models: Dict[str, Dict[str, Any]] = {
-            "model_architect": {
-                "id": "model_architect",
-                "name": "Architect",
-                "role": "Architect",
-                "provider": "ollama",
-                "model_name": "llama3.2:1b",
-                "enabled": True,
-                "is_moderator": True,
-                "status": "active",
-                "max_context_tokens": 4096,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "top_k": 40,
-                "repeat_penalty": 1.1
-            },
-            "model_critic": {
-                "id": "model_critic",
-                "name": "Critic",
-                "role": "Critic",
-                "provider": "ollama",
-                "model_name": "llama3.2:1b",
-                "enabled": True,
-                "is_moderator": False,
-                "status": "active",
-                "max_context_tokens": 4096,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "top_k": 40,
-                "repeat_penalty": 1.1
-            },
-            "model_coder": {
-                "id": "model_coder",
-                "name": "Coder",
-                "role": "Coder",
-                "provider": "ollama",
-                "model_name": "llama3.2:1b",
-                "enabled": True,
-                "is_moderator": False,
-                "status": "active",
-                "max_context_tokens": 4096,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "top_k": 40,
-                "repeat_penalty": 1.1
-            }
+            "model_architect": default_model_config("model_architect", "Architect", "Architect", is_moderator=True),
+            "model_critic": default_model_config("model_critic", "Critic", "Critic"),
+            "model_coder": default_model_config("model_coder", "Coder", "Coder")
         }
 
         # Active chatroom models (subset of known models currently in the room)
@@ -176,7 +160,7 @@ class Orchestrator:
 
     def add_chat_message(self, sender: str, role: str, content: str, is_admin: bool = False, model_id: Optional[str] = None) -> Dict[str, Any]:
         msg = {
-            "id": f"msg_{int(time.time()*1000)}",
+            "id": timestamped_id("msg"),
             "timestamp": time.time(),
             "sender": sender,
             "role": role,
@@ -391,80 +375,55 @@ class Orchestrator:
         elif "[REQUEST_DISCUSSION]" in response_text:
             self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
 
-        if "[UPDATE_CONFIG:" in response_text:
+        raw_cfg = extract_directive(response_text, "UPDATE_CONFIG")
+        if raw_cfg:
             try:
-                start = response_text.find("[UPDATE_CONFIG:") + len("[UPDATE_CONFIG:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    raw_cfg = response_text[start:end].strip()
-                    parts = [p.strip() for p in raw_cfg.split(",")]
-                    updates = {}
-                    target_id = model_id
-                    for p in parts:
-                        if "=" in p:
-                            k, v = p.split("=", 1)
-                            k, v = k.strip(), v.strip()
-                            if k == "model_id":
-                                target_id = v
-                            elif k in ["top_p", "temperature", "repeat_penalty"]:
-                                updates[k] = float(v)
-                            elif k == "top_k":
-                                updates[k] = int(v)
-                    if updates and target_id in self.models:
-                        self.models[target_id].update(updates)
-                        if target_id in self.known_models:
-                            self.known_models[target_id].update(updates)
-                        self.memory_manager.add_entry(
-                            author=model_cfg["name"],
-                            content=f"Updated sampling settings for `{target_id}` based on Hugging Face / performance research: {updates}"
-                        )
-            except Exception:
-                pass
-
-        if "[UPDATE_SPEC:" in response_text:
-            try:
-                start = response_text.find("[UPDATE_SPEC:") + len("[UPDATE_SPEC:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    spec_content = response_text[start:end].strip()
-                    self.memory_manager.update_spec_file(model_id, spec_content)
-            except Exception:
-                pass
-
-        if "[SEARCH_HF:" in response_text:
-            try:
-                start = response_text.find("[SEARCH_HF:") + len("[SEARCH_HF:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    query = response_text[start:end].strip()
-                    hf_res = await self.tool_manager.search_huggingface(query)
-                    m_list = hf_res.get("models", [])
-                    res_summary = ", ".join([m["model_id"] for m in m_list[:3]])
+                updates = {}
+                target_id = model_id
+                for p in [p.strip() for p in raw_cfg.split(",")]:
+                    if "=" in p:
+                        k, v = p.split("=", 1)
+                        k, v = k.strip(), v.strip()
+                        if k == "model_id":
+                            target_id = v
+                        elif k in ["top_p", "temperature", "repeat_penalty"]:
+                            updates[k] = float(v)
+                        elif k == "top_k":
+                            updates[k] = int(v)
+                if updates and target_id in self.models:
+                    self.models[target_id].update(updates)
+                    if target_id in self.known_models:
+                        self.known_models[target_id].update(updates)
                     self.memory_manager.add_entry(
-                        model_cfg["name"],
-                        f"HuggingFace search for '{query}' returned candidate models: {res_summary}"
+                        author=model_cfg["name"],
+                        content=f"Updated sampling settings for `{target_id}` based on Hugging Face / performance research: {updates}"
                     )
             except Exception:
                 pass
 
-        if "[JOURNAL:" in response_text:
+        spec_content = extract_directive(response_text, "UPDATE_SPEC")
+        if spec_content:
+            self.memory_manager.update_spec_file(model_id, spec_content)
+
+        hf_query = extract_directive(response_text, "SEARCH_HF")
+        if hf_query:
             try:
-                start = response_text.find("[JOURNAL:") + len("[JOURNAL:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    journal_content = response_text[start:end].strip()
-                    self.memory_manager.record_model_nap(model_id, journal_content)
+                hf_res = await self.tool_manager.search_huggingface(hf_query)
+                m_list = hf_res.get("models", [])
+                res_summary = ", ".join([m["model_id"] for m in m_list[:3]])
+                self.memory_manager.add_entry(
+                    model_cfg["name"],
+                    f"HuggingFace search for '{hf_query}' returned candidate models: {res_summary}"
+                )
             except Exception:
                 pass
-        elif "[LOG_TO_MEMORY:" in response_text:
-            try:
-                start = response_text.find("[LOG_TO_MEMORY:") + len("[LOG_TO_MEMORY:")
-                end = response_text.find("]", start)
-                if end != -1:
-                    mem_content = response_text[start:end].strip()
-                    self.memory_manager.add_entry(model_cfg["name"], mem_content)
-            except Exception:
-                pass
+
+        journal_content = extract_directive(response_text, "JOURNAL")
+        mem_content = extract_directive(response_text, "LOG_TO_MEMORY")
+        if journal_content:
+            self.memory_manager.record_model_nap(model_id, journal_content)
+        elif mem_content:
+            self.memory_manager.add_entry(model_cfg["name"], mem_content)
 
         if "[REQUEST_NAP]" in response_text and "[JOURNAL:" not in response_text:
             self.memory_manager.record_model_nap(model_id, f"{model_cfg['name']} completed a context nap.")
@@ -545,7 +504,7 @@ class Orchestrator:
     def propose_tool_call(self, model_id: str, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         risk = self.tool_manager.classify_tool_risk(tool_name)
         vote_req = {
-            "id": f"vote_{int(time.time()*1000)}",
+            "id": timestamped_id("vote"),
             "model_id": model_id,
             "model_name": self.models.get(model_id, {}).get("name", "Unknown"),
             "tool_name": tool_name,
@@ -577,6 +536,16 @@ class Orchestrator:
                 return loop.run_until_complete(self._execute_tool_async(tool_name, args, caller_id))
         except Exception:
             return asyncio.run(self._execute_tool_async(tool_name, args, caller_id))
+
+    def _log_edit_if_success(self, res: Dict[str, Any], filepath: str, caller_id: str, action: str, diff_snippet: str) -> Dict[str, Any]:
+        if res.get("success"):
+            self.memory_manager.log_file_edit(
+                filepath=filepath,
+                author=caller_id,
+                action=action,
+                diff_snippet=diff_snippet
+            )
+        return res
 
     async def _execute_tool_async(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
         # Lock write tools during discussion phase
@@ -612,27 +581,13 @@ class Orchestrator:
                 dest = args.get("dest", "")
                 self.set_model_live_status(caller_id, f"Cloning / copying {src} to {dest}")
                 res = self.tool_manager.copy_file(src, dest, bot_id=caller_id)
-                if res.get("success"):
-                    self.memory_manager.log_file_edit(
-                        filepath=dest,
-                        author=caller_id,
-                        action="copy",
-                        diff_snippet=f"Copied from {src}"
-                    )
-                return res
+                return self._log_edit_if_success(res, dest, caller_id, "copy", f"Copied from {src}")
             elif tool_name == "write_file":
                 filepath = args.get("filepath", "")
                 self.set_model_live_status(caller_id, f"Editing file {filepath}")
                 content = args.get("content", "")
                 res = self.tool_manager.write_file(filepath, content, bot_id=caller_id)
-                if res.get("success"):
-                    self.memory_manager.log_file_edit(
-                        filepath=filepath,
-                        author=caller_id,
-                        action="write",
-                        diff_snippet=f"Written {res.get('bytes_written', 0)} bytes"
-                    )
-                return res
+                return self._log_edit_if_success(res, filepath, caller_id, "write", f"Written {res.get('bytes_written', 0)} bytes")
             elif tool_name == "bot_workspace_write":
                 filepath = args.get("filepath", "")
                 self.set_model_live_status(caller_id, f"Writing workspace sandbox {filepath}")
@@ -641,14 +596,7 @@ class Orchestrator:
                 filepath = args.get("filepath", "")
                 self.set_model_live_status(caller_id, f"Merging sandbox edits for {filepath}")
                 res = self.tool_manager.bot_workspace_merge_to_main(bot_id=caller_id, filepath=filepath)
-                if res.get("success"):
-                    self.memory_manager.log_file_edit(
-                        filepath=filepath,
-                        author=caller_id,
-                        action="merge",
-                        diff_snippet=f"Merged from workspace {caller_id}"
-                    )
-                return res
+                return self._log_edit_if_success(res, filepath, caller_id, "merge", f"Merged from workspace {caller_id}")
             elif tool_name == "run_terminal_cmd":
                 cmd = args.get("command", "")
                 self.set_model_live_status(caller_id, f"Executing command '{cmd[:20]}...'")

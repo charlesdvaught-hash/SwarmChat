@@ -3,6 +3,8 @@ import json
 import time
 from typing import Dict, Any, List, Optional
 
+from backend.utils import format_clock, format_datetime, timestamped_id, write_json_file, write_text_file
+
 class MemoryManager:
     def __init__(self, storage_dir: str = ".swarmchat", project_id: str = "default_project"):
         self.base_storage_dir = storage_dir
@@ -53,8 +55,7 @@ class MemoryManager:
 
     def save_memory(self):
         try:
-            with open(self.json_path, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, indent=2)
+            write_json_file(self.json_path, self.state)
             self._render_markdown_archive()
         except Exception as e:
             print(f"Error saving shared memory: {e}")
@@ -65,7 +66,7 @@ class MemoryManager:
                 f"# 🧠 SwarmChat Continuous Shared Memory Archive — Project: `{self.project_id}`",
                 f"**Session ID:** `{self.state.get('session_id', 'default_session')}`",
                 f"**Current Phase:** `{self.state.get('phase', 'discussion').upper()}`",
-                f"**Last Phase Switch:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.state.get('phase_last_changed', time.time())))}",
+                f"**Last Phase Switch:** {format_datetime(self.state.get('phase_last_changed'))}",
                 "\n---",
                 "## 📌 Key Decisions & Shared Memory Entries\n"
             ]
@@ -75,7 +76,7 @@ class MemoryManager:
                 lines.append("*No shared entries logged yet.*")
             else:
                 for entry in entries:
-                    timestamp = time.strftime('%H:%M:%S', time.localtime(entry.get("timestamp", time.time())))
+                    timestamp = format_clock(entry.get("timestamp"))
                     author = entry.get("author", "Unknown")
                     content = entry.get("content", "")
                     lines.append(f"- **[{timestamp}] {author}:** {content}")
@@ -86,7 +87,7 @@ class MemoryManager:
                 lines.append("*No episodes recorded yet.*")
             else:
                 for ep in episodes:
-                    t_str = time.strftime('%H:%M:%S', time.localtime(ep.get("timestamp", time.time())))
+                    t_str = format_clock(ep.get("timestamp"))
                     lines.append(f"### Episode `{ep.get('id')}` — [{ep.get('author')}] ({ep.get('thread_name', 'main')})")
                     lines.append(f"- **Time:** {t_str}")
                     lines.append(f"- **Action / Task:** {ep.get('action', '')}")
@@ -102,11 +103,10 @@ class MemoryManager:
                 for model_id, logs in journals.items():
                     lines.append(f"### 🤖 Model: `{model_id}`")
                     for log in logs:
-                        t_str = time.strftime('%H:%M:%S', time.localtime(log.get("timestamp", time.time())))
+                        t_str = format_clock(log.get("timestamp"))
                         lines.append(f"- **[{t_str}] Journal Summary:** {log.get('summary', '')}")
 
-            with open(self.md_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
+            write_text_file(self.md_path, "\n".join(lines))
         except Exception as e:
             print(f"Error rendering markdown archive: {e}")
 
@@ -128,7 +128,7 @@ class MemoryManager:
 
     def add_entry(self, author: str, content: str):
         entry = {
-            "id": f"mem_{int(time.time() * 1000)}",
+            "id": timestamped_id("mem"),
             "timestamp": time.time(),
             "author": author,
             "content": content
@@ -145,7 +145,7 @@ class MemoryManager:
         modified_files: Optional[List[str]] = None,
         source_threads: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        ep_id = f"ep_{int(time.time() * 1000)}"
+        ep_id = timestamped_id("ep")
         episode = {
             "id": ep_id,
             "timestamp": time.time(),
@@ -176,8 +176,7 @@ class MemoryManager:
         os.makedirs(model_dir, exist_ok=True)
         journal_path = os.path.join(model_dir, "journal.json")
         try:
-            with open(journal_path, "w", encoding="utf-8") as f:
-                json.dump(self.state["model_journals"][model_id], f, indent=2)
+            write_json_file(journal_path, self.state["model_journals"][model_id])
         except Exception:
             pass
 
@@ -204,7 +203,7 @@ class MemoryManager:
     # --- TASK ITINERARY & MEETINGS ---
     def add_itinerary_task(self, title: str, description: str, priority: str = "medium", assigned_model: Optional[str] = None) -> Dict[str, Any]:
         task = {
-            "id": f"task_{int(time.time() * 1000)}",
+            "id": timestamped_id("task"),
             "title": title,
             "description": description,
             "priority": priority,  # high, medium, low
@@ -242,7 +241,7 @@ class MemoryManager:
     # --- FILE AUDIT LOG & ATTRIBUTION ---
     def log_file_edit(self, filepath: str, author: str, action: str, diff_snippet: Optional[str] = None):
         entry = {
-            "id": f"audit_{int(time.time() * 1000)}",
+            "id": timestamped_id("audit"),
             "timestamp": time.time(),
             "filepath": filepath,
             "author": author,
@@ -298,8 +297,7 @@ class MemoryManager:
         os.makedirs(model_dir, exist_ok=True)
         spec_path = os.path.join(model_dir, "spec_file.md")
         try:
-            with open(spec_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            write_text_file(spec_path, content)
         except Exception:
             pass
 
