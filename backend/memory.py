@@ -3,6 +3,8 @@ import json
 import time
 from typing import Dict, Any, List, Optional
 
+from backend.security import SAFE_ID_PATTERN
+
 class MemoryManager:
     def __init__(self, storage_dir: str = ".swarmchat", project_id: str = "default_project"):
         self.base_storage_dir = storage_dir
@@ -28,6 +30,14 @@ class MemoryManager:
             "session_id": "default_session"
         }
         self.load_memory()
+
+    def _model_dir(self, model_id: str) -> Optional[str]:
+        """Returns the per-model storage directory, or None when the id is not a safe path component."""
+        if not SAFE_ID_PATTERN.match(model_id or ""):
+            return None
+        model_dir = os.path.join(self.project_dir, "models", model_id)
+        os.makedirs(model_dir, exist_ok=True)
+        return model_dir
 
     def get_project_id(self) -> str:
         return self.project_id
@@ -172,14 +182,14 @@ class MemoryManager:
         self.state.setdefault("model_journals", {}).setdefault(model_id, []).append(log)
         
         # Save model-isolated journal in project models folder
-        model_dir = os.path.join(self.project_dir, "models", model_id)
-        os.makedirs(model_dir, exist_ok=True)
-        journal_path = os.path.join(model_dir, "journal.json")
-        try:
-            with open(journal_path, "w", encoding="utf-8") as f:
-                json.dump(self.state["model_journals"][model_id], f, indent=2)
-        except Exception:
-            pass
+        model_dir = self._model_dir(model_id)
+        if model_dir:
+            journal_path = os.path.join(model_dir, "journal.json")
+            try:
+                with open(journal_path, "w", encoding="utf-8") as f:
+                    json.dump(self.state["model_journals"][model_id], f, indent=2)
+            except Exception:
+                pass
 
         # Automatically generate a NAC-style Episode checkpoint on Nap
         self.record_episode(
@@ -294,14 +304,14 @@ class MemoryManager:
         self.state.setdefault("model_spec_files", {})[model_id] = content
 
         # Save to file
-        model_dir = os.path.join(self.project_dir, "models", model_id)
-        os.makedirs(model_dir, exist_ok=True)
-        spec_path = os.path.join(model_dir, "spec_file.md")
-        try:
-            with open(spec_path, "w", encoding="utf-8") as f:
-                f.write(content)
-        except Exception:
-            pass
+        model_dir = self._model_dir(model_id)
+        if model_dir:
+            spec_path = os.path.join(model_dir, "spec_file.md")
+            try:
+                with open(spec_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception:
+                pass
 
         self.save_memory()
         return content

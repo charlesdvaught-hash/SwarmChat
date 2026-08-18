@@ -46,6 +46,34 @@ If your machine has an NVIDIA GPU and CUDA installed:
      CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --force-reinstall --upgrade --no-cache-dir
      ```
 
+## 🔐 Access Control
+
+SwarmChat can browse the server filesystem, write files and run approved commands, so the API is not
+open by default:
+
+- The server binds to `127.0.0.1` unless `SWARMCHAT_HOST` says otherwise.
+- Without configuration, only loopback clients may call `/api/*`.
+- To reach SwarmChat from another machine, set a shared token and pass it as the
+  `X-SwarmChat-Token` header (or `Authorization: Bearer <token>`). The web UI also accepts the token
+  once as `http://host:8000/?token=<token>`; it is moved to `sessionStorage` and stripped from the URL.
+
+| Variable | Purpose |
+| --- | --- |
+| `SWARMCHAT_API_TOKEN` | Token required on every `/api` request. Required for non-loopback access. |
+| `SWARMCHAT_ALLOWED_ORIGINS` | Extra browser origins allowed by CORS, comma separated. Local dev origins are always allowed. |
+| `SWARMCHAT_ALLOWED_HOSTS` | Host headers the server answers to, comma separated. Defaults to localhost. |
+| `SWARMCHAT_HOST` / `SWARMCHAT_PORT` | Bind address and port used by `run.sh` / `run.bat`. |
+
+```bash
+export SWARMCHAT_API_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export SWARMCHAT_HOST=0.0.0.0
+export SWARMCHAT_ALLOWED_HOSTS="swarm.internal,127.0.0.1,localhost"
+./run.sh
+```
+
+Provider API keys are kept in memory for outbound calls only; the API redacts them from every
+response and reports `api_key_set` instead.
+
 ## 🧪 Testing
 Run backend unit and integration tests:
 ```bash

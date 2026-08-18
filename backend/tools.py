@@ -1,10 +1,15 @@
 import os
 import json
+import re
+import shlex
 import shutil
 import subprocess
 import py_compile
 import httpx
 from typing import Dict, Any, List, Optional
+from urllib.parse import quote_plus
+
+BOT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 class ToolManager:
     def __init__(self, workspace_root: str = "."):
@@ -30,6 +35,8 @@ class ToolManager:
             self.allowed_domains.append(domain)
 
     def get_bot_workspace_dir(self, bot_id: str) -> str:
+        if not BOT_ID_PATTERN.match(bot_id or ""):
+            raise ValueError(f"Invalid bot id: '{bot_id}'")
         bot_dir = os.path.join(self.bot_workspaces_dir, bot_id)
         os.makedirs(bot_dir, exist_ok=True)
         return bot_dir
@@ -77,6 +84,9 @@ class ToolManager:
         full_path = os.path.abspath(os.path.join(root, rel_dir))
         if not os.path.exists(full_path):
             full_path = os.path.abspath(os.path.join(self.workspace_root, rel_dir))
+
+        if not self._is_safe_path(full_path, self.workspace_root) and not self._is_safe_path(full_path, self.bot_workspaces_dir):
+            return {"success": False, "error": "Access outside workspace denied."}
 
         try:
             items = []
@@ -131,7 +141,7 @@ class ToolManager:
         results = []
         try:
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                resp = await client.get(f"https://html.duckduckgo.com/html/?q={query}")
+                resp = await client.get(f"https://html.duckduckgo.com/html/?q={quote_plus(query)}")
                 if resp.status_code == 200:
                     from bs4 import BeautifulSoup
                     soup = BeautifulSoup(resp.text, "html.parser")
@@ -160,7 +170,7 @@ class ToolManager:
 
     async def search_huggingface(self, query: str, limit: int = 5) -> Dict[str, Any]:
         clean_q = query.replace("huggingface", "").replace("hf", "").strip() or query
-        url = f"https://huggingface.co/api/models?search={clean_q}&limit={limit}&full=true"
+        url = f"https://huggingface.co/api/models?search={quote_plus(clean_q)}&limit={int(limit)}&full=true"
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(url)
@@ -271,6 +281,9 @@ class ToolManager:
         src_path = os.path.abspath(os.path.join(bot_dir, filepath))
         dest_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
 
+        if not self._is_safe_path(src_path, bot_dir) or not self._is_safe_path(dest_path, self.workspace_root):
+            return {"success": False, "error": "Merge outside workspace denied."}
+
         if not os.path.exists(src_path):
             return {"success": False, "error": f"File '{filepath}' does not exist in bot workspace '{bot_id}'."}
 
@@ -348,10 +361,18 @@ class ToolManager:
             return {"success": False, "error": str(e)}
 
     def run_terminal_cmd(self, command: str) -> Dict[str, Any]:
+        """Runs an Admin-approved command without a shell, so a single approval cannot chain extra commands."""
+        try:
+            argv = shlex.split(command or "")
+        except ValueError as e:
+            return {"success": False, "error": f"Could not parse command: {e}"}
+        if not argv:
+            return {"success": False, "error": "Empty command."}
+
         try:
             res = subprocess.run(
-                command,
-                shell=True,
+                argv,
+                shell=False,
                 cwd=self.workspace_root,
                 capture_output=True,
                 text=True,

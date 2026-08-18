@@ -38,9 +38,10 @@ fi
 
 echo ""
 echo "===================================================="
-echo "   SwarmChat Server is running on http://localhost:8000"
+echo "   SwarmChat Server is running on http://localhost:8000 (local access only)"
+echo "   To expose it beyond this machine, set SWARMCHAT_API_TOKEN and SWARMCHAT_HOST."
 echo "   Press Ctrl+C to stop the server when done."
 echo "===================================================="
 echo ""
 
-python3 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+python3 -m uvicorn backend.main:app --host "${SWARMCHAT_HOST:-127.0.0.1}" --port "${SWARMCHAT_PORT:-8000}"
