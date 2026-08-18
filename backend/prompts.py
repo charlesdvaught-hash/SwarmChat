@@ -29,39 +29,29 @@ APEX_TITLES = {
 }
 
 # Default templates designed to be under 300 tokens, strict and clear for unaligned/Dolphin models.
-DEFAULT_START_PROMPT = """You are %n, serving strictly as %a (%r) in project %p.
-Current Task: %t
-Phase: Discussion (Planning & Alignment)
+DEFAULT_START_PROMPT = """You are %n (%r) in project %p. Task: %t. Phase: Discussion.
 
-CRITICAL DIRECTIVES & ACTION COMMANDS:
-1. NO THINKING BLOCKS: Do NOT output `<think>` tags, `</think>` tags, or internal reasoning.
-2. NO PREFIXES: Do NOT prefix messages with your name or role header.
-3. ABSOLUTE PHASE RULES:
-   - File edits and code writes are LOCKED during Discussion phase.
-   - You MUST record key ideas, specs, and decisions into indexed memory using action tags so they are preserved across context resets!
-4. AVAILABLE ACTION TAGS (Include these in your message when taking action):
-   - `[LOG_TO_MEMORY: <key finding or decision>]` to save important decisions to shared indexed memory.
-   - `[UPDATE_SPEC: <content>]` to record technical design specs in your personal notebook.
-   - `[UPDATE_TASK: id=<task_id>, status=<pending|in_progress|completed>, title=<title>]` to create or update task itinerary items.
-   - `[JOURNAL: <summary>]` to save a self-journal checkpoint.
-   - `[SEARCH_HF: <query>]` to research HuggingFace candidate models.
-   - `[READY_FOR_EXECUTION]` when planning is complete and team is ready to write code."""
+DIRECTIVES:
+1. NO THINKING BLOCKS or name headers.
+2. Save notes and specs to indexed memory across context resets:
+   - `[SAVE_NOTE: <100-300 token chunk>]` save indexed note chunk.
+   - `[LOG_TO_MEMORY: <decision>]` save shared memory entry.
+   - `[UPDATE_SPEC: <spec>]` update spec file.
+   - `[UPDATE_TASK: title=<title>, status=<pending|in_progress>]` update task itinerary.
+   - `[READY_FOR_EXECUTION]` when ready for code execution.
+3. Reference peer code with `@bot_name:filename` or `workspace://<bot_id>/<file>`."""
 
-DEFAULT_EXECUTION_PROMPT = """You are %n, serving strictly as %a (%r) in project %p.
-Current Task: %t
-Phase: Execution (Implementation & Testing)
+DEFAULT_EXECUTION_PROMPT = """You are %n (%r) in project %p. Task: %t. Phase: Execution.
 
-CRITICAL DIRECTIVES & ACTION COMMANDS:
-1. NO THINKING BLOCKS: Do NOT output `<think>` tags, `</think>` tags, or internal reasoning.
-2. NO PREFIXES: Do NOT prefix messages with your name or role header.
-3. ABSOLUTE PHASE RULES:
-   - Work incrementally. Non-moderators write to local sandbox workspaces (`bot_workspace_write`).
-   - Test, verify, and log progress to indexed memory continuously!
-4. AVAILABLE ACTION TAGS:
-   - `[LOG_TO_MEMORY: <log message>]` to record completed tasks, test results, or code updates.
-   - `[UPDATE_TASK: id=<task_id>, status=<completed|in_progress>]` to mark tasks finished.
-   - `[JOURNAL: <summary>]` to save execution progress summary before context resets.
-   - `[REQUEST_DISCUSSION]` if requirements are ambiguous and team needs to return to discussion phase."""
+DIRECTIVES:
+1. NO THINKING BLOCKS or name headers.
+2. Code generated in chat blocks is auto-saved to your workspace sandbox (`.swarmchat/workspaces/%n/`).
+3. Reference peer code with `@bot_name:filename` or `workspace://<bot_id>/<file>`.
+4. ACTION TAGS:
+   - `[SAVE_NOTE: <chunk>]` save indexed note chunk.
+   - `[LOG_TO_MEMORY: <log>]` log completion or test result.
+   - `[UPDATE_TASK: id=<task_id>, status=<completed>]` mark finished.
+   - `[REQUEST_DISCUSSION]` if ambiguous."""
 
 ROLE_DEFINITIONS = {
     "Architect": {

@@ -1,14 +1,29 @@
-INFO:     Started server process [194736]
+INFO:     Started server process [285536]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
-INFO:     127.0.0.1:36126 - "GET /api/state HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET / HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /assets/index-6o-fawmA.js HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54618 - "GET /assets/index-B8JSji7I.css HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/state HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/hardware HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/dependencies HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/workspace/files HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/evaluate/health HTTP/1.1" 200 OK
-INFO:     127.0.0.1:54602 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54190 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /assets/index-B4yFwqNm.js HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49644 - "GET /assets/index-CG_L1UDS.css HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+Generation failure for model_architect (ollama): Ollama is not reachable at http://localhost:11434. Start Ollama or switch the model provider.
+Turn failed for model_architect: Ollama is not reachable at http://localhost:11434. Start Ollama or switch the model provider.
+INFO:     127.0.0.1:49638 - "POST /api/chat/step HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/models/search_paths HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/state HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/hardware HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/dependencies HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/workspace/files HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/evaluate/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49638 - "GET /api/models/search_paths HTTP/1.1" 200 OK

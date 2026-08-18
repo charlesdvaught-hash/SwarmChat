@@ -563,6 +563,11 @@ export default function App() {
                 <Cpu className="w-3.5 h-3.5 text-slate-400" />
                 <span>RAM: {hardware.ram_available_gb}GB</span>
               </div>
+              <div className="h-3 w-px bg-slate-700" />
+              <div className="flex items-center gap-1 text-slate-300" title={hardware.gpu_name || 'GPU / VRAM'}>
+                <Zap className="w-3.5 h-3.5 text-cyan-400" />
+                <span>VRAM: {hardware.vram_free_gb ?? 0} / {hardware.vram_total_gb ?? 0} GB</span>
+              </div>
             </div>
           )}
 

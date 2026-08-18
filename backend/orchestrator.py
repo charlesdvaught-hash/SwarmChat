@@ -92,8 +92,9 @@ class Orchestrator:
         }
 
         # Active chatroom models (subset of known models currently in the room)
+        # Initial status set to "Connecting..." until confirmed connected/online on turn step or validation
         self.models: Dict[str, Dict[str, Any]] = {
-            m_id: {**cfg, "live_status": "Idle / Live in Chat"} for m_id, cfg in self.known_models.items()
+            m_id: {**cfg, "live_status": "Connecting..."} for m_id, cfg in self.known_models.items()
         }
 
         self.pending_tool_votes: List[Dict[str, Any]] = []
@@ -153,7 +154,7 @@ class Orchestrator:
     def add_or_update_known_model(self, model_cfg: Dict[str, Any]):
         m_id = model_cfg["id"]
         if "live_status" not in model_cfg:
-            model_cfg["live_status"] = "Idle / Live in Chat"
+            model_cfg["live_status"] = "Connecting..."
         self.known_models[m_id] = model_cfg
         self.models[m_id] = dict(model_cfg)
         if model_cfg.get("is_moderator"):
@@ -191,7 +192,9 @@ class Orchestrator:
 
     def readd_model_to_room(self, model_id: str) -> Dict[str, Any]:
         if model_id in self.known_models:
-            self.models[model_id] = dict(self.known_models[model_id])
+            m_cfg = dict(self.known_models[model_id])
+            m_cfg["live_status"] = "Connecting..."
+            self.models[model_id] = m_cfg
             if self.known_models[model_id].get("is_moderator"):
                 self.set_moderator(model_id)
             return {"success": True, "model": self.models[model_id]}
@@ -602,8 +605,41 @@ class Orchestrator:
                 self._directive_payload(response_text, "[LOG_TO_MEMORY:")
             )
 
+        if "[SAVE_NOTE:" in response_text:
+            self._run_directive(
+                "SAVE_NOTE", model_cfg,
+                lambda payload: self.memory_manager.add_note_chunk(model_id, payload, title=f"Note by {model_cfg['name']}"),
+                self._directive_payload(response_text, "[SAVE_NOTE:")
+            )
+
         if "[REQUEST_NAP]" in response_text and "[JOURNAL:" not in response_text:
             self.memory_manager.record_model_nap(model_id, f"{model_cfg['name']} completed a context nap.")
+
+        # Auto-extract markdown code blocks and save into model workspace
+        if "```" in response_text:
+            parts = response_text.split("```")
+            for i in range(1, len(parts), 2):
+                block = parts[i]
+                lines = block.splitlines()
+                if not lines:
+                    continue
+                first_line = lines[0].strip()
+                # Check for comment filename header like `# filename: example.py` or `// filename: index.ts`
+                fn = f"generated_code_{int(time.time()*1000)}_{i//2}.py"
+                code_body = block
+                if len(lines) > 1 and ("filename:" in lines[0] or "filename:" in lines[1]):
+                    for line in lines[:2]:
+                        if "filename:" in line:
+                            fn = line.split("filename:")[-1].strip().strip("`*#/")
+                    code_body = "\n".join(lines[1:])
+                elif first_line and not any(char in first_line for char in " =():[]{}#"):
+                    # First line is language identifier (e.g., python, ts)
+                    code_body = "\n".join(lines[1:])
+                    ext = ".py" if "py" in first_line else (".js" if "js" in first_line or "ts" in first_line else ".txt")
+                    fn = f"generated_code_{int(time.time()*1000)}{ext}"
+
+                if code_body.strip():
+                    self.tool_manager.bot_workspace_write(bot_id=model_id, filepath=fn, content=code_body)
 
         msg = self.add_chat_message(
             sender=model_cfg["name"],
@@ -954,17 +990,22 @@ class Orchestrator:
     def manage_vram_allocation(self, active_speaker_id: str):
         """
         Dynamic Resource Management:
-        Ensures Moderator/Architect AND capability-critical Refiner are prioritized in VRAM.
-        If VRAM headroom is tight, offloads/unloads non-priority inactive models.
+        Ensures active speaker, upcoming roster models, and Moderator are prioritized in VRAM based on who is expected to be needed next.
+        Offloads remaining models to RAM if VRAM headroom is tight.
         """
         hw = self.model_manager.get_hardware_info()
+        has_gpu = bool(hw.get("gpu_name") or hw.get("vram_total_gb", 0) > 0)
+        if not has_gpu:
+            return
+
         mod_id = self.moderator_model_id or "model_architect"
 
-        # Identify Refiner / capability-critical models
-        refiner_ids = [m_id for m_id, m in self.models.items() if m.get("role", "").lower() in ["refiner", "critic", "coder"]]
-        priority_ids = set([mod_id] + refiner_ids + [active_speaker_id])
+        # Priority 1: Active speaker & Moderator
+        # Priority 2: Upcoming speakers in turn roster
+        upcoming_roster = self.turn_schedule[:3] if self.turn_schedule else []
+        priority_ids = set([active_speaker_id, mod_id] + upcoming_roster)
 
-        # Preload priority models into VRAM if room exists
+        # Preload priority GGUF models into VRAM if room exists
         for pid in priority_ids:
             if pid in self.models and self.models[pid].get("provider") == "gguf_local":
                 pcfg = self.models[pid]
@@ -981,7 +1022,7 @@ class Orchestrator:
                     except Exception as e:
                         logger.warning("Priority VRAM preload for %s skipped: %s", pid, e)
 
-        # If VRAM headroom is tight (< 1.5 GB), unload non-priority inactive models
+        # If VRAM headroom is tight (< 1.5 GB), offload non-priority inactive models to RAM
         if hw.get("vram_free_gb", 0) < 1.5:
             for m_id, m_cfg in list(self.models.items()):
                 if m_cfg.get("provider") == "gguf_local" and m_id not in priority_ids:

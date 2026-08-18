@@ -5,13 +5,14 @@
   "shared_entries": [],
   "model_journals": {},
   "model_spec_files": {},
+  "model_notes": {},
   "episodes": [],
   "task_itinerary": [],
   "file_audit_log": [],
   "active_file_locks": {},
   "tokens_used": {
-    "model_coder": 3,
-    "model_architect": 3
+    "model_coder": 30,
+    "model_architect": 30
   },
   "session_id": "default_session"
 }
