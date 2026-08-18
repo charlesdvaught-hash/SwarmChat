@@ -19,12 +19,19 @@ class ModelManager:
         self.model_statuses: Dict[str, Dict[str, Any]] = {}
         self.gguf_instances: Dict[str, Any] = {}
         self.custom_search_paths: List[str] = []
+        self._cached_search_paths: Optional[List[str]] = None
 
     def add_search_path(self, path: str):
-        if path and path not in self.custom_search_paths:
-            self.custom_search_paths.append(os.path.abspath(path))
+        if path:
+            abs_p = os.path.abspath(path)
+            if abs_p not in self.custom_search_paths:
+                self.custom_search_paths.append(abs_p)
+                self._cached_search_paths = None
 
     def get_search_paths(self) -> List[str]:
+        if self._cached_search_paths is not None:
+            return self._cached_search_paths
+
         paths = [
             os.path.abspath("."),
             os.path.abspath("models"),
@@ -40,7 +47,8 @@ class ModelManager:
         for cp in self.custom_search_paths:
             if cp not in paths:
                 paths.append(cp)
-        return [p for p in paths if os.path.exists(p)]
+        self._cached_search_paths = [p for p in paths if os.path.exists(p)]
+        return self._cached_search_paths
 
     def resolve_gguf_path(self, raw_path: Optional[str]) -> Optional[str]:
         if not raw_path or not raw_path.strip():
@@ -55,30 +63,38 @@ class ModelManager:
         basename = os.path.basename(raw_path)
         search_dirs = self.get_search_paths()
 
-        # 2. Search in search_dirs for direct join or basename join
-        for sdir in search_dirs:
-            candidate1 = os.path.join(sdir, raw_path)
-            if os.path.exists(candidate1) and os.path.isfile(candidate1):
-                return os.path.abspath(candidate1)
+        # Helper for candidate evaluation
+        def _check_candidates() -> Optional[str]:
+            for sdir in search_dirs:
+                c1 = os.path.join(sdir, raw_path)
+                if os.path.exists(c1) and os.path.isfile(c1):
+                    return os.path.abspath(c1)
 
-            candidate2 = os.path.join(sdir, basename)
-            if os.path.exists(candidate2) and os.path.isfile(candidate2):
-                return os.path.abspath(candidate2)
+                c2 = os.path.join(sdir, basename)
+                if os.path.exists(c2) and os.path.isfile(c2):
+                    return os.path.abspath(c2)
+            return None
 
-        # 3. Case-insensitive basename search in search_dirs
-        for sdir in search_dirs:
-            try:
-                entries = os.listdir(sdir)
-            except OSError as e:
-                logger.warning("Skipping unreadable model search directory %s: %s", sdir, e)
-                continue
-            for entry in entries:
-                if entry.lower() == basename.lower():
-                    full = os.path.join(sdir, entry)
-                    if os.path.isfile(full):
-                        return os.path.abspath(full)
+        found = _check_candidates()
+        if found:
+            return found
 
-        return None
+        # Helper for case-insensitive search
+        def _case_insensitive_search() -> Optional[str]:
+            for sdir in search_dirs:
+                try:
+                    entries = os.listdir(sdir)
+                except OSError as e:
+                    logger.warning("Skipping unreadable model search directory %s: %s", sdir, e)
+                    continue
+                for entry in entries:
+                    if entry.lower() == basename.lower():
+                        full = os.path.join(sdir, entry)
+                        if os.path.isfile(full):
+                            return os.path.abspath(full)
+            return None
+
+        return _case_insensitive_search()
 
     def is_llama_cpp_installed(self) -> bool:
         try:
@@ -87,6 +103,10 @@ class ModelManager:
         except ImportError:
             return False
 
+    def _run_install_cmd(self, cmd: List[str], env: Dict[str, str], timeout: int = 180) -> subprocess.CompletedProcess:
+        """Executes a subprocess pip command for engine installation."""
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
+
     def install_llama_cpp(self, use_cuda_wheels: bool = True) -> Dict[str, Any]:
         """Attempts 1-click installation of llama-cpp-python, preferring official pre-built CUDA wheels if GPU is present."""
         hw = self.get_hardware_info()
@@ -94,7 +114,6 @@ class ModelManager:
 
         # If NVIDIA GPU is detected and pre-built CUDA wheel installation requested
         if hw.get("gpu_name") and use_cuda_wheels:
-            # Install pre-compiled wheel index for CUDA support
             cmd = [
                 sys.executable, "-m", "pip", "install", "llama-cpp-python",
                 "--extra-index-url", "https://abetlen.github.io/llama-cpp-python/wheels/cu121",
@@ -106,25 +125,26 @@ class ModelManager:
                 env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
 
         try:
-            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=180)
+            res = self._run_install_cmd(cmd, env)
             if res.returncode == 0:
-                return {"success": True, "message": "Successfully installed llama-cpp-python engine (CUDA wheel / build)." }
-            else:
-                # Fallback to standard pip install if wheel url failed
-                fallback_cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python"]
-                res2 = subprocess.run(fallback_cmd, env=env, capture_output=True, text=True, timeout=180)
-                if res2.returncode == 0:
-                    return {"success": True, "message": "Successfully installed standard llama-cpp-python engine."}
-                logger.error(
-                    "llama-cpp-python installation failed (primary and fallback attempts). primary=%s fallback=%s",
-                    res.stderr or res.stdout,
-                    res2.stderr or res2.stdout,
-                )
-                return {
-                    "success": False,
-                    "error": f"Installation failed: {res2.stderr or res2.stdout}",
-                    "primary_attempt_error": res.stderr or res.stdout,
-                }
+                return {"success": True, "message": "Successfully installed llama-cpp-python engine (CUDA wheel / build)."}
+
+            # Fallback to standard pip install if wheel url failed
+            fallback_cmd = [sys.executable, "-m", "pip", "install", "llama-cpp-python"]
+            res2 = self._run_install_cmd(fallback_cmd, env)
+            if res2.returncode == 0:
+                return {"success": True, "message": "Successfully installed standard llama-cpp-python engine."}
+
+            logger.error(
+                "llama-cpp-python installation failed (primary and fallback attempts). primary=%s fallback=%s",
+                res.stderr or res.stdout,
+                res2.stderr or res2.stdout,
+            )
+            return {
+                "success": False,
+                "error": f"Installation failed: {res2.stderr or res2.stdout}",
+                "primary_attempt_error": res.stderr or res.stdout,
+            }
         except subprocess.TimeoutExpired as e:
             logger.exception("llama-cpp-python installation timed out")
             return {"success": False, "error": f"Engine installation timed out after {e.timeout}s.", "timed_out": True}

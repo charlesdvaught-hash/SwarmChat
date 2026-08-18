@@ -1,7 +1,6 @@
 import logging
 import os
 import time
-import random
 import asyncio
 from typing import Callable, Dict, Any, List, Optional
 from backend.errors import DirectiveParseError, ModelInvocationError, SwarmChatError
@@ -11,6 +10,43 @@ from backend.memory import MemoryManager
 from backend.tools import ToolManager
 
 logger = logging.getLogger(__name__)
+
+
+def create_model_config(
+    model_id: str,
+    name: str,
+    role: str,
+    model_name: str,
+    provider: str = "ollama",
+    enabled: bool = True,
+    is_moderator: bool = False,
+    status: str = "active",
+    max_context_tokens: int = 4096,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 40,
+    repeat_penalty: float = 1.1,
+    **extra
+) -> Dict[str, Any]:
+    """Factory helper to create a model configuration dictionary with canonical defaults."""
+    cfg = {
+        "id": model_id,
+        "name": name,
+        "role": role,
+        "provider": provider,
+        "model_name": model_name,
+        "enabled": enabled,
+        "is_moderator": is_moderator,
+        "status": status,
+        "max_context_tokens": max_context_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "repeat_penalty": repeat_penalty,
+    }
+    cfg.update(extra)
+    return cfg
+
 
 class Orchestrator:
     def __init__(self, model_manager: ModelManager, memory_manager: MemoryManager, tool_manager: ToolManager):
@@ -29,66 +65,10 @@ class Orchestrator:
 
         # Known models library with specialized default model recommendations per role
         self.known_models: Dict[str, Dict[str, Any]] = {
-            "model_architect": {
-                "id": "model_architect",
-                "name": "Architect",
-                "role": "Architect",
-                "provider": "ollama",
-                "model_name": "llama3.2:1b",
-                "enabled": True,
-                "is_moderator": True,
-                "status": "active",
-                "max_context_tokens": 4096,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "top_k": 40,
-                "repeat_penalty": 1.1
-            },
-            "model_critic": {
-                "id": "model_critic",
-                "name": "Critic",
-                "role": "Critic",
-                "provider": "ollama",
-                "model_name": "qwen2.5-coder:3b",
-                "enabled": True,
-                "is_moderator": False,
-                "status": "active",
-                "max_context_tokens": 4096,
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "top_k": 40,
-                "repeat_penalty": 1.1
-            },
-            "model_coder": {
-                "id": "model_coder",
-                "name": "Coder",
-                "role": "Coder",
-                "provider": "ollama",
-                "model_name": "qwen2.5-coder:1.5b",
-                "enabled": True,
-                "is_moderator": False,
-                "status": "active",
-                "max_context_tokens": 4096,
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "top_k": 40,
-                "repeat_penalty": 1.02
-            },
-            "model_refiner": {
-                "id": "model_refiner",
-                "name": "Refiner",
-                "role": "Refiner",
-                "provider": "ollama",
-                "model_name": "qwen2.5-coder:3b",
-                "enabled": True,
-                "is_moderator": False,
-                "status": "active",
-                "max_context_tokens": 4096,
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "top_k": 40,
-                "repeat_penalty": 1.05
-            }
+            "model_architect": create_model_config("model_architect", "Architect", "Architect", "llama3.2:1b", is_moderator=True, temperature=0.7, repeat_penalty=1.1),
+            "model_critic": create_model_config("model_critic", "Critic", "Critic", "qwen2.5-coder:3b", is_moderator=False, temperature=0.7, repeat_penalty=1.1),
+            "model_coder": create_model_config("model_coder", "Coder", "Coder", "qwen2.5-coder:1.5b", is_moderator=False, temperature=0.1, repeat_penalty=1.02),
+            "model_refiner": create_model_config("model_refiner", "Refiner", "Refiner", "qwen2.5-coder:3b", is_moderator=False, temperature=0.1, repeat_penalty=1.05),
         }
 
         # Active chatroom models (subset of known models currently in the room)
@@ -105,6 +85,26 @@ class Orchestrator:
         self.spoken_models: set = set()  # Tracks models that have spoken at least once
 
     VALID_TURN_MODES = ("admin_controlled", "moderator_controlled", "round_robin")
+
+    def get_active_models(self) -> List[Dict[str, Any]]:
+        """Returns list of model configuration dicts for active/enabled models in the chat room."""
+        return [m for m in self.models.values() if m.get("enabled", True)]
+
+    def get_active_model_ids(self) -> List[str]:
+        """Returns list of IDs for active/enabled models in the chat room."""
+        return [m_id for m_id, m in self.models.items() if m.get("enabled", True)]
+
+    def _get_model_meta(self, model_id: str) -> Dict[str, Any]:
+        """Returns normalized model metadata safely."""
+        m_cfg = self.models.get(model_id, {})
+        return {
+            "id": model_id,
+            "name": m_cfg.get("name", "Unknown"),
+            "role": m_cfg.get("role", "Participant"),
+            "is_moderator": m_cfg.get("is_moderator", False),
+            "enabled": m_cfg.get("enabled", True),
+            "live_status": m_cfg.get("live_status", "Unknown")
+        }
 
     def set_turn_mode(self, mode: str):
         if mode not in self.VALID_TURN_MODES:
@@ -216,7 +216,7 @@ class Orchestrator:
 
     def generate_turn_schedule(self, length: int = 8) -> List[str]:
         """Generates a 5-10 turn scheduled roster based on available user roles, prioritizing Architect first."""
-        active_models = [m_id for m_id, m in self.models.items() if m.get("enabled", True)]
+        active_models = self.get_active_model_ids()
         if not active_models:
             return []
 
@@ -244,7 +244,7 @@ class Orchestrator:
         return self.turn_schedule
 
     def get_next_speaker(self, last_speaker_id: Optional[str] = None) -> Optional[str]:
-        active_models = [m_id for m_id, m in self.models.items() if m.get("enabled", True)]
+        active_models = self.get_active_model_ids()
         if not active_models:
             return None
 
@@ -306,6 +306,44 @@ class Orchestrator:
         from difflib import SequenceMatcher
         return SequenceMatcher(None, str1, str2).ratio()
 
+    def _build_system_prompt(self, model_id: str, model_cfg: Dict[str, Any], current_phase: str, active_task: Optional[Dict[str, Any]], is_first_turn: bool) -> str:
+        if not is_first_turn:
+            return f"You are {model_cfg['name']} ({model_cfg['role']}). Continue contributing concisely to the task: {active_task['title'] if active_task else 'General Discussion'}."
+        return get_system_prompt(
+            role=model_cfg["role"],
+            name=model_cfg["name"],
+            phase=current_phase,
+            project_info=self.memory_manager.get_project_id(),
+            current_task=active_task["title"] if active_task else "General Discussion / Alignment",
+            is_moderator=model_cfg.get("is_moderator", False),
+            custom_template=model_cfg.get("custom_start_prompt") if current_phase == "discussion" else model_cfg.get("custom_execution_prompt"),
+            model_id=model_id
+        )
+
+    def _build_episode_context(self) -> str:
+        episodes = self.memory_manager.get_latest_episodes(limit=3)
+        if not episodes:
+            return ""
+        ep_lines = [f"- [{e['author']}] Task ({e['action']}): {e['summary']}" for e in episodes]
+        return "\n\n### RECENT EPISODE CHECKPOINTS (HANDOFFS):\n" + "\n".join(ep_lines)
+
+    def _build_task_context(self, active_task: Optional[Dict[str, Any]]) -> str:
+        if not active_task:
+            return ""
+        return f"\n\n### 🎯 ACTIVE ITINERARY ITEM / MEETING AGENDA:\nTitle: {active_task['title']}\nDescription: {active_task['description']}\nPriority: {active_task['priority'].upper()}\nStatus: {active_task['status'].upper()}"
+
+    def _build_journal_context(self, latest_journal: Optional[str]) -> str:
+        if not latest_journal:
+            return ""
+        truncated = latest_journal[:300] + "... [truncated]" if len(latest_journal) > 300 else latest_journal
+        return f"\n\n### YOUR LATEST TIMESTAMPED SELF-JOURNAL (PRE-NAP PERSPECTIVE):\n{truncated}"
+
+    def _build_spec_context(self, model_id: str) -> str:
+        own_spec = self.memory_manager.get_spec_file(model_id)
+        if own_spec and len(own_spec) > 500:
+            own_spec = own_spec[:500] + "... [truncated]"
+        return f"\n\n### YOUR PERSONAL SPEC NOTEBOOK:\n{own_spec if own_spec else '(Empty)'}"
+
     async def step_model_turn(self, model_id: str) -> Dict[str, Any]:
         model_cfg = self.models.get(model_id)
         if not model_cfg:
@@ -327,48 +365,15 @@ class Orchestrator:
         memory_summary = self.memory_manager.get_memory_summary()
         latest_journal = self.memory_manager.get_model_latest_journal(model_id)
 
-        # Retrieve recent episodes for NAC-style thread weaving
-        episodes = self.memory_manager.get_latest_episodes(limit=3)
-        ep_summary = ""
-        if episodes:
-            ep_lines = [f"- [{e['author']}] Task ({e['action']}): {e['summary']}" for e in episodes]
-            ep_summary = f"\n\n### RECENT EPISODE CHECKPOINTS (HANDOFFS):\n" + "\n".join(ep_lines)
-
-        # Retrieve Active Task / Itinerary Item for Meetings
         active_task = self.memory_manager.get_active_task()
-
         is_first_turn = model_id not in self.spoken_models
         self.spoken_models.add(model_id)
 
-        sys_prompt = get_system_prompt(
-            role=model_cfg["role"],
-            name=model_cfg["name"],
-            phase=current_phase,
-            project_info=self.memory_manager.get_project_id(),
-            current_task=active_task["title"] if active_task else "General Discussion / Alignment",
-            is_moderator=model_cfg.get("is_moderator", False),
-            custom_template=model_cfg.get("custom_start_prompt") if current_phase == "discussion" else model_cfg.get("custom_execution_prompt"),
-            model_id=model_id
-        )
-
-        if not is_first_turn:
-            # Subsequent turn reprompting: Keep context window fresh by providing concise instructions
-            sys_prompt = f"You are {model_cfg['name']} ({model_cfg['role']}). Continue contributing concisely to the task: {active_task['title'] if active_task else 'General Discussion'}."
-
-        task_context = ""
-        if active_task:
-            task_context = f"\n\n### 🎯 ACTIVE ITINERARY ITEM / MEETING AGENDA:\nTitle: {active_task['title']}\nDescription: {active_task['description']}\nPriority: {active_task['priority'].upper()}\nStatus: {active_task['status'].upper()}"
-
-        # Hard character / token caps for spec notebook and journals to prevent prefix bloat
-        journal_context = ""
-        if latest_journal:
-            truncated_journal = latest_journal[:300] + "... [truncated]" if len(latest_journal) > 300 else latest_journal
-            journal_context = f"\n\n### YOUR LATEST TIMESTAMPED SELF-JOURNAL (PRE-NAP PERSPECTIVE):\n{truncated_journal}"
-
-        own_spec = self.memory_manager.get_spec_file(model_id)
-        if own_spec and len(own_spec) > 500:
-            own_spec = own_spec[:500] + "... [truncated]"
-        spec_context = f"\n\n### YOUR PERSONAL SPEC NOTEBOOK:\n{own_spec if own_spec else '(Empty)'}"
+        sys_prompt = self._build_system_prompt(model_id, model_cfg, current_phase, active_task, is_first_turn)
+        ep_summary = self._build_episode_context()
+        task_context = self._build_task_context(active_task)
+        journal_context = self._build_journal_context(latest_journal)
+        spec_context = self._build_spec_context(model_id)
 
         # Prefix Cache Optimization: Put stable content FIRST (system prompt, task details, personal spec)
         # and volatile context LAST (shared memory summary, episodes, journal)
@@ -1182,6 +1187,10 @@ class Orchestrator:
             elif tool_name == "git_diff":
                 self.set_model_live_status(caller_id, "Reviewing git diff")
                 return self.tool_manager.git_diff()
+            elif tool_name == "condense_workspace_code":
+                target_fn = args.get("target_filename", "main.py")
+                self.set_model_live_status(caller_id, f"Condensing generated workspace code into {target_fn}")
+                return self.tool_manager.condense_workspace_code(bot_id=caller_id, target_filename=target_fn)
             return {"success": False, "error": f"Unknown tool: {tool_name}"}
         except Exception as e:
             logger.exception("Tool '%s' raised while running for %s", tool_name, caller_id)

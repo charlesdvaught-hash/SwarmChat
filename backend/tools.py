@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import json
 import shutil
 import subprocess
@@ -46,7 +47,7 @@ class ToolManager:
             return False
 
     def classify_tool_risk(self, tool_name: str) -> str:
-        low_risk = ["read_file", "list_files", "search_workspace", "internet_search", "search_huggingface", "git_status", "git_diff", "git_log", "run_python", "run_tests"]
+        low_risk = ["read_file", "list_files", "search_workspace", "internet_search", "search_huggingface", "git_status", "git_diff", "git_log", "run_python", "run_tests", "condense_workspace_code"]
         consequential = ["write_file", "patch_file", "copy_file", "git_branch", "git_commit", "git_rollback", "bot_workspace_write", "bot_workspace_merge"]
         high_risk = ["run_terminal_cmd"]
 
@@ -377,6 +378,41 @@ class ToolManager:
             except OSError as e:
                 return {"valid": False, "error": f"Could not read '{full_path}': {e}"}
         return {"valid": True}
+
+    def condense_workspace_code(self, bot_id: str, target_filename: str = "main.py") -> Dict[str, Any]:
+        """Condenses all generated code snippets in bot workspace sandbox into a single unified file."""
+        bot_dir = self.get_bot_workspace_dir(bot_id)
+        if not os.path.exists(bot_dir):
+            return {"success": False, "error": f"Workspace sandbox for bot '{bot_id}' does not exist."}
+
+        code_blocks = []
+        for file_entry in sorted(os.listdir(bot_dir)):
+            if file_entry == target_filename or file_entry.startswith("."):
+                continue
+            full_p = os.path.join(bot_dir, file_entry)
+            if os.path.isfile(full_p) and (file_entry.endswith(".py") or file_entry.endswith(".js") or file_entry.endswith(".ts") or file_entry.endswith(".txt")):
+                try:
+                    with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                        c = f.read().strip()
+                        if c:
+                            code_blocks.append(f"# --- Source Snippet: {file_entry} ---\n{c}")
+                except OSError as e:
+                    logger.warning("Could not read snippet %s during condensing: %s", full_p, e)
+
+        if not code_blocks:
+            return {"success": False, "error": f"No code snippets found to condense in workspace '{bot_id}'."}
+
+        condensed_content = "\n\n".join(code_blocks) + "\n"
+        w_res = self.bot_workspace_write(bot_id=bot_id, filepath=target_filename, content=condensed_content)
+        if w_res.get("success"):
+            return {
+                "success": True,
+                "bot_id": bot_id,
+                "target_filename": target_filename,
+                "snippets_condensed_count": len(code_blocks),
+                "bytes_written": len(condensed_content)
+            }
+        return w_res
 
     def bot_workspace_write(self, bot_id: str, filepath: str, content: str) -> Dict[str, Any]:
         """Writes file to the bot's isolated workspace sandbox."""
