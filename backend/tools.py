@@ -46,7 +46,7 @@ class ToolManager:
             return False
 
     def classify_tool_risk(self, tool_name: str) -> str:
-        low_risk = ["read_file", "list_files", "search_workspace", "internet_search", "search_huggingface", "git_status", "git_diff", "git_log"]
+        low_risk = ["read_file", "list_files", "search_workspace", "internet_search", "search_huggingface", "git_status", "git_diff", "git_log", "run_python", "run_tests"]
         consequential = ["write_file", "patch_file", "copy_file", "git_branch", "git_commit", "git_rollback", "bot_workspace_write", "bot_workspace_merge"]
         high_risk = ["run_terminal_cmd"]
 
@@ -57,6 +57,78 @@ class ToolManager:
         elif tool_name in high_risk:
             return "high"
         return "consequential"
+
+    def run_python(self, filepath: str, bot_id: str, timeout: int = 10) -> Dict[str, Any]:
+        """Runs a python file inside the bot's workspace sandbox without shell=True."""
+        bot_dir = self.get_bot_workspace_dir(bot_id)
+        full_path = os.path.abspath(os.path.join(bot_dir, filepath))
+        if not os.path.exists(full_path):
+            full_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
+
+        if not os.path.exists(full_path):
+            return {"success": False, "error": f"File '{filepath}' not found."}
+
+        try:
+            res = subprocess.run(
+                [sys.executable, full_path],
+                cwd=bot_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return {
+                "success": res.returncode == 0,
+                "returncode": res.returncode,
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+                "filepath": filepath,
+                "bot_id": bot_id,
+                "error": None if res.returncode == 0 else f"Process exited with return code {res.returncode}"
+            }
+        except subprocess.TimeoutExpired as e:
+            return {
+                "success": False,
+                "timed_out": True,
+                "error": f"Execution timed out after {timeout}s",
+                "stdout": e.stdout if isinstance(e.stdout, str) else "",
+                "stderr": e.stderr if isinstance(e.stderr, str) else ""
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Execution failed: {e}"}
+
+    def run_tests(self, bot_id: str, test_path: Optional[str] = None, timeout: int = 15) -> Dict[str, Any]:
+        """Runs pytest on bot's workspace sandbox without shell=True."""
+        bot_dir = self.get_bot_workspace_dir(bot_id)
+        cmd = [sys.executable, "-m", "pytest"]
+        if test_path:
+            cmd.append(test_path)
+
+        try:
+            res = subprocess.run(
+                cmd,
+                cwd=bot_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+            return {
+                "success": res.returncode == 0,
+                "returncode": res.returncode,
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+                "bot_id": bot_id,
+                "error": None if res.returncode == 0 else f"Pytest exited with return code {res.returncode}"
+            }
+        except subprocess.TimeoutExpired as e:
+            return {
+                "success": False,
+                "timed_out": True,
+                "error": f"Pytest timed out after {timeout}s",
+                "stdout": e.stdout if isinstance(e.stdout, str) else "",
+                "stderr": e.stderr if isinstance(e.stderr, str) else ""
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Pytest execution failed: {e}"}
 
     def read_file(self, filepath: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
         root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
@@ -456,12 +528,31 @@ class ToolManager:
             logger.warning("Write of %s failed: %s", full_path, e)
             return {"success": False, "error": f"Write of '{filepath}' failed: {e}"}
 
-    def run_terminal_cmd(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+    def run_terminal_cmd(self, command: str, bot_id: Optional[str] = None, timeout: int = 30) -> Dict[str, Any]:
+        """Runs terminal command inside per-bot workspace CWD without shell=True, enforcing allowlist."""
+        cwd = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
+        import shlex
+        try:
+            cmd_args = shlex.split(command)
+        except Exception as e:
+            return {"success": False, "error": f"Failed to parse command: {e}"}
+
+        if not cmd_args:
+            return {"success": False, "error": "Empty command provided."}
+
+        binary = cmd_args[0].lower()
+        allowed_binaries = ["git", "python", "python3", "pytest", "pip", "node", "npm", "ls", "dir", "echo", "cat"]
+        if binary not in allowed_binaries:
+            return {
+                "success": False,
+                "error": f"Command binary '{binary}' is not in the allowed list ({', '.join(allowed_binaries)})."
+            }
+
         try:
             res = subprocess.run(
-                command,
-                shell=True,
-                cwd=self.workspace_root,
+                cmd_args,
+                shell=False,
+                cwd=cwd,
                 capture_output=True,
                 text=True,
                 timeout=timeout

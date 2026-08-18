@@ -306,29 +306,80 @@ class ModelManager:
             logger.warning("Unexpected Ollama tag listing payload: %s", e)
             return []
 
-    def can_load_model(self, estimated_size_gb: float) -> Dict[str, Any]:
+    def can_load_model(self, estimated_size_gb: float, n_ctx: int = 4096, quant_type: Optional[str] = None) -> Dict[str, Any]:
         hw = self.get_hardware_info()
         avail_ram = hw["ram_available_gb"]
         avail_vram = hw["vram_free_gb"]
         headroom_gb = 1.5
         effective_avail = max(avail_ram - headroom_gb, 0.0) + avail_vram
 
-        if estimated_size_gb > effective_avail:
+        # Account for KV cache + compute buffer overhead (n_ctx * n_layer * n_kv_heads * head_dim * 2 * 2 bytes)
+        # Approximate average LLM layer config: ~32 layers, ~8 KV heads, ~128 head dim for 1-3B models (~0.2 - 0.5 GB at 4k ctx)
+        kv_cache_bytes = n_ctx * 32 * 8 * 128 * 2 * 2
+        compute_buffer_bytes = 256 * 1024 * 1024  # ~256MB compute overhead
+        overhead_gb = round((kv_cache_bytes + compute_buffer_bytes) / (1024 ** 3), 2)
+        total_needed_gb = estimated_size_gb + overhead_gb
+
+        quant_warning = ""
+        # Surface quantization warning for small models (<=3B / ~3.5GB file) at <=Q4
+        if estimated_size_gb <= 3.5 and quant_type:
+            q_lower = quant_type.lower()
+            if any(q in q_lower for q in ["q2", "q3", "q4", "q4_k_m", "q4_k_s", "q4_0", "q4_1"]):
+                quant_warning = (
+                    f" ⚠️ Quantization Warning: Model is ≤3B and loaded at {quant_type.upper()}. "
+                    "Small models suffer severe instruction-following accuracy drops at Q4 or lower. "
+                    "Q5_K_M minimum or Q6_K/Q8_0 is recommended for models ≤5B."
+                )
+
+        if total_needed_gb > effective_avail:
             return {
                 "allowed": False,
                 "warning": True,
-                "message": f"Estimated model size ({estimated_size_gb:.1f} GB) exceeds safe available memory ({effective_avail:.1f} GB with headroom)."
+                "quant_warning": quant_warning,
+                "message": f"Total memory needed ({total_needed_gb:.2f} GB = {estimated_size_gb:.1f} GB model + {overhead_gb:.2f} GB KV/compute) exceeds safe available memory ({effective_avail:.1f} GB with headroom).{quant_warning}"
             }
-        elif estimated_size_gb > (effective_avail * 0.8):
+        elif total_needed_gb > (effective_avail * 0.8):
             return {
                 "allowed": True,
                 "warning": True,
-                "message": f"High memory utilization warning: Loading model ({estimated_size_gb:.1f} GB) leaves tight RAM/VRAM margin."
+                "quant_warning": quant_warning,
+                "message": f"High memory utilization warning: Loading model ({total_needed_gb:.2f} GB total) leaves tight RAM/VRAM margin.{quant_warning}"
             }
         return {
             "allowed": True,
-            "warning": False,
-            "message": "Sufficient memory headroom available."
+            "warning": bool(quant_warning),
+            "quant_warning": quant_warning,
+            "message": f"Sufficient memory headroom available ({total_needed_gb:.2f} GB needed).{quant_warning}"
+        }
+
+    @staticmethod
+    def get_action_json_schema() -> Dict[str, Any]:
+        """Returns the JSON schema definition for SwarmChat action emissions."""
+        return {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+                "actions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": ["log_memory", "update_task", "update_spec", "journal", "ready_for_execution", "request_discussion", "search_hf", "run_tests", "run_python", "vote_tool"]
+                            },
+                            "payload": {"type": "string"},
+                            "task_id": {"type": "string"},
+                            "status": {"type": "string"},
+                            "title": {"type": "string"},
+                            "tool_name": {"type": "string"},
+                            "args": {"type": "object"}
+                        },
+                        "required": ["type"]
+                    }
+                }
+            },
+            "required": ["message", "actions"]
         }
 
     async def generate_response(
@@ -336,17 +387,37 @@ class ModelManager:
         model_config: Dict[str, Any],
         system_prompt: str,
         messages: List[Dict[str, str]],
-        temperature: Optional[float] = None
+        temperature: Optional[float] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
+        use_gbnf: bool = False
     ) -> str:
         provider = model_config.get("provider", "ollama")
         model_name = model_config.get("model_name", "llama3.2:1b")
         api_key = model_config.get("api_key", "")
 
-        # Extract sampling parameters with fallbacks
-        temp = temperature if temperature is not None else float(model_config.get("temperature", 0.7))
+        # Role-based sampling parameter defaults
+        role = model_config.get("role", "Participant")
+        role_lower = role.lower()
+
+        # Temperature by role: Tool/tag emission & refiner run at 0.0-0.2; ideation/brainstorming at 0.6-0.8
+        if temperature is not None:
+            temp = float(temperature)
+        elif any(r in role_lower for r in ["coder", "tester", "debugger", "refiner"]):
+            temp = 0.1
+        elif any(r in role_lower for r in ["architect", "critic"]):
+            temp = 0.7
+        else:
+            temp = float(model_config.get("temperature", 0.2 if "temperature" not in model_config else model_config["temperature"]))
+
         top_p = float(model_config.get("top_p", 0.9))
         top_k = int(model_config.get("top_k", 40))
-        repeat_penalty = float(model_config.get("repeat_penalty", 1.1))
+        min_p = float(model_config.get("min_p", 0.05))
+
+        # Repeat penalty: drop to 1.0-1.05 for Coder role specifically so legitimate repeated identifiers/indentation aren't penalized
+        if "repeat_penalty" in model_config:
+            repeat_penalty = float(model_config["repeat_penalty"])
+        else:
+            repeat_penalty = 1.02 if "coder" in role_lower else 1.1
 
         from backend.sanitizer import normalize_messages_for_gguf, sanitize_message_content
         role = model_config.get("role", "Participant")
@@ -366,16 +437,21 @@ class ModelManager:
                         "temperature": temp,
                         "top_p": top_p,
                         "top_k": top_k,
+                        "min_p": min_p,
                         "repeat_penalty": repeat_penalty
                     }
+                    payload = {
+                        "model": model_name,
+                        "messages": full_messages,
+                        "stream": False,
+                        "options": options
+                    }
+                    if response_schema:
+                        payload["format"] = response_schema
+
                     resp = await client.post(
                         f"{self.ollama_host}/api/chat",
-                        json={
-                            "model": model_name,
-                            "messages": full_messages,
-                            "stream": False,
-                            "options": options
-                        }
+                        json=payload
                     )
             except httpx.HTTPError as e:
                 self._fail_generation(model_id, provider, f"Ollama request failed: {e}", cause=e)
@@ -394,39 +470,132 @@ class ModelManager:
             return sanitize_message_content(raw_res)
 
         elif provider in ["claude", "groq", "gemini"]:
-            if not api_key:
+            env_key_map = {
+                "claude": "ANTHROPIC_API_KEY",
+                "groq": "GROQ_API_KEY",
+                "gemini": "GEMINI_API_KEY"
+            }
+            effective_key = api_key or os.environ.get(env_key_map.get(provider, ""), "")
+            if not effective_key:
                 self._fail_generation(
                     model_id, provider,
-                    f"API key missing for provider '{provider}'. Configure the key in model settings.",
+                    f"API key missing for cloud provider '{provider}'. Configure key in model settings or set {env_key_map.get(provider)}.",
                     error_cls=ProviderNotConfiguredError
                 )
-            # Cloud providers are declared in the UI but no client is implemented yet; returning
-            # placeholder prose here would be indistinguishable from a genuine model answer.
-            self._fail_generation(
-                model_id, provider,
-                f"Provider '{provider}' is not implemented yet; no cloud client is wired up.",
-                error_cls=ProviderNotConfiguredError
-            )
+
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    if provider == "groq":
+                        # Groq API (OpenAI-compatible)
+                        resp = await client.post(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {effective_key}", "Content-Type": "application/json"},
+                            json={
+                                "model": model_name or "llama-3.3-70b-versatile",
+                                "messages": full_messages,
+                                "temperature": temp,
+                                "top_p": top_p
+                            }
+                        )
+                        if resp.status_code != 200:
+                            self._fail_generation(model_id, provider, f"Groq API error {resp.status_code}: {resp.text[:300]}")
+                        raw_res = resp.json()["choices"][0]["message"]["content"]
+
+                    elif provider == "claude":
+                        # Anthropic Claude API
+                        # Format system message separately for Claude
+                        user_assistant_msgs = [m for m in full_messages if m["role"] != "system"]
+                        resp = await client.post(
+                            "https://api.anthropic.com/v1/messages",
+                            headers={
+                                "x-api-key": effective_key,
+                                "anthropic-version": "2023-06-01",
+                                "content-type": "application/json"
+                            },
+                            json={
+                                "model": model_name or "claude-3-5-sonnet-20241022",
+                                "system": system_prompt,
+                                "messages": user_assistant_msgs,
+                                "max_tokens": 1024,
+                                "temperature": temp
+                            }
+                        )
+                        if resp.status_code != 200:
+                            self._fail_generation(model_id, provider, f"Claude API error {resp.status_code}: {resp.text[:300]}")
+                        raw_res = resp.json()["content"][0]["text"]
+
+                    elif provider == "gemini":
+                        # Google Gemini API
+                        contents = []
+                        for m in full_messages:
+                            role = "user" if m["role"] in ["user", "system"] else "model"
+                            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+
+                        gemini_model = model_name or "gemini-1.5-flash"
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={effective_key}"
+                        resp = await client.post(
+                            url,
+                            json={"contents": contents, "generationConfig": {"temperature": temp}}
+                        )
+                        if resp.status_code != 200:
+                            self._fail_generation(model_id, provider, f"Gemini API error {resp.status_code}: {resp.text[:300]}")
+                        raw_res = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+            except httpx.HTTPError as e:
+                self._fail_generation(model_id, provider, f"Cloud API request failed for '{provider}': {e}", cause=e)
+
+            self.update_model_status(model_id, status="online", error=None, location="Cloud")
+            return sanitize_message_content(raw_res)
 
         elif provider == "gguf_local":
             gguf_path = model_config.get("gguf_path") or model_config.get("model_name", "")
             mmproj_path = model_config.get("mmproj_path") or model_config.get("clip_model_path", "")
-            max_tokens = model_config.get("max_context_tokens", 2048)
+            n_ctx = model_config.get("max_context_tokens", 2048)
 
             # Raises ModelLoadError (a ModelInvocationError) if the model cannot be loaded.
-            llm = self.load_gguf_model(model_id, gguf_path, max_tokens, mmproj_path=mmproj_path)
+            llm = self.load_gguf_model(model_id, gguf_path, n_ctx, mmproj_path=mmproj_path)
 
             try:
+                # Token counting & derived max_tokens: n_ctx - prompt_tokens with a floor
+                prompt_tokens_est = 0
+                for m in full_messages:
+                    content_str = m.get("content", "")
+                    try:
+                        prompt_tokens_est += len(llm.tokenize(content_str.encode("utf-8")))
+                    except Exception:
+                        prompt_tokens_est += int(len(content_str.split()) * 1.3)
+
+                # Reserve max_tokens based on available context headroom, minimum 256, max 1024
+                gen_max_tokens = max(256, min(1024, n_ctx - prompt_tokens_est - 32))
+
                 start_time = time.time()
-                # Format prompt for llama_cpp chat completion
-                response = llm.create_chat_completion(
-                    messages=full_messages,
-                    temperature=temp,
-                    top_p=top_p,
-                    top_k=top_k,
-                    repeat_penalty=repeat_penalty,
-                    max_tokens=512
-                )
+                kwargs = {
+                    "messages": full_messages,
+                    "temperature": temp,
+                    "top_p": top_p,
+                    "top_k": top_k,
+                    "min_p": min_p,
+                    "repeat_penalty": repeat_penalty,
+                    "max_tokens": gen_max_tokens
+                }
+
+                if response_schema:
+                    try:
+                        from llama_cpp.llama_grammar import LlamaGrammar
+                        # Attempt to construct LlamaGrammar from schema if available
+                        grammar = LlamaGrammar.from_json_schema(json.dumps(response_schema))
+                        kwargs["grammar"] = grammar
+                    except Exception as ge:
+                        # Fallback to response_format dict if llama_cpp supports it natively
+                        kwargs["response_format"] = {"type": "json_object", "schema": response_schema}
+                        logger.debug("LlamaGrammar schema construction fallback for %s: %s", model_id, ge)
+
+                response = llm.create_chat_completion(**kwargs)
+                elapsed = time.time() - start_time
+
+                finish_reason = response["choices"][0].get("finish_reason", "")
+                if finish_reason == "length":
+                    logger.warning("Generation for %s reached max_tokens length limit (%d tokens)", model_id, gen_max_tokens)
                 elapsed = time.time() - start_time
                 content = response["choices"][0]["message"]["content"]
 
