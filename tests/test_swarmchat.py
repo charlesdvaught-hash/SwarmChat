@@ -33,7 +33,7 @@ def test_thinking_disabled_prompts():
     assert "Phase: Discussion" in prompt_disc
     
     prompt_mod = get_system_prompt("Architect", "Otis", "discussion", is_moderator=True)
-    assert "Moderator Directive" in prompt_mod
+    assert "MODERATOR / CHIEF PROJECT MANAGER DIRECTIVE" in prompt_mod
 
 def test_tool_risk_classification():
     tm = ToolManager()

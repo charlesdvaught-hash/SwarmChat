@@ -195,6 +195,6 @@ def get_system_prompt(
     )
 
     if is_moderator:
-        base_prompt += "\n\nModerator Directive: Coordinate turns, keep discussion focused, and assign unassigned itinerary tasks to idle bots."
+        base_prompt += "\n\nMODERATOR / CHIEF PROJECT MANAGER DIRECTIVE:\nYou serve as Chief Project Manager for this autonomous software engineering team. Your duties are to coordinate participant turns, maintain clear project focus, refine task itineraries, and assign unassigned work items to idle team members."
 
     return base_prompt

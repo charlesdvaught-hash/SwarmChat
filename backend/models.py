@@ -152,7 +152,7 @@ class ModelManager:
 
         import llama_cpp
         hw = self.get_hardware_info()
-        # Decide VRAM vs RAM allocation
+        # Assume VRAM preferred by default
         if force_device == "gpu":
             n_gpu_layers = -1
             location = "VRAM"
@@ -160,8 +160,13 @@ class ModelManager:
             n_gpu_layers = 0
             location = "RAM"
         else:
-            n_gpu_layers = -1 if hw["vram_free_gb"] > 1.0 else 0
-            location = "VRAM" if n_gpu_layers == -1 else "RAM"
+            # Prefer VRAM if free VRAM exists or if this model is moderator/preferred
+            if hw["vram_free_gb"] > 0.5 or hw["gpu_name"]:
+                n_gpu_layers = -1
+                location = "VRAM"
+            else:
+                n_gpu_layers = 0
+                location = "RAM"
 
         # Resolve mmproj (clip/vision projector) if provided
         chat_handler = None
@@ -216,10 +221,22 @@ class ModelManager:
         vram_total_gb = 0.0
         gpu_name = None
 
-        if shutil.which("nvidia-smi"):
+        nvidia_smi_cmd = shutil.which("nvidia-smi")
+        if not nvidia_smi_cmd and os.name == "nt":
+            # Check standard Windows nvidia-smi installation paths
+            candidate_paths = [
+                r"C:\Windows\System32\nvidia-smi.exe",
+                r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+            ]
+            for cp in candidate_paths:
+                if os.path.exists(cp):
+                    nvidia_smi_cmd = cp
+                    break
+
+        if nvidia_smi_cmd:
             try:
                 res = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=name,memory.total,memory.free", "--format=csv,nounits,noheader"],
+                    [nvidia_smi_cmd, "--query-gpu=name,memory.total,memory.free", "--format=csv,nounits,noheader"],
                     text=True
                 )
                 parts = res.strip().split("\n")[0].split(",")

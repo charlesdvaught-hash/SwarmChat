@@ -90,6 +90,9 @@ class ItineraryTaskUpdateReq(BaseModel):
     priority: Optional[str] = None
     assigned_model: Optional[str] = None
 
+class RosterUpdateReq(BaseModel):
+    schedule: List[str]
+
 @app.get("/api/prompts/templates")
 def get_prompt_templates():
     from backend.prompts import prompt_template_mgr
@@ -104,9 +107,12 @@ def update_prompt_templates(req: PromptTemplateUpdateReq):
     )
     return {"success": True, "templates": prompt_template_mgr.templates}
 
+last_loaded_model_dir: Optional[str] = None
+
 @app.get("/api/fs/browse")
 def browse_filesystem(path: Optional[str] = None):
-    target = path.strip() if path and path.strip() else os.path.expanduser("~")
+    global last_loaded_model_dir
+    target = path.strip() if path and path.strip() else (last_loaded_model_dir or os.path.expanduser("~"))
     if not os.path.exists(target):
         target = os.path.abspath(".")
 
@@ -131,20 +137,23 @@ def browse_filesystem(path: Optional[str] = None):
                 lower = entry.lower()
                 is_gguf = lower.endswith(".gguf") or lower.endswith(".bin")
                 is_mmproj = "mmproj" in lower or "clip" in lower
-                try:
-                    size_mb = round(os.path.getsize(full_p) / (1024 * 1024), 2)
-                except Exception:
-                    size_mb = 0.0
 
-                files.append({
-                    "name": entry,
-                    "path": full_p,
-                    "size_mb": size_mb,
-                    "is_gguf": is_gguf,
-                    "is_mmproj": is_mmproj
-                })
+                # In Server Filesystem Explorer, show ONLY model files (GGUF/bin/mmproj) and folders
+                if is_gguf or is_mmproj:
+                    try:
+                        size_mb = round(os.path.getsize(full_p) / (1024 * 1024), 2)
+                    except Exception:
+                        size_mb = 0.0
+
+                    files.append({
+                        "name": entry,
+                        "path": full_p,
+                        "size_mb": size_mb,
+                        "is_gguf": is_gguf,
+                        "is_mmproj": is_mmproj
+                    })
     except Exception as e:
-        return {"success": False, "error": str(e), "current_path": abs_target}
+        return {"success": False, "error": str(e), "current_path": abs_target, "last_loaded_dir": last_loaded_model_dir}
 
     directories.sort(key=lambda x: x["name"].lower())
     files.sort(key=lambda x: x["name"].lower())
@@ -154,7 +163,8 @@ def browse_filesystem(path: Optional[str] = None):
         "current_path": abs_target,
         "parent_path": parent_path,
         "directories": directories,
-        "files": files
+        "files": files,
+        "last_loaded_dir": last_loaded_model_dir
     }
 
 @app.post("/api/fs/validate")
@@ -227,6 +237,7 @@ def get_full_state():
         "model_statuses": model_mgr.model_statuses,
         "pending_votes": orchestrator.pending_tool_votes,
         "chat_history": orchestrator.chat_history,
+        "turn_schedule": orchestrator.turn_schedule,
         "shared_memory": memory_mgr.state.get("shared_entries", []),
         "model_journals": memory_mgr.state.get("model_journals", {}),
         "tokens_used": memory_mgr.state.get("tokens_used", {}),
@@ -237,6 +248,16 @@ def get_full_state():
         "file_audit_log": memory_mgr.get_file_audit_log(),
         "active_file_locks": memory_mgr.state.get("active_file_locks", {})
     }
+
+@app.post("/api/roster/update")
+def update_roster(req: RosterUpdateReq):
+    orchestrator.turn_schedule = req.schedule
+    return {"success": True, "turn_schedule": orchestrator.turn_schedule}
+
+@app.post("/api/roster/refresh")
+def refresh_roster():
+    sched = orchestrator.generate_turn_schedule()
+    return {"success": True, "turn_schedule": sched}
 
 @app.post("/api/itinerary/task")
 def add_itinerary_task(req: ItineraryTaskReq):
@@ -267,6 +288,11 @@ def get_workspace_file_audit(filepath: Optional[str] = None):
         "active_file_locks": memory_mgr.state.get("active_file_locks", {})
     }
 
+@app.post("/api/chat/stop")
+def trigger_emergency_stop():
+    res = orchestrator.emergency_stop()
+    return res
+
 @app.post("/api/phase")
 def set_phase(req: PhaseSwitchReq):
     new_p = memory_mgr.set_phase(req.phase)
@@ -294,9 +320,17 @@ async def step_turn(model_id: Optional[str] = None):
 
 @app.post("/api/models/configure")
 def configure_model(req: ModelConfigReq):
+    global last_loaded_model_dir
     m_dict = req.dict()
+
+    # Store persistent last loaded model directory
+    gguf_p = req.gguf_path or req.model_name
+    resolved = model_mgr.resolve_gguf_path(gguf_p)
+    if resolved and os.path.exists(resolved):
+        last_loaded_model_dir = os.path.dirname(resolved)
+
     orchestrator.add_or_update_known_model(m_dict)
-    return {"success": True, "models": orchestrator.models, "known_models": orchestrator.known_models}
+    return {"success": True, "models": orchestrator.models, "known_models": orchestrator.known_models, "last_loaded_dir": last_loaded_model_dir}
 
 @app.post("/api/models/kick")
 def kick_model(model_id: str):

@@ -81,18 +81,51 @@ class Orchestrator:
         self.turn_schedule: List[str] = []  # 5-10 turn scheduled roster queue
         self.autorun_enabled: bool = False
         self.last_speech_time: float = time.time()
+        self.spoken_models: set = set()  # Tracks models that have spoken at least once
 
     def set_turn_mode(self, mode: str):
         if mode in ["admin_controlled", "moderator_controlled", "round_robin"]:
             self.turn_mode = mode
 
     def set_moderator(self, model_id: str):
+        old_mod_id = self.moderator_model_id
         if model_id in self.models:
             for m_id, m_cfg in self.models.items():
-                m_cfg["is_moderator"] = (m_id == model_id)
+                was_mod = m_cfg.get("is_moderator", False)
+                should_be_mod = (m_id == model_id)
+                m_cfg["is_moderator"] = should_be_mod
+                if was_mod and not should_be_mod and m_id != model_id:
+                    # Notify demoted model
+                    self.add_chat_message(
+                        sender="System / Role Manager",
+                        role="System",
+                        content=f"📢 [SYSTEM NOTIFICATION TO @{m_cfg['name']}]: You have been demoted from Moderator / Chief Project Manager status. @{self.models[model_id]['name']} is now the Chief Project Manager.",
+                        is_admin=True
+                    )
             for m_id, m_cfg in self.known_models.items():
                 m_cfg["is_moderator"] = (m_id == model_id)
             self.moderator_model_id = model_id
+
+    def emergency_stop(self) -> Dict[str, Any]:
+        """Halts all active conversation loops, background tasks, and pending tool calls without deleting evidence or history."""
+        self.loop_active = False
+        self.turn_schedule = []
+        stopped_votes_count = len(self.pending_tool_votes)
+        for v in self.pending_tool_votes:
+            if v.get("status") == "pending":
+                v["status"] = "stopped"
+
+        self.add_chat_message(
+            sender="System / Emergency Stop",
+            role="System",
+            content="🛑 [EMERGENCY STOP TRIGGERED]: All active conversation loops, tool executions, and turn schedules have been forcefully halted. Historical logs and evidence remain preserved.",
+            is_admin=True
+        )
+        return {
+            "success": True,
+            "message": "Emergency stop executed successfully.",
+            "stopped_votes_count": stopped_votes_count
+        }
 
     def add_or_update_known_model(self, model_cfg: Dict[str, Any]):
         m_id = model_cfg["id"]
@@ -212,15 +245,24 @@ class Orchestrator:
         if self.turn_schedule:
             next_spk = self.turn_schedule.pop(0)
             if next_spk in active_models:
-                # Check if schedule queue is almost empty (1 left)
-                if len(self.turn_schedule) <= 1:
-                    self.add_chat_message(
-                        sender="System / Toast",
-                        role="System",
-                        content="[TOAST_NOTIFICATION] Approaches end of turn schedule! Moderator is planning the next turn sequence.",
-                        is_admin=True
-                    )
                 return next_spk
+
+        # If roster queue runs out, inform Moderator explicitly about loaded models vs available models
+        loaded_info = [f"@{m['name']} ({m['role']})" for m_id, m in self.models.items() if m.get("enabled", True)]
+        avail_info = [f"@{m['name']} ({m['role']})" for m_id, m in self.known_models.items() if m_id not in self.models]
+
+        mod_msg = (
+            f"⚠️ [ROSTER QUEUE EXHAUSTED]: The turn schedule queue has run out! "
+            f"Chief Project Manager (@{self.models.get(self.moderator_model_id, {}).get('name', 'Moderator')}), please refill the roster queue. "
+            f"\n- Currently Loaded Active Models: {', '.join(loaded_info) if loaded_info else 'None'}"
+            f"\n- Available Models in Library: {', '.join(avail_info) if avail_info else 'None'}"
+        )
+        self.add_chat_message(
+            sender="System / Roster Manager",
+            role="System",
+            content=mod_msg,
+            is_admin=True
+        )
 
         # Fallback to round-robin
         effective_last = last_speaker_id or self.last_speaker_id
@@ -250,6 +292,9 @@ class Orchestrator:
         # Retrieve Active Task / Itinerary Item for Meetings
         active_task = self.memory_manager.get_active_task()
 
+        is_first_turn = model_id not in self.spoken_models
+        self.spoken_models.add(model_id)
+
         sys_prompt = get_system_prompt(
             role=model_cfg["role"],
             name=model_cfg["name"],
@@ -260,6 +305,11 @@ class Orchestrator:
             custom_template=model_cfg.get("custom_start_prompt") if current_phase == "discussion" else model_cfg.get("custom_execution_prompt"),
             model_id=model_id
         )
+
+        if not is_first_turn:
+            # Subsequent turn reprompting: Keep context window fresh by providing concise instructions and only the last few messages
+            sys_prompt = f"You are {model_cfg['name']} ({model_cfg['role']}). Continue contributing concisely to the task: {active_task['title'] if active_task else 'General Discussion'}."
+
         task_context = ""
         if active_task:
             task_context = f"\n\n### 🎯 ACTIVE ITINERARY ITEM / MEETING AGENDA:\nTitle: {active_task['title']}\nDescription: {active_task['description']}\nPriority: {active_task['priority'].upper()}\nStatus: {active_task['status'].upper()}"
@@ -456,13 +506,33 @@ class Orchestrator:
             self.loop_active = False
 
     def manage_vram_allocation(self, active_speaker_id: str):
-        """Prioritizes VRAM for the Moderator model and active speaker, offloading other GGUF models to RAM if tight."""
+        """
+        Dynamic Moderator Resource Management:
+        Ensures Architect / Moderator loads in VRAM first.
+        If VRAM headroom is tight, unloads inactive models or offloads smaller models to CPU/RAM,
+        while ensuring models can be dropped and reloaded on demand.
+        """
         hw = self.model_manager.get_hardware_info()
-        if hw.get("vram_free_gb", 0) < 1.0:
-            # Unload any GGUF instances that are not the Moderator and not the active speaker
+        mod_id = self.moderator_model_id or "model_architect"
+
+        # Ensure Moderator/Architect is prioritized in VRAM
+        if mod_id in self.models and self.models[mod_id].get("provider") == "gguf_local":
+            mod_cfg = self.models[mod_id]
+            mod_path = mod_cfg.get("gguf_path") or mod_cfg.get("model_name", "")
+            if mod_path and mod_id not in self.model_manager.gguf_instances:
+                self.model_manager.load_gguf_model(
+                    mod_id,
+                    mod_path,
+                    max_tokens=mod_cfg.get("max_context_tokens", 2048),
+                    mmproj_path=mod_cfg.get("mmproj_path"),
+                    force_device="gpu"
+                )
+
+        # If VRAM headroom is tight (< 1.5 GB), offload non-active models to RAM or unload them
+        if hw.get("vram_free_gb", 0) < 1.5:
             for m_id, m_cfg in list(self.models.items()):
                 if m_cfg.get("provider") == "gguf_local":
-                    if m_id != self.moderator_model_id and m_id != active_speaker_id:
+                    if m_id != mod_id and m_id != active_speaker_id:
                         self.model_manager.unload_gguf_model(m_id)
                         self.model_manager.update_model_status(
                             m_id,
@@ -537,6 +607,19 @@ class Orchestrator:
                 query = args.get("query", "")
                 self.set_model_live_status(caller_id, f"Researching HuggingFace for '{query}'")
                 return await self.tool_manager.search_huggingface(query, limit=args.get("limit", 5))
+            elif tool_name == "copy_file":
+                src = args.get("src", "")
+                dest = args.get("dest", "")
+                self.set_model_live_status(caller_id, f"Cloning / copying {src} to {dest}")
+                res = self.tool_manager.copy_file(src, dest, bot_id=caller_id)
+                if res.get("success"):
+                    self.memory_manager.log_file_edit(
+                        filepath=dest,
+                        author=caller_id,
+                        action="copy",
+                        diff_snippet=f"Copied from {src}"
+                    )
+                return res
             elif tool_name == "write_file":
                 filepath = args.get("filepath", "")
                 self.set_model_live_status(caller_id, f"Editing file {filepath}")

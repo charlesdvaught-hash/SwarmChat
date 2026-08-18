@@ -43,7 +43,7 @@ class ToolManager:
 
     def classify_tool_risk(self, tool_name: str) -> str:
         low_risk = ["read_file", "list_files", "search_workspace", "internet_search", "search_huggingface", "git_status", "git_diff", "git_log"]
-        consequential = ["write_file", "patch_file", "git_branch", "git_commit", "git_rollback", "bot_workspace_write", "bot_workspace_merge"]
+        consequential = ["write_file", "patch_file", "copy_file", "git_branch", "git_commit", "git_rollback", "bot_workspace_write", "bot_workspace_merge"]
         high_risk = ["run_terminal_cmd"]
 
         if tool_name in low_risk:
@@ -304,6 +304,27 @@ class ToolManager:
         except Exception as e:
             # Rollback file copy
             return {"success": False, "error": f"Merge failed with error: {str(e)}"}
+
+    def copy_file(self, src: str, dest: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
+        """Copies or clones a file within the workspace or bot sandbox."""
+        root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
+        full_src = os.path.abspath(os.path.join(root, src))
+        if not os.path.exists(full_src):
+            full_src = os.path.abspath(os.path.join(self.workspace_root, src))
+
+        full_dest = os.path.abspath(os.path.join(root, dest))
+        if not self._is_safe_path(full_src) or not self._is_safe_path(full_dest):
+            return {"success": False, "error": "Copy operations outside workspace are denied."}
+
+        if not os.path.exists(full_src):
+            return {"success": False, "error": f"Source file '{src}' does not exist."}
+
+        try:
+            os.makedirs(os.path.dirname(full_dest), exist_ok=True)
+            shutil.copy2(full_src, full_dest)
+            return {"success": True, "src": src, "dest": dest}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def write_file(self, filepath: str, content: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
         """Standard write tool. If bot_id is provided, writes to bot workspace first."""
