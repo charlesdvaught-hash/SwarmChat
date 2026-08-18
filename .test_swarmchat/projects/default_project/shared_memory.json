@@ -1,7 +1,7 @@
 {
   "project_id": "default_project",
   "phase": "execution",
-  "phase_last_changed": 1787026101.508629,
+  "phase_last_changed": 1787033378.761297,
   "shared_entries": [
     {
       "id": "mem_1787026101432",
@@ -38,10 +38,335 @@
       "timestamp": 1787026101.5086339,
       "author": "System State Machine",
       "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787032981144",
+      "timestamp": 1787032981.1446307,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787032981146",
+      "timestamp": 1787032981.146287,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787032981147",
+      "timestamp": 1787032981.1470416,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787032981164",
+      "timestamp": 1787032981.1642902,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787032981206",
+      "timestamp": 1787032981.2064767,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787032981225",
+      "timestamp": 1787032981.225299,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787032999261",
+      "timestamp": 1787032999.2618613,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787032999263",
+      "timestamp": 1787032999.2637262,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787032999264",
+      "timestamp": 1787032999.2645802,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787032999281",
+      "timestamp": 1787032999.2818437,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787032999323",
+      "timestamp": 1787032999.3237069,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787032999341",
+      "timestamp": 1787032999.3416705,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033054756",
+      "timestamp": 1787033054.7560582,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033054757",
+      "timestamp": 1787033054.7578096,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787033054758",
+      "timestamp": 1787033054.7585857,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033054775",
+      "timestamp": 1787033054.775327,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787033054816",
+      "timestamp": 1787033054.8162825,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033054833",
+      "timestamp": 1787033054.8336003,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033107875",
+      "timestamp": 1787033107.8750606,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033107877",
+      "timestamp": 1787033107.8771663,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787033107878",
+      "timestamp": 1787033107.8781524,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033107896",
+      "timestamp": 1787033107.896457,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787033107938",
+      "timestamp": 1787033107.938372,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033107956",
+      "timestamp": 1787033107.9567537,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033185652",
+      "timestamp": 1787033185.6528075,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033185654",
+      "timestamp": 1787033185.6547403,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787033185655",
+      "timestamp": 1787033185.6557715,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033185674",
+      "timestamp": 1787033185.6743898,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787033185718",
+      "timestamp": 1787033185.718766,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033185735",
+      "timestamp": 1787033185.735768,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033253272",
+      "timestamp": 1787033253.2724109,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033253274",
+      "timestamp": 1787033253.2745466,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787033253275",
+      "timestamp": 1787033253.2756433,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033253294",
+      "timestamp": 1787033253.294151,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787033253337",
+      "timestamp": 1787033253.3373592,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033253355",
+      "timestamp": 1787033253.355033,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033291205",
+      "timestamp": 1787033291.2059522,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033291208",
+      "timestamp": 1787033291.2087343,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787033291209",
+      "timestamp": 1787033291.2099967,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033291230",
+      "timestamp": 1787033291.230918,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787033291276",
+      "timestamp": 1787033291.27689,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033291293",
+      "timestamp": 1787033291.2936883,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033343594",
+      "timestamp": 1787033343.5941846,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033343596",
+      "timestamp": 1787033343.596801,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787033343597",
+      "timestamp": 1787033343.5978947,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033343615",
+      "timestamp": 1787033343.6157067,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787033343657",
+      "timestamp": 1787033343.6574545,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033343674",
+      "timestamp": 1787033343.6748219,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033378674",
+      "timestamp": 1787033378.674493,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033378677",
+      "timestamp": 1787033378.6775568,
+      "author": "Architect",
+      "content": "Test decision"
+    },
+    {
+      "id": "mem_1787033378678",
+      "timestamp": 1787033378.6789749,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
+    },
+    {
+      "id": "mem_1787033378700",
+      "timestamp": 1787033378.7004046,
+      "author": "Architect",
+      "content": "Updated sampling settings for `model_architect` based on Hugging Face / performance research: {'temperature': 0.35, 'top_k': 20}"
+    },
+    {
+      "id": "mem_1787033378744",
+      "timestamp": 1787033378.7441673,
+      "author": "System State Machine",
+      "content": "Phase switched from 'EXECUTION' to 'DISCUSSION'."
+    },
+    {
+      "id": "mem_1787033378761",
+      "timestamp": 1787033378.7613008,
+      "author": "System State Machine",
+      "content": "Phase switched from 'DISCUSSION' to 'EXECUTION'."
     }
   ],
   "model_journals": {},
   "model_spec_files": {},
+  "model_notes": {},
   "episodes": [],
   "task_itinerary": [],
   "file_audit_log": [
@@ -52,17 +377,89 @@
       "author": "model_coder",
       "action": "write",
       "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787032981240",
+      "timestamp": 1787032981.2402163,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787032999365",
+      "timestamp": 1787032999.365991,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787033054861",
+      "timestamp": 1787033054.8617704,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787033107987",
+      "timestamp": 1787033107.9879472,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787033185767",
+      "timestamp": 1787033185.7678359,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787033253384",
+      "timestamp": 1787033253.3843927,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787033291321",
+      "timestamp": 1787033291.3211305,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787033343705",
+      "timestamp": 1787033343.7050254,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
+    },
+    {
+      "id": "audit_1787033378791",
+      "timestamp": 1787033378.791345,
+      "filepath": "test.txt",
+      "author": "model_coder",
+      "action": "write",
+      "diff_snippet": "Written 0 bytes"
     }
   ],
   "active_file_locks": {
     "test.txt": {
       "last_edited_by": "model_coder",
-      "last_edited_at": 1787026101.5309668,
+      "last_edited_at": 1787033378.7913504,
       "status": "edited"
     }
   },
   "tokens_used": {
-    "model_architect": 11
+    "model_architect": 110
   },
   "session_id": "default_session"
 }

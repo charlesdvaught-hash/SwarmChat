@@ -25,6 +25,7 @@ class MemoryManager:
             "shared_entries": [],
             "model_journals": {},
             "model_spec_files": {},  # Per-model spec files/notebooks (model_id -> str content)
+            "model_notes": {},  # Per-model indexed note chunks (model_id -> List[Dict])
             "episodes": [],  # Structured NAC-style episodes
             "task_itinerary": [],  # Meeting itinerary tasks
             "file_audit_log": [],  # File edits and user/model attribution
@@ -351,3 +352,59 @@ class MemoryManager:
     def get_all_spec_files(self) -> Dict[str, str]:
         """Returns all models' spec files for selective reading."""
         return self.state.get("model_spec_files", {})
+
+    # --- INDEXED NOTE CHUNKS (100-300 TOKENS) ---
+    def add_note_chunk(self, model_id: str, content: str, title: str = "Note") -> Dict[str, Any]:
+        """Saves an internal note segment, chunking long content into 100-300 token segments (~150-400 words)."""
+        words = content.strip().split()
+        chunks = []
+        chunk_size = 200  # Target ~200 words (~150-250 tokens)
+
+        if len(words) <= chunk_size:
+            chunks.append(" ".join(words))
+        else:
+            for i in range(0, len(words), chunk_size):
+                chunk_words = words[i:i + chunk_size]
+                chunks.append(" ".join(chunk_words))
+
+        added_entries = []
+        model_notes = self.state.setdefault("model_notes", {}).setdefault(model_id, [])
+
+        for idx, chunk_text in enumerate(chunks):
+            idx_title = f"{title} (Part {idx + 1}/{len(chunks)})" if len(chunks) > 1 else title
+            entry = {
+                "id": f"note_{model_id}_{int(time.time() * 1000)}_{idx}",
+                "title": idx_title,
+                "content": chunk_text,
+                "timestamp": time.time(),
+                "est_tokens": int(len(chunk_text.split()) * 1.3)
+            }
+            model_notes.append(entry)
+            added_entries.append(entry)
+
+        # Persist to model directory
+        model_dir = os.path.join(self.project_dir, "models", model_id)
+        os.makedirs(model_dir, exist_ok=True)
+        notes_path = os.path.join(model_dir, "notes.json")
+        try:
+            with open(notes_path, "w", encoding="utf-8") as f:
+                json.dump(model_notes, f, indent=2)
+        except OSError as e:
+            logger.exception("Failed to write notes store for %s", model_id)
+            raise MemoryPersistenceError(f"Failed to write notes store for model '{model_id}': {e}") from e
+
+        self.save_memory()
+        return {"added_count": len(added_entries), "entries": added_entries}
+
+    def search_note_chunks(self, model_id: str, query: str = "", limit: int = 5) -> List[Dict[str, Any]]:
+        """Retrieves and searches indexed note chunks for a model."""
+        notes = self.state.get("model_notes", {}).get(model_id, [])
+        if not query or not query.strip():
+            return notes[-limit:]
+
+        q_lower = query.lower()
+        matched = [
+            n for n in notes
+            if q_lower in n.get("title", "").lower() or q_lower in n.get("content", "").lower()
+        ]
+        return matched[-limit:]

@@ -434,6 +434,31 @@ def test_action_tag_parsing_and_context_reset():
     assert mem.state["tokens_used"]["model_architect"] < 4000
     assert len(mem.state.get("model_journals", {}).get("model_architect", [])) > 0
 
+def test_note_chunking_and_workspace_auto_save(tmp_path):
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=str(tmp_path / "mem_notes"))
+    tm = ToolManager()
+    orch = Orchestrator(mm, mem, tm)
+
+    # Test SAVE_NOTE directive
+    res_notes = mem.add_note_chunk("model_coder", "This is an indexed note chunk detailing architecture specs and design decisions.", title="Spec Note")
+    assert res_notes["added_count"] == 1
+    searched = mem.search_note_chunks("model_coder", "architecture")
+    assert len(searched) == 1
+    assert "architecture specs" in searched[0]["content"]
+
+    # Test auto-save of generated markdown code block
+    stub_generation(mm, "Here is the code implementation:\n```python\n# filename: calculate.py\ndef add(a, b):\n    return a + b\n```")
+    asyncio.run(orch.step_model_turn("model_coder"))
+
+    # Check that file was auto-saved in model workspace
+    bot_dir = tm.get_bot_workspace_dir("model_coder")
+    code_path = os.path.join(bot_dir, "calculate.py")
+    assert os.path.exists(code_path)
+    with open(code_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "def add(a, b):" in content
+
 def test_api_returns_error_status_codes():
     """Endpoints must answer with real HTTP errors instead of 200s carrying success: false."""
     from backend import main

@@ -1,0 +1,34 @@
+{
+  "project_id": "default_project",
+  "phase": "discussion",
+  "phase_last_changed": 1787033293.7766585,
+  "shared_entries": [],
+  "model_journals": {},
+  "model_spec_files": {},
+  "model_notes": {
+    "model_coder": [
+      {
+        "id": "note_model_coder_1787033293776_0",
+        "title": "Spec Note",
+        "content": "This is an indexed note chunk detailing architecture specs and design decisions.",
+        "timestamp": 1787033293.7767491,
+        "est_tokens": 15
+      },
+      {
+        "id": "note_model_coder_1787033346123_0",
+        "title": "Spec Note",
+        "content": "This is an indexed note chunk detailing architecture specs and design decisions.",
+        "timestamp": 1787033346.1231167,
+        "est_tokens": 15
+      }
+    ]
+  },
+  "episodes": [],
+  "task_itinerary": [],
+  "file_audit_log": [],
+  "active_file_locks": {},
+  "tokens_used": {
+    "model_coder": 17
+  },
+  "session_id": "default_session"
+}
