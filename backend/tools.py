@@ -47,8 +47,14 @@ class ToolManager:
             return False
 
     def classify_tool_risk(self, tool_name: str) -> str:
-        low_risk = ["read_file", "list_files", "search_workspace", "internet_search", "search_huggingface", "git_status", "git_diff", "git_log", "run_python", "run_tests", "condense_workspace_code"]
-        consequential = ["write_file", "patch_file", "copy_file", "git_branch", "git_commit", "git_rollback", "bot_workspace_write", "bot_workspace_merge"]
+        low_risk = [
+            "read_file", "list_files", "search_workspace", "internet_search", "web_fetch", "web_open",
+            "search_huggingface", "git_status", "git_diff", "git_log", "run_python", "run_tests", "condense_workspace_code"
+        ]
+        consequential = [
+            "write_file", "patch_file", "copy_file", "git_branch", "git_commit", "git_rollback",
+            "bot_workspace_write", "bot_workspace_merge"
+        ]
         high_risk = ["run_terminal_cmd"]
 
         if tool_name in low_risk:
@@ -58,6 +64,129 @@ class ToolManager:
         elif tool_name in high_risk:
             return "high"
         return "consequential"
+
+    def patch_file(
+        self,
+        filepath: str,
+        search_block: str,
+        replace_block: str,
+        bot_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Applies a targeted search-and-replace block edit to a workspace or bot file after pre-validation."""
+        root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
+        full_path = os.path.abspath(os.path.join(root, filepath))
+        if not os.path.exists(full_path):
+            full_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
+
+        if not self._is_safe_path(full_path, self.workspace_root) and not self._is_safe_path(full_path, self.bot_workspaces_dir):
+            return {"success": False, "error": f"Access outside workspace denied for '{filepath}'."}
+
+        if not os.path.exists(full_path):
+            return {"success": False, "error": f"Target file '{filepath}' does not exist."}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            if search_block not in content:
+                # Try targeted line-level normalized whitespace comparison
+                lines = content.splitlines(keepends=True)
+                search_lines = search_block.splitlines()
+                matched_idx = -1
+                for idx in range(len(lines) - len(search_lines) + 1):
+                    sub = [l.rstrip("\r\n").rstrip() for l in lines[idx:idx+len(search_lines)]]
+                    target_sub = [l.rstrip() for l in search_lines]
+                    if sub == target_sub:
+                        matched_idx = idx
+                        break
+
+                if matched_idx != -1:
+                    rep_str = replace_block if replace_block.endswith("\n") else replace_block + "\n"
+                    lines[matched_idx:matched_idx+len(search_lines)] = [rep_str]
+                    new_content = "".join(lines)
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Search block not found in '{filepath}'. Please check line indentation and content exactness."
+                    }
+            else:
+                new_content = content.replace(search_block, replace_block, 1)
+
+            # Pre-validate syntax before committing patch
+            temp_path = f"{full_path}.patch_test"
+            with open(temp_path, "w", encoding="utf-8") as tf:
+                tf.write(new_content)
+
+            syntax_check = self.validate_file_syntax(temp_path)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+            if not syntax_check.get("valid"):
+                return {
+                    "success": False,
+                    "error": f"Patch rejected due to syntax error after application: {syntax_check.get('error')}"
+                }
+
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+
+            return {
+                "success": True,
+                "filepath": filepath,
+                "bot_id": bot_id,
+                "patched": True,
+                "bytes_written": len(new_content)
+            }
+        except OSError as e:
+            logger.warning("Patch failed for %s: %s", filepath, e)
+            return {"success": False, "error": f"Failed to patch '{filepath}': {e}"}
+
+    async def web_fetch(self, url: str, max_chars: int = 4000) -> Dict[str, Any]:
+        """Fetches web page content, extracts clean text, and truncates to max_chars as a structured observation."""
+        if not url or not (url.startswith("http://") or url.startswith("https://")):
+            return {"success": False, "error": "Invalid URL format. URL must start with http:// or https://"}
+
+        try:
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers={"User-Agent": "SwarmChat-Agent/1.0"})
+        except httpx.HTTPError as e:
+            logger.warning("Web fetch failed for URL '%s': %s", url, e)
+            return {"success": False, "url": url, "error": f"HTTP fetch request failed: {e}"}
+
+        if resp.status_code != 200:
+            return {"success": False, "url": url, "error": f"Web fetch returned HTTP {resp.status_code}."}
+
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Remove scripts, styles, and non-content elements
+            for elem in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+                elem.decompose()
+
+            title = soup.title.string.strip() if soup.title and soup.title.string else url
+            text = soup.get_text(separator="\n", strip=True)
+
+            # Compact consecutive newlines
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            clean_text = "\n".join(lines)
+
+            truncated = clean_text[:max_chars] + ("... [truncated page content]" if len(clean_text) > max_chars else "")
+
+            return {
+                "success": True,
+                "url": url,
+                "title": title,
+                "content": truncated,
+                "char_count": len(clean_text)
+            }
+        except Exception as e:
+            logger.warning("Parsing web fetch content failed for '%s': %s", url, e)
+            return {"success": False, "url": url, "error": f"Failed to parse web page content: {e}"}
+
+    async def web_open(self, url: str, max_chars: int = 4000) -> Dict[str, Any]:
+        """Alias for web_fetch."""
+        return await self.web_fetch(url, max_chars)
 
     def run_python(self, filepath: str, bot_id: str, timeout: int = 10) -> Dict[str, Any]:
         """Runs a python file inside the bot's workspace sandbox without shell=True."""
@@ -195,7 +324,6 @@ class ToolManager:
                                     if len(results) >= 50:
                                         break
                     except OSError as e:
-                        # Unreadable files are reported back so callers know the search was partial.
                         logger.debug("Skipping unreadable file %s during search: %s", rel_path, e)
                         skipped.append({"filepath": rel_path, "error": str(e)})
             return {

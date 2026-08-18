@@ -18,6 +18,7 @@ from backend.memory import MemoryManager
 from backend.tools import ToolManager
 from backend.orchestrator import Orchestrator
 from backend.evaluate import EvaluateEngine
+from backend.workflows import WORKFLOW_TEMPLATES, Task, TaskGraph, infer_model_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +38,12 @@ tool_mgr = ToolManager()
 orchestrator = Orchestrator(model_mgr, memory_mgr, tool_mgr)
 evaluate_engine = EvaluateEngine(model_mgr)
 
-# Background loop tasks are retained so their failures are logged instead of being
-# discarded when the task object is garbage collected.
 background_tasks: set = set()
 last_background_error: Optional[str] = None
 
 
 @app.exception_handler(SwarmChatError)
 async def swarmchat_error_handler(request: Request, exc: SwarmChatError):
-    """Turns backend failures into real error responses instead of 200s that look successful."""
     logger.error("%s %s failed: %s", request.method, request.url.path, exc)
     status = 503 if isinstance(exc, ModelInvocationError) else 500
     return JSONResponse(status_code=status, content={"success": False, "error": str(exc)})
@@ -130,6 +128,15 @@ class ItineraryTaskUpdateReq(BaseModel):
 class RosterUpdateReq(BaseModel):
     schedule: List[str]
 
+class SelectWorkflowReq(BaseModel):
+    workflow_id: str
+
+class GenerateTaskGraphReq(BaseModel):
+    user_request: str
+
+class ExecuteTaskReq(BaseModel):
+    task_id: Optional[str] = None
+
 @app.get("/api/prompts/templates")
 def get_prompt_templates():
     from backend.prompts import prompt_template_mgr
@@ -148,6 +155,57 @@ def update_prompt_templates(req: PromptTemplateUpdateReq):
     return {"success": True, "templates": prompt_template_mgr.templates}
 
 last_loaded_model_dir: Optional[str] = None
+
+@app.get("/api/workflows")
+def get_workflows():
+    return {
+        "success": True,
+        "active_workflow_id": orchestrator.current_workflow_id,
+        "workflows": list(WORKFLOW_TEMPLATES.values())
+    }
+
+@app.post("/api/workflows/select")
+def select_workflow(req: SelectWorkflowReq):
+    try:
+        wf = orchestrator.set_workflow(req.workflow_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"success": True, "workflow": wf}
+
+@app.get("/api/workflows/task_graph")
+def get_task_graph():
+    return {
+        "success": True,
+        "workflow_id": orchestrator.current_workflow_id,
+        "task_graph": orchestrator.task_graph.to_dict_list(),
+        "execution_teams": orchestrator.execution_teams
+    }
+
+@app.post("/api/workflows/task_graph/generate")
+async def generate_task_graph(req: GenerateTaskGraphReq):
+    tg = await orchestrator.generate_task_graph_from_discussion(req.user_request)
+    return {
+        "success": True,
+        "task_graph": tg.to_dict_list(),
+        "execution_teams": orchestrator.execution_teams
+    }
+
+@app.post("/api/workflows/task_graph/execute")
+async def execute_task_graph(req: Optional[ExecuteTaskReq] = None):
+    if req and req.task_id:
+        res = await orchestrator.execute_task_pipeline(req.task_id)
+        return {"success": True, "result": res, "task_graph": orchestrator.task_graph.to_dict_list()}
+    else:
+        results = await orchestrator.execute_all_pending_tasks()
+        return {"success": True, "results": results, "task_graph": orchestrator.task_graph.to_dict_list()}
+
+@app.get("/api/models/capabilities")
+def get_model_capabilities():
+    caps = {}
+    for m_id, cfg in orchestrator.models.items():
+        gguf_p = cfg.get("gguf_path") or cfg.get("model_name", "")
+        caps[m_id] = infer_model_capabilities(cfg.get("model_name", ""), gguf_p).to_dict()
+    return {"success": True, "capabilities": caps}
 
 @app.get("/api/fs/browse")
 def browse_filesystem(path: Optional[str] = None):
@@ -178,7 +236,6 @@ def browse_filesystem(path: Optional[str] = None):
                 is_gguf = lower.endswith(".gguf") or lower.endswith(".bin")
                 is_mmproj = "mmproj" in lower or "clip" in lower
 
-                # In Server Filesystem Explorer, show ONLY model files (GGUF/bin/mmproj) and folders
                 if is_gguf or is_mmproj:
                     try:
                         size_mb = round(os.path.getsize(full_p) / (1024 * 1024), 2)
@@ -277,6 +334,10 @@ def install_engine():
 def get_full_state():
     return {
         "phase": memory_mgr.get_phase(),
+        "current_workflow_id": orchestrator.current_workflow_id,
+        "workflows": list(WORKFLOW_TEMPLATES.values()),
+        "task_graph": orchestrator.task_graph.to_dict_list(),
+        "execution_teams": orchestrator.execution_teams,
         "turn_mode": orchestrator.turn_mode,
         "moderator_model_id": orchestrator.moderator_model_id,
         "models": orchestrator.models,
@@ -363,7 +424,6 @@ async def send_chat_message(req: ChatMsgReq):
         content=req.content,
         is_admin=req.is_admin
     )
-    # Automatically launch conversation loop in background
     _track_background_task(
         asyncio.create_task(orchestrator.run_autonomous_loop(max_turns=5)),
         "autonomous conversation loop"
@@ -388,7 +448,6 @@ def configure_model(req: ModelConfigReq):
     global last_loaded_model_dir
     m_dict = req.dict()
 
-    # Store persistent last loaded model directory
     gguf_p = req.gguf_path or req.model_name
     resolved = model_mgr.resolve_gguf_path(gguf_p)
     if resolved and os.path.exists(resolved):
@@ -422,7 +481,6 @@ def set_moderator(model_id: str):
 async def search_huggingface(query: str, limit: int = 5):
     res = await tool_mgr.search_huggingface(query, limit=limit)
     if not res.get("success"):
-        # 502: the upstream provider failed, and the caller must not treat this as "no results".
         raise HTTPException(status_code=502, detail=res.get("error", "HuggingFace search failed."))
     return res
 
@@ -443,7 +501,6 @@ def override_vote(req: VoteOverrideReq):
 
 @app.post("/api/hiring/vote")
 def submit_hire_vote(req: HireVoteReq):
-    """Handles a successful bot vote on a HuggingFace candidate and notifies the Admin via private notification."""
     admin_msg = orchestrator.add_chat_message(
         sender="System / Hiring Pipeline",
         role="System",

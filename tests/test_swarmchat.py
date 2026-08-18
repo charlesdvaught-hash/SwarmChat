@@ -13,6 +13,7 @@ from backend.tools import ToolManager
 from backend.orchestrator import Orchestrator
 from backend.evaluate import EvaluateEngine
 from backend.prompts import PromptTemplateManager, get_system_prompt
+from backend.workflows import Task, TaskGraph
 from fastapi import HTTPException
 
 
@@ -191,7 +192,6 @@ def test_tool_voting_and_admin_override():
 
     vote_id = vote_req["id"]
 
-    # Write tools are locked in discussion phase: the override must report that, not claim success.
     locked_res = orch.admin_override_vote(vote_id, "approve")
     assert locked_res["success"] is False
     assert "locked" in locked_res["error"].lower()
@@ -215,7 +215,6 @@ def test_evaluate_engine():
     assert len(res["rankings"]) == 2
 
 def test_evaluate_engine_reports_candidate_failures():
-    """An unusable candidate is ranked last with its error, not scored as if it answered."""
     mm = ModelManager()
     fail_generation(mm, "llama-cpp-python engine not installed")
     ee = EvaluateEngine(mm)
@@ -229,13 +228,11 @@ def test_evaluate_engine_reports_candidate_failures():
     assert "llama-cpp-python" in res["rankings"][0]["error"]
 
 def test_tiny_gguf_models_interaction_and_memory():
-    # Verify that two tiny GGUF models can be configured, interact, and write self-journals to shared memory
     mm = ModelManager()
     mem = MemoryManager(storage_dir=".test_swarmchat_gguf")
     tm = ToolManager()
     orch = Orchestrator(mm, mem, tm)
 
-    # Configure two authentic tiny GGUF models in known models and active room
     tiny_gguf_1 = {
         "id": "gguf_qwen_0_5b",
         "name": "Qwen 0.5B Architect",
@@ -270,19 +267,16 @@ def test_tiny_gguf_models_interaction_and_memory():
     assert "gguf_qwen_0_5b" in orch.models
     assert "gguf_qwen_0_8b" in orch.models
 
-    # Step turns for both models and check response & memory journaling
     msg1 = asyncio.run(orch.step_model_turn("gguf_qwen_0_5b"))
     assert msg1["sender"] == "Qwen 0.5B Architect"
 
     msg2 = asyncio.run(orch.step_model_turn("gguf_qwen_0_8b"))
     assert msg2["sender"] == "Qwen 0.8B Coder"
 
-    # Test self-journaling and napping
     mem.record_model_nap("gguf_qwen_0_5b", "Qwen 0.5B Architect self-journal summary: Architecture layout approved.")
     latest_journal = mem.get_model_latest_journal("gguf_qwen_0_5b")
     assert "Architecture layout approved" in latest_journal
 
-    # Test kicking a model and re-adding from known library
     kick_res = orch.kick_model_from_room("gguf_qwen_0_5b")
     assert kick_res["was_moderator"] is True
     assert "gguf_qwen_0_5b" not in orch.models
@@ -298,14 +292,12 @@ def test_gguf_status_tracking_and_vram_management():
     tm = ToolManager()
     orch = Orchestrator(mm, mem, tm)
 
-    # Test status update and error tracking
     mm.update_model_status("test_m", status="error", error="File missing", tok_per_sec=12.5)
     st = mm.model_statuses.get("test_m")
     assert st["status"] == "error"
     assert st["error"] == "File missing"
     assert st["tok_per_sec"] == 12.5
 
-    # Test VRAM management routine
     orch.manage_vram_allocation("model_critic")
     assert mm.is_llama_cpp_installed() in [True, False]
 
@@ -316,32 +308,26 @@ def test_autonomous_loop_and_speaker_selection():
     orch = Orchestrator(mm, mem, tm)
     stub_generation(mm)
 
-    # @mention context detection
     orch.add_chat_message("Admin", "Admin", "Hey @Coder what do you think?", is_admin=True)
     speaker = orch.get_next_speaker()
     assert speaker == "model_coder"
 
-    # Test autonomous loop max turn execution
     asyncio.run(orch.run_autonomous_loop(max_turns=2))
     assert len(orch.chat_history) >= 3
 
 def test_gguf_path_resolution_and_search_paths(tmp_path):
     mm = ModelManager()
-    # Create a dummy gguf file in temp dir
     fake_dir = tmp_path / "custom_models"
     fake_dir.mkdir()
     dummy_gguf = fake_dir / "Bonsai-27B-Q1_0.gguf"
     dummy_gguf.write_text("dummy gguf weights")
 
-    # Before adding custom path, path resolution by filename alone should fail
     resolved_before = mm.resolve_gguf_path("Bonsai-27B-Q1_0.gguf")
     assert resolved_before is None or os.path.exists(resolved_before)
 
-    # Add custom path to search paths
     mm.add_search_path(str(fake_dir))
     assert str(fake_dir) in mm.get_search_paths()
 
-    # Now resolve_gguf_path with filename should find absolute path
     resolved_after = mm.resolve_gguf_path("Bonsai-27B-Q1_0.gguf")
     assert resolved_after is not None
     assert os.path.abspath(resolved_after) == os.path.abspath(str(dummy_gguf))
@@ -358,8 +344,6 @@ def test_huggingface_search_tool():
     assert "model_id" in res["models"][0]
 
 class _FailingClient:
-    """Minimal httpx.AsyncClient stand-in whose requests always fail."""
-
     def __init__(self, *args, **kwargs):
         pass
 
@@ -373,7 +357,6 @@ class _FailingClient:
         raise httpx.ConnectError("network unreachable")
 
 def test_huggingface_search_failure_is_not_fabricated(monkeypatch):
-    """A failed HF lookup must not be reported as a successful hit on an invented model."""
     monkeypatch.setattr(httpx, "AsyncClient", _FailingClient)
     res = asyncio.run(ToolManager().search_huggingface("Llama-3-GGUF"))
     assert res["success"] is False
@@ -423,14 +406,11 @@ def test_action_tag_parsing_and_context_reset():
     tm = ToolManager()
     orch = Orchestrator(mm, mem, tm)
 
-    # Test UPDATE_TASK tag parsing
     mem.add_itinerary_task("Initial Task", "Task description")
 
-    # Exceed model token limit to trigger context refresh
     mem.state.setdefault("tokens_used", {})["model_architect"] = 4000
     asyncio.run(orch.step_model_turn("model_architect"))
 
-    # Token counter should reset to 0 after turn
     assert mem.state["tokens_used"]["model_architect"] < 4000
     assert len(mem.state.get("model_journals", {}).get("model_architect", [])) > 0
 
@@ -440,18 +420,15 @@ def test_note_chunking_and_workspace_auto_save(tmp_path):
     tm = ToolManager()
     orch = Orchestrator(mm, mem, tm)
 
-    # Test SAVE_NOTE directive
     res_notes = mem.add_note_chunk("model_coder", "This is an indexed note chunk detailing architecture specs and design decisions.", title="Spec Note")
     assert res_notes["added_count"] == 1
     searched = mem.search_note_chunks("model_coder", "architecture")
     assert len(searched) == 1
     assert "architecture specs" in searched[0]["content"]
 
-    # Test auto-save of generated markdown code block
     stub_generation(mm, "Here is the code implementation:\n```python\n# filename: calculate.py\ndef add(a, b):\n    return a + b\n```")
     asyncio.run(orch.step_model_turn("model_coder"))
 
-    # Check that file was auto-saved in model workspace
     bot_dir = tm.get_bot_workspace_dir("model_coder")
     code_path = os.path.join(bot_dir, "calculate.py")
     assert os.path.exists(code_path)
@@ -459,8 +436,67 @@ def test_note_chunking_and_workspace_auto_save(tmp_path):
         content = f.read()
     assert "def add(a, b):" in content
 
+def test_task_execution_pipeline_reliability_loop():
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=".test_swarmchat_pipeline")
+    tm = ToolManager()
+    orch = Orchestrator(mm, mem, tm)
+    stub_generation(mm, "I am implementing the task.")
+
+    task = Task(
+        task_id="TASK-TEST-001",
+        title="Implement helper function",
+        description="Write helper.py in bot workspace and pass tests",
+        test_command="python3 -c 'import sys; sys.exit(0)'"
+    )
+    orch.task_graph.add_task(task)
+    orch.assign_teams_for_task_graph(orch.task_graph)
+
+    res = asyncio.run(orch.execute_task_pipeline("TASK-TEST-001"))
+    assert res["success"] is True
+    assert res["status"] == "merged"
+
+    failing_task = Task(
+        task_id="TASK-TEST-002",
+        title="Failing Task with Repair",
+        description="Fails initially then succeeds",
+        test_command="python3 -c 'import sys; sys.exit(0)'"
+    )
+    orch.task_graph.add_task(failing_task)
+    orch.assign_teams_for_task_graph(orch.task_graph)
+
+    calls = 0
+    def _test_mock(task_obj, bot_id):
+        nonlocal calls
+        calls += 1
+        if calls < 2:
+            return {"success": False, "returncode": 1, "stderr": "AssertionError: expected True"}
+        return {"success": True, "returncode": 0, "stdout": "All tests passed"}
+
+    orch._run_task_tests = _test_mock
+    res_repair = asyncio.run(orch.execute_task_pipeline("TASK-TEST-002"))
+    assert res_repair["success"] is True
+    assert "Passed after repair attempt 1" in res_repair["summary"]
+
+def test_workflow_api_endpoints():
+    from backend import main
+    wf_res = main.get_workflows()
+    assert wf_res["success"] is True
+    assert len(wf_res["workflows"]) >= 7
+
+    sel_res = main.select_workflow(main.SelectWorkflowReq(workflow_id="APPLICATION_BUILD"))
+    assert sel_res["success"] is True
+    assert sel_res["workflow"]["id"] == "APPLICATION_BUILD"
+
+    tg_res = main.get_task_graph()
+    assert tg_res["success"] is True
+    assert "task_graph" in tg_res
+
+    caps_res = main.get_model_capabilities()
+    assert caps_res["success"] is True
+    assert "capabilities" in caps_res
+
 def test_api_returns_error_status_codes():
-    """Endpoints must answer with real HTTP errors instead of 200s carrying success: false."""
     from backend import main
 
     with pytest.raises(HTTPException) as invalid_phase:

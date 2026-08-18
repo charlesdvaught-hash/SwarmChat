@@ -1,13 +1,16 @@
 import logging
 import os
 import time
+import json
 import asyncio
 from typing import Callable, Dict, Any, List, Optional
+
 from backend.errors import DirectiveParseError, ModelInvocationError, SwarmChatError
 from backend.models import ModelManager
 from backend.prompts import get_system_prompt
 from backend.memory import MemoryManager
 from backend.tools import ToolManager
+from backend.workflows import WORKFLOW_TEMPLATES, Task, TaskGraph, infer_model_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,10 @@ class Orchestrator:
         self.respond_immediately_to_at = True
         self.moderator_model_id = "model_architect"
 
+        self.current_workflow_id = "APPLICATION_BUILD"
+        self.task_graph = TaskGraph()
+        self.execution_teams: Dict[str, Dict[str, Any]] = {}
+
         self.loop_active = False
         self.tie_counters: Dict[str, int] = {}
         self.last_speaker_id: Optional[str] = None
@@ -72,7 +79,6 @@ class Orchestrator:
         }
 
         # Active chatroom models (subset of known models currently in the room)
-        # Initial status set to "Connecting..." until confirmed connected/online on turn step or validation
         self.models: Dict[str, Dict[str, Any]] = {
             m_id: {**cfg, "live_status": "Connecting..."} for m_id, cfg in self.known_models.items()
         }
@@ -85,6 +91,411 @@ class Orchestrator:
         self.spoken_models: set = set()  # Tracks models that have spoken at least once
 
     VALID_TURN_MODES = ("admin_controlled", "moderator_controlled", "round_robin")
+
+    def set_workflow(self, workflow_id: str) -> Dict[str, Any]:
+        if workflow_id not in WORKFLOW_TEMPLATES:
+            raise ValueError(f"Unknown workflow template '{workflow_id}'. Valid: {', '.join(WORKFLOW_TEMPLATES.keys())}")
+        self.current_workflow_id = workflow_id
+        wf = WORKFLOW_TEMPLATES[workflow_id]
+        self.add_chat_message(
+            sender="System / Workflow Engine",
+            role="System",
+            content=f"🔄 [WORKFLOW SWITCHED]: Switched workflow to '{wf['name']}' ({wf['description']}).",
+            is_admin=True
+        )
+        return wf
+
+    def assign_teams_for_task_graph(self, task_graph: TaskGraph) -> Dict[str, Dict[str, Any]]:
+        """Assigns active room models to tasks based on capability metadata and roles."""
+        active_models = self.get_active_models()
+        if not active_models:
+            return {}
+
+        teams = {}
+        coders = [m for m in active_models if "coder" in m.get("role", "").lower() or "developer" in m.get("role", "").lower()]
+        moderators = [m for m in active_models if m.get("is_moderator") or "architect" in m.get("role", "").lower()]
+        refiners = [m for m in active_models if "refiner" in m.get("role", "").lower() or "critic" in m.get("role", "").lower()]
+
+        default_coder = coders[0] if coders else active_models[0]
+        default_mod = moderators[0] if moderators else active_models[0]
+        default_refiner = refiners[0] if refiners else active_models[0]
+
+        for task in task_graph.tasks.values():
+            if not task.assigned_model or task.assigned_model not in self.models:
+                if "test" in task.title.lower() or "verify" in task.title.lower():
+                    assigned = default_refiner["id"]
+                elif "design" in task.title.lower() or "architecture" in task.title.lower():
+                    assigned = default_mod["id"]
+                else:
+                    assigned = default_coder["id"]
+                task.assigned_model = assigned
+
+            teams[task.id] = {
+                "task_id": task.id,
+                "primary_model": task.assigned_model,
+                "primary_role": self.models.get(task.assigned_model, {}).get("role", "Coder"),
+                "refiner_model": default_refiner["id"],
+                "solver_model": default_mod["id"]
+            }
+
+        self.execution_teams = teams
+        return teams
+
+    async def generate_task_graph_from_discussion(self, user_request: str) -> TaskGraph:
+        """Asks Moderator model to generate a structured task graph bridging Discussion -> Execution."""
+        mod_id = self.moderator_model_id or "model_architect"
+        mod_cfg = self.models.get(mod_id, self.known_models.get(mod_id, {}))
+
+        prompt = (
+            f"You are the Moderator/Architect. Based on the user request: '{user_request}' "
+            f"and current project discussion, generate a structured task graph for execution.\n\n"
+            "Return a JSON array of task objects with fields: "
+            "id (e.g. TASK-001), title, description, dependencies (list of task IDs), priority, allowed_files (list), test_command.\n"
+            "Output ONLY valid JSON without prose wrappers."
+        )
+
+        try:
+            resp_str = await self.model_manager.generate_response(
+                model_config=mod_cfg,
+                system_prompt="You are an architectural task planning agent. Output valid JSON arrays of tasks only.",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2
+            )
+
+            clean_json = resp_str.strip()
+            if clean_json.startswith("```"):
+                lines = clean_json.splitlines()
+                if len(lines) > 2:
+                    clean_json = "\n".join(lines[1:-1])
+
+            raw_tasks = json.loads(clean_json)
+            if isinstance(raw_tasks, list) and len(raw_tasks) > 0:
+                tasks = [Task.from_dict(d) for d in raw_tasks]
+                self.task_graph = TaskGraph(tasks)
+                self.assign_teams_for_task_graph(self.task_graph)
+                self.add_chat_message(
+                    sender=f"{mod_cfg.get('name', 'Moderator')}",
+                    role="Moderator",
+                    content=f"📋 [TASK GRAPH GENERATED]: Created {len(tasks)} implementation tasks for Execution Phase.",
+                    model_id=mod_id
+                )
+                return self.task_graph
+        except Exception as e:
+            logger.warning("Moderator task graph auto-generation failed/unparseable (%s); creating standard fallback task graph.", e)
+
+        fallback_tasks = [
+            Task(
+                task_id="TASK-001",
+                title="Inspect Codebase & Requirements",
+                description=f"Inspect existing workspace files for request: '{user_request}'",
+                priority="high",
+                allowed_files=["."]
+            ),
+            Task(
+                task_id="TASK-002",
+                title="Implement Workspace Code",
+                description=f"Write implementation files for request: '{user_request}'",
+                dependencies=["TASK-001"],
+                priority="high",
+                test_command="python3 -m pytest tests/"
+            )
+        ]
+        self.task_graph = TaskGraph(fallback_tasks)
+        self.assign_teams_for_task_graph(self.task_graph)
+        self.add_chat_message(
+            sender="System / Task Graph Builder",
+            role="System",
+            content=f"📋 [TASK GRAPH INITIALIZED]: Created task graph with {len(fallback_tasks)} tasks for Execution Phase.",
+            is_admin=True
+        )
+        return self.task_graph
+
+    def _process_model_turn_artifacts(self, bot_id: str, response_text: str) -> List[str]:
+        """Parses markdown code blocks from model turns and writes them directly to the bot workspace."""
+        written_files = []
+        if "```" in response_text:
+            parts = response_text.split("```")
+            for i in range(1, len(parts), 2):
+                block = parts[i]
+                lines = block.splitlines()
+                if not lines:
+                    continue
+                first_line = lines[0].strip()
+                fn = f"generated_code_{int(time.time()*1000)}_{i//2}.py"
+                code_body = block
+                if len(lines) > 1 and ("filename:" in lines[0] or "filename:" in lines[1]):
+                    for line in lines[:2]:
+                        if "filename:" in line:
+                            fn = line.split("filename:")[-1].strip().strip("`*#/")
+                    code_body = "\n".join(lines[1:])
+                elif first_line and not any(char in first_line for char in " =():[]{}#"):
+                    code_body = "\n".join(lines[1:])
+                    ext = ".py" if "py" in first_line else (".js" if "js" in first_line or "ts" in first_line else ".txt")
+                    fn = f"generated_code_{int(time.time()*1000)}{ext}"
+
+                if code_body.strip():
+                    w_res = self.tool_manager.bot_workspace_write(bot_id=bot_id, filepath=fn, content=code_body)
+                    if w_res.get("success"):
+                        written_files.append(fn)
+
+        return written_files
+
+    def _has_workspace_changes(self, bot_id: str) -> bool:
+        bot_dir = self.tool_manager.get_bot_workspace_dir(bot_id)
+        if not os.path.exists(bot_dir):
+            return False
+        for root, _, files in os.walk(bot_dir):
+            if files:
+                return True
+        return False
+
+    def _run_task_tests(self, task: Task, bot_id: str) -> Dict[str, Any]:
+        """Runs the task's test command or pytest suite in candidate workspace."""
+        if task.test_command and "pytest" not in task.test_command.lower():
+            res = self.tool_manager.run_terminal_cmd(task.test_command, bot_id=bot_id)
+        else:
+            res = self.tool_manager.run_tests(bot_id=bot_id)
+
+        return {
+            "task_id": task.id,
+            "attempt": task.attempt_count,
+            "command": task.test_command or "pytest",
+            "status": "PASSED" if res.get("success") else "FAILED",
+            "returncode": res.get("returncode", 1),
+            "stdout": res.get("stdout", ""),
+            "stderr": res.get("stderr", "") or res.get("error", ""),
+            "success": res.get("success", False)
+        }
+
+    def _finalize_task_success(self, task: Task, bot_id: str, summary: str) -> Dict[str, Any]:
+        """Merges candidate workspace into main project and marks task passed/merged."""
+        bot_dir = self.tool_manager.get_bot_workspace_dir(bot_id)
+        merged_files = []
+
+        if os.path.exists(bot_dir):
+            for root, _, files in os.walk(bot_dir):
+                for f in files:
+                    rel_p = os.path.relpath(os.path.join(root, f), bot_dir)
+                    m_res = self.tool_manager.bot_workspace_merge_to_main(bot_id, rel_p)
+                    if m_res.get("success"):
+                        merged_files.append(rel_p)
+
+        task.status = "merged"
+        diff_res = self.tool_manager.git_diff()
+        compact_diff = diff_res.get("diff", "")[:400] if diff_res.get("success") else ""
+
+        self.add_chat_message(
+            sender="System / Tester",
+            role="System",
+            content=f"✅ {task.id} passed validation! ({summary}). Merged {len(merged_files)} file(s) into main project."
+            + (f"\n```diff\n{compact_diff}\n```" if compact_diff else ""),
+            is_admin=True
+        )
+
+        return {
+            "success": True,
+            "task_id": task.id,
+            "status": "merged",
+            "merged_files": merged_files,
+            "bot_id": bot_id,
+            "summary": summary
+        }
+
+    async def execute_task_pipeline(self, task_id: str) -> Dict[str, Any]:
+        """Executes full task reliability pipeline: Coder -> Test -> 3 Repairs -> Alt Coder -> Solver -> Merge/Escalate."""
+        task = self.task_graph.get_task(task_id)
+        if not task:
+            return {"success": False, "error": f"Task '{task_id}' not found in task graph."}
+
+        team = self.execution_teams.get(task_id, {})
+        primary_coder_id = task.assigned_model or team.get("primary_model") or "model_coder"
+        solver_id = team.get("solver_model") or self.moderator_model_id or "model_architect"
+
+        # Step 1: Initial Implementation
+        task.status = "implementing"
+        task.attempt_count += 1
+        task.workspace = primary_coder_id
+        coder_cfg = self.models.get(primary_coder_id, self.known_models.get(primary_coder_id, {}))
+
+        self.add_chat_message(
+            sender=f"Coder (@{coder_cfg.get('name', 'Coder')})",
+            role="Coder",
+            content=f"🚀 Starting {task.id}: '{task.title}'. Candidate workspace: `{primary_coder_id}`.",
+            model_id=primary_coder_id
+        )
+
+        imp_prompt = (
+            f"Execute {task.id}: '{task.title}'.\nDescription: {task.description}\n"
+            f"Allowed files: {', '.join(task.allowed_files) if task.allowed_files else 'Any'}\n"
+            "Inspect workspace files first and write/edit code directly in your workspace sandbox using tools or markdown blocks."
+        )
+        try:
+            imp_resp = await self.model_manager.generate_response(
+                model_config=coder_cfg,
+                system_prompt=f"You are {coder_cfg.get('name', 'Coder')} ({coder_cfg.get('role', 'Coder')}). Edit files directly in workspace.",
+                messages=[{"role": "user", "content": imp_prompt}],
+                temperature=0.1
+            )
+            self._process_model_turn_artifacts(primary_coder_id, imp_resp)
+        except Exception as e:
+            logger.warning("Initial turn for %s on %s failed: %s", primary_coder_id, task_id, e)
+
+        # Step 2: Testing Phase
+        task.status = "testing"
+        test_res = self._run_task_tests(task, bot_id=primary_coder_id)
+
+        if test_res.get("success"):
+            return self._finalize_task_success(task, primary_coder_id, "Passed initial testing")
+
+        task.failure_history.append({
+            "attempt": task.attempt_count,
+            "phase": "initial",
+            "bot_id": primary_coder_id,
+            "test_result": test_res
+        })
+
+        # Step 3: Up to 3 Repair Attempts
+        for repair_idx in range(1, 4):
+            task.status = "repairing"
+            task.repair_count += 1
+            self.add_chat_message(
+                sender=f"Coder (@{coder_cfg.get('name', 'Coder')})",
+                role="Coder",
+                content=f"🛠️ Starting repair attempt {repair_idx}/3 for {task.id}. Latest failure:\n```{test_res.get('stderr', '')[:300]}```",
+                model_id=primary_coder_id
+            )
+
+            repair_prompt = (
+                f"Repair attempt {repair_idx}/3 for {task.id}: '{task.title}'.\n"
+                f"Previous test error:\n{test_res.get('stderr', '')[:800]}\n"
+                "Apply targeted fix in your workspace."
+            )
+            try:
+                rep_resp = await self.model_manager.generate_response(
+                    model_config=coder_cfg,
+                    system_prompt="You are a code repair agent. Fix errors in workspace directly.",
+                    messages=[{"role": "user", "content": repair_prompt}],
+                    temperature=0.1
+                )
+                self._process_model_turn_artifacts(primary_coder_id, rep_resp)
+            except Exception as e:
+                logger.warning("Repair turn %d for %s failed: %s", repair_idx, task_id, e)
+
+            test_res = self._run_task_tests(task, bot_id=primary_coder_id)
+            if test_res.get("success"):
+                return self._finalize_task_success(task, primary_coder_id, f"Passed after repair attempt {repair_idx}")
+
+            task.failure_history.append({
+                "attempt": repair_idx,
+                "phase": "repair",
+                "bot_id": primary_coder_id,
+                "test_result": test_res
+            })
+
+        # Step 4: Alternate Coder Escalation
+        task.status = "alternate_attempt"
+        alt_coder_id = None
+        for m_id, m in self.models.items():
+            if m_id != primary_coder_id and ("coder" in m.get("role", "").lower() or "developer" in m.get("role", "").lower() or "refiner" in m.get("role", "").lower()):
+                alt_coder_id = m_id
+                break
+        if not alt_coder_id:
+            alt_coder_id = "model_refiner" if primary_coder_id != "model_refiner" else "model_coder"
+
+        alt_coder_cfg = self.models.get(alt_coder_id, self.known_models.get(alt_coder_id, {}))
+        self.add_chat_message(
+            sender="System / Orchestrator",
+            role="System",
+            content=f"⚠️ Persistent failure after 3 repairs on {task.id}. Escalating to Alternate Coder (@{alt_coder_cfg.get('name', 'Alt Coder')}).",
+            is_admin=True
+        )
+
+        alt_prompt = (
+            f"Fresh implementation attempt for {task.id}: '{task.title}'.\n"
+            f"Original Coder (@{coder_cfg.get('name')}) failed after 3 repair passes.\n"
+            f"Failure summary:\n{test_res.get('stderr', '')[:600]}\n"
+            "Please provide an independent clean implementation in your candidate workspace."
+        )
+        task.workspace = alt_coder_id
+        try:
+            alt_resp = await self.model_manager.generate_response(
+                model_config=alt_coder_cfg,
+                system_prompt=f"You are {alt_coder_cfg.get('name')} taking over {task.id}.",
+                messages=[{"role": "user", "content": alt_prompt}],
+                temperature=0.15
+            )
+            self._process_model_turn_artifacts(alt_coder_id, alt_resp)
+        except Exception as e:
+            logger.warning("Alternate coder turn for %s failed: %s", task_id, e)
+
+        test_res = self._run_task_tests(task, bot_id=alt_coder_id)
+        if test_res.get("success"):
+            return self._finalize_task_success(task, alt_coder_id, "Passed with Alternate Coder")
+
+        task.failure_history.append({
+            "attempt": 1,
+            "phase": "alternate_coder",
+            "bot_id": alt_coder_id,
+            "test_result": test_res
+        })
+
+        # Step 5: Solver Escalation
+        task.status = "solver_review"
+        solver_cfg = self.models.get(solver_id, self.known_models.get(solver_id, {}))
+        self.add_chat_message(
+            sender="System / Orchestrator",
+            role="System",
+            content=f"🚨 Both primary and alternate coders failed on {task.id}. Escalating to Solver (@{solver_cfg.get('name', 'Solver')}).",
+            is_admin=True
+        )
+
+        solver_prompt = (
+            f"Solver review required for {task.id}: '{task.title}'.\n"
+            f"Candidate A ({primary_coder_id}) and Candidate B ({alt_coder_id}) both failed tests.\n"
+            f"Latest failure snippet:\n{test_res.get('stderr', '')[:800]}\n"
+            "Inspect both candidates, apply necessary fixes in workspace, and finalize implementation."
+        )
+        task.workspace = solver_id
+        try:
+            sol_resp = await self.model_manager.generate_response(
+                model_config=solver_cfg,
+                system_prompt=f"You are Solver {solver_cfg.get('name')}. Repair and produce final workspace code.",
+                messages=[{"role": "user", "content": solver_prompt}],
+                temperature=0.1
+            )
+            self._process_model_turn_artifacts(solver_id, sol_resp)
+        except Exception as e:
+            logger.warning("Solver turn for %s failed: %s", task_id, e)
+
+        test_res = self._run_task_tests(task, bot_id=solver_id)
+        if test_res.get("success"):
+            return self._finalize_task_success(task, solver_id, "Passed with Solver escalation")
+
+        # Terminal failure
+        task.status = "needs_human"
+        self.add_chat_message(
+            sender="System / Orchestrator",
+            role="System",
+            content=f"❌ {task.id} failed all repair and solver attempts. Human intervention required.",
+            is_admin=True
+        )
+        return {"success": False, "task_id": task_id, "status": "needs_human", "failure_history": task.failure_history}
+
+    async def execute_all_pending_tasks(self) -> List[Dict[str, Any]]:
+        """Executes all pending tasks in dependency order."""
+        results = []
+        while not self.task_graph.is_complete():
+            executable = self.task_graph.get_executable_tasks()
+            if not executable:
+                logger.info("No executable tasks remaining or dependency blocked.")
+                break
+            for task in executable:
+                res = await self.execute_task_pipeline(task.id)
+                results.append(res)
+                if not res.get("success"):
+                    logger.warning("Task %s failed during pipeline execution; stopping sequence.", task.id)
+                    break
+        return results
 
     def get_active_models(self) -> List[Dict[str, Any]]:
         """Returns list of model configuration dicts for active/enabled models in the chat room."""
@@ -174,7 +585,6 @@ class Orchestrator:
 
         new_mod_id = None
         if was_moderator:
-            # Select replacement that wasn't former moderator
             candidates = [m_id for m_id in self.models if m_id != model_id]
             if candidates:
                 new_mod_id = candidates[0]
@@ -215,14 +625,12 @@ class Orchestrator:
         return msg
 
     def generate_turn_schedule(self, length: int = 8) -> List[str]:
-        """Generates a 5-10 turn scheduled roster based on available user roles, prioritizing Architect first."""
         active_models = self.get_active_model_ids()
         if not active_models:
             return []
 
         schedule: List[str] = []
 
-        # 1. Ensure Architect is first if present and not spoke very recently
         architect_id = None
         for m_id in active_models:
             if self.models[m_id].get("role", "").lower() in ["architect", "planner"] or self.models[m_id].get("is_moderator"):
@@ -232,7 +640,6 @@ class Orchestrator:
         if architect_id:
             schedule.append(architect_id)
 
-        # 2. Add other active roles sequentially, ensuring fair coverage without default bias
         remaining = [m_id for m_id in active_models if m_id not in schedule]
         while len(schedule) < length:
             if not remaining:
@@ -248,7 +655,6 @@ class Orchestrator:
         if not active_models:
             return None
 
-        # Check safety rule: Every 15 messages, ensure any model that hasn't spoken gets a turn
         if len(self.chat_history) >= 15:
             last_15 = self.chat_history[-15:]
             spoken_ids = {m.get("model_id") for m in last_15 if m.get("model_id")}
@@ -256,7 +662,6 @@ class Orchestrator:
             if unspoken:
                 return unspoken[0]
 
-        # Context-based selection: check if last message @mentions a specific model name/role
         if self.chat_history:
             last_msg = self.chat_history[-1]["content"].lower()
             for m_id in active_models:
@@ -264,7 +669,6 @@ class Orchestrator:
                 if f"@{m_cfg['name'].lower()}" in last_msg or f"@{m_cfg['role'].lower()}" in last_msg:
                     return m_id
 
-        # Use scheduled queue if available
         if not self.turn_schedule:
             self.generate_turn_schedule()
 
@@ -273,7 +677,6 @@ class Orchestrator:
             if next_spk in active_models:
                 return next_spk
 
-        # If roster queue runs out, inform Moderator explicitly about loaded models vs available models
         loaded_info = [f"@{m['name']} ({m['role']})" for m_id, m in self.models.items() if m.get("enabled", True)]
         avail_info = [f"@{m['name']} ({m['role']})" for m_id, m in self.known_models.items() if m_id not in self.models]
 
@@ -290,7 +693,6 @@ class Orchestrator:
             is_admin=True
         )
 
-        # Fallback to round-robin
         effective_last = last_speaker_id or self.last_speaker_id
         if effective_last and effective_last in active_models and len(active_models) > 1:
             idx = active_models.index(effective_last)
@@ -300,7 +702,6 @@ class Orchestrator:
 
     @staticmethod
     def _calculate_similarity(str1: str, str2: str) -> float:
-        """Calculates character sequence similarity ratio between two strings."""
         if not str1 or not str2:
             return 0.0
         from difflib import SequenceMatcher
@@ -353,7 +754,6 @@ class Orchestrator:
 
         current_phase = self.memory_manager.get_phase()
 
-        # Evidence-Gated Critique enforcement: If Coder receives a critique, require tool evidence reference in previous messages
         role_lower = model_cfg.get("role", "").lower()
         if "coder" in role_lower and self.chat_history:
             last_msg_content = self.chat_history[-1]["content"]
@@ -375,23 +775,18 @@ class Orchestrator:
         journal_context = self._build_journal_context(latest_journal)
         spec_context = self._build_spec_context(model_id)
 
-        # Prefix Cache Optimization: Put stable content FIRST (system prompt, task details, personal spec)
-        # and volatile context LAST (shared memory summary, episodes, journal)
         context_prompt = f"{sys_prompt}{task_context}{spec_context}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{journal_context}"
 
-        # Check model token usage against limits - enforce context reset if exceeded to prevent degradation
         tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)
         max_tokens = model_cfg.get("max_context_tokens", 4096)
         context_was_reset = False
         if tokens_used > (max_tokens * 0.75):
-            # Record automatic LLM-driven/rule self-journal and reset token counter for model
             auto_journal = f"Context refresh checkpoint for {model_cfg['name']} ({model_cfg['role']}): Active project '{self.memory_manager.get_project_id()}'. Current task: '{active_task['title'] if active_task else 'General Discussion'}'. Key contributions logged to shared memory."
             self.memory_manager.record_model_nap(model_id, auto_journal)
             self.memory_manager.state["tokens_used"][model_id] = 0
             self.memory_manager.save_memory()
             context_was_reset = True
 
-            # Construct ~50-token high-level project summary
             proj_summary_50_tokens = (
                 f"PROJECT INDEX ({self.memory_manager.get_project_id()}): "
                 f"Phase: {current_phase.upper()}. Task: {active_task['title'] if active_task else 'General Alignment'}. "
@@ -400,7 +795,6 @@ class Orchestrator:
             context_prompt = f"{sys_prompt}\n\n### 📌 HIGH-LEVEL PROJECT INDEX (~50 TOKENS):\n{proj_summary_50_tokens}\n\n### SHARED INDEXED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{task_context}\n\n### 🔄 REFRESHED CONTEXT SAVE FILE:\n{auto_journal}\nPlease continue your concise contribution."
 
         if context_was_reset or current_phase == "execution":
-            # Clean context refresh mode: minimal message context to prevent token overload
             file_manifest = self.tool_manager.list_files(".", bot_id=model_id)
             manifest_str = ", ".join(file_manifest.get("files", [])[:15]) if isinstance(file_manifest, dict) else ""
 
@@ -411,8 +805,6 @@ class Orchestrator:
                 }
             ]
         else:
-            # Discussion phase: Truncate messages to prevent prompt overflow & context degradation
-            # Limit each message to max 300 characters and include at most the last 3 turns to prevent echo loops
             from backend.sanitizer import sanitize_message_content
             recent_msgs = []
             for m in self.chat_history[-3:]:
@@ -429,9 +821,7 @@ class Orchestrator:
 
         self.set_model_live_status(model_id, f"Formulating response as {model_cfg.get('role', 'Participant')}")
 
-        # Determine if two-call split should be used: call 1 for unconstrained prose, call 2 for grammar-constrained action emission
         is_execution_phase = (current_phase == "execution")
-        role_lower = model_cfg.get("role", "").lower()
         use_two_call = is_execution_phase or any(r in role_lower for r in ["coder", "tester", "debugger", "refiner"])
 
         response_text = ""
@@ -439,7 +829,6 @@ class Orchestrator:
 
         try:
             if use_two_call:
-                # Call 1: Unconstrained prose contribution
                 prose_response = await self.model_manager.generate_response(
                     model_config=model_cfg,
                     system_prompt=context_prompt,
@@ -447,7 +836,6 @@ class Orchestrator:
                 )
                 response_text = prose_response
 
-                # Call 2: Low-temperature grammar-constrained action emission for what was just said
                 action_sys_prompt = (
                     f"You are the action parsing module for {model_cfg['name']}. "
                     "Analyze the response just emitted and extract all action tags or tool executions into structured JSON format."
@@ -471,7 +859,6 @@ class Orchestrator:
                 except Exception as json_err:
                     logger.debug("Grammar-constrained action call parsing failed or empty for %s: %s", model_id, json_err)
             else:
-                # Single call for general discussion
                 response_text = await self.model_manager.generate_response(
                     model_config=model_cfg,
                     system_prompt=context_prompt,
@@ -491,7 +878,6 @@ class Orchestrator:
         else:
             self.set_model_live_status(model_id, "Idle / Live in Chat")
 
-        # Deduplication: If new message is >=90% similar to model's previous message, skip appending turn
         model_prev_msgs = [m["content"] for m in self.chat_history if m.get("model_id") == model_id]
         if model_prev_msgs:
             last_prev = model_prev_msgs[-1]
@@ -511,13 +897,14 @@ class Orchestrator:
 
         self.memory_manager.update_token_usage(model_id, len(response_text.split()))
 
-        # Process structured JSON actions first
+        # Process structured JSON actions
         for act in actions_list:
             act_type = act.get("type")
             if act_type == "ready_for_execution":
                 self.memory_manager.add_entry(model_cfg["name"], "Declared readiness for Execution Phase.")
                 if self.memory_manager.get_phase() == "discussion":
                     self.memory_manager.set_phase("execution")
+                    asyncio.create_task(self.generate_task_graph_from_discussion("Execute discussion consensus"))
             elif act_type == "request_discussion":
                 self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
             elif act_type == "log_memory":
@@ -546,14 +933,7 @@ class Orchestrator:
             self.memory_manager.add_entry(model_cfg["name"], "Declared readiness for Execution Phase.")
             if self.memory_manager.get_phase() == "discussion":
                 self.memory_manager.set_phase("execution")
-                active_t = self.memory_manager.get_active_task()
-                if not active_t:
-                    self.memory_manager.add_itinerary_task(
-                        title="Execute Project Requirements",
-                        description="Implement codebase updates based on discussion phase consensus.",
-                        priority="high",
-                        assigned_model=model_id
-                    )
+                asyncio.create_task(self.generate_task_graph_from_discussion("Execute discussion consensus"))
         elif "[REQUEST_DISCUSSION]" in response_text:
             self.memory_manager.add_entry(model_cfg["name"], "Requested return to Discussion Phase due to ambiguity.")
 
@@ -620,31 +1000,8 @@ class Orchestrator:
         if "[REQUEST_NAP]" in response_text and "[JOURNAL:" not in response_text:
             self.memory_manager.record_model_nap(model_id, f"{model_cfg['name']} completed a context nap.")
 
-        # Auto-extract markdown code blocks and save into model workspace
-        if "```" in response_text:
-            parts = response_text.split("```")
-            for i in range(1, len(parts), 2):
-                block = parts[i]
-                lines = block.splitlines()
-                if not lines:
-                    continue
-                first_line = lines[0].strip()
-                # Check for comment filename header like `# filename: example.py` or `// filename: index.ts`
-                fn = f"generated_code_{int(time.time()*1000)}_{i//2}.py"
-                code_body = block
-                if len(lines) > 1 and ("filename:" in lines[0] or "filename:" in lines[1]):
-                    for line in lines[:2]:
-                        if "filename:" in line:
-                            fn = line.split("filename:")[-1].strip().strip("`*#/")
-                    code_body = "\n".join(lines[1:])
-                elif first_line and not any(char in first_line for char in " =():[]{}#"):
-                    # First line is language identifier (e.g., python, ts)
-                    code_body = "\n".join(lines[1:])
-                    ext = ".py" if "py" in first_line else (".js" if "js" in first_line or "ts" in first_line else ".txt")
-                    fn = f"generated_code_{int(time.time()*1000)}{ext}"
-
-                if code_body.strip():
-                    self.tool_manager.bot_workspace_write(bot_id=model_id, filepath=fn, content=code_body)
+        # Process markdown code blocks
+        self._process_model_turn_artifacts(model_id, response_text)
 
         msg = self.add_chat_message(
             sender=model_cfg["name"],
@@ -672,16 +1029,10 @@ class Orchestrator:
         return "None"
 
     async def trigger_sandbox_refinement_loop(self, bot_id: str, filepath: str) -> Dict[str, Any]:
-        """Out-of-chat self-refinement feedback loop.
-
-        Runs Python/pytest on newly written workspace file. On SyntaxError/NameError/ImportError,
-        runs isolated repair turns with best-of retention (early stopping).
-        Escalates AssertionError or persistent failure to cloud model/human alert.
-        """
+        """Out-of-chat self-refinement feedback loop."""
         bot_dir = self.tool_manager.get_bot_workspace_dir(bot_id)
         full_file_path = os.path.abspath(os.path.join(bot_dir, filepath))
 
-        # Check initial syntax first
         syntax_check = self.tool_manager.validate_file_syntax(full_file_path)
         if syntax_check.get("valid"):
             exec_res = self.tool_manager.run_python(filepath=filepath, bot_id=bot_id)
@@ -712,9 +1063,7 @@ class Orchestrator:
             content=f"❌ Sandbox execution failed for `{filepath}` [Error Class: `{error_cls}`].\nTraceback snippet:\n```{stderr[:400]}```"
         )
 
-        # Classify & Route
         if error_cls in ["AssertionError", "LogicError"]:
-            # Logic error carries low traceback signal -> do not loop; escalate to human/cloud
             self.add_chat_message(
                 sender="System / Refinement Router",
                 role="System",
@@ -723,9 +1072,7 @@ class Orchestrator:
             )
             return {"success": False, "error_class": error_cls, "escalated": True}
 
-        # Auto-refine for SyntaxError / NameError / ImportError
         refiner_id = None
-        # Locate Refiner model or Coder model
         for m_id, m in self.models.items():
             if m.get("role", "").lower() in ["refiner", "critic", "coder"]:
                 refiner_id = m_id
@@ -735,14 +1082,12 @@ class Orchestrator:
 
         refiner_cfg = self.models.get(refiner_id, self.known_models.get(refiner_id, {}))
 
-        # Best-of retention
         read_res = self.tool_manager.read_file(filepath, bot_id=bot_id)
         best_artifact = read_res.get("content", "")
         best_error_count = len(stderr.splitlines()) if stderr else 100
 
         refined_successfully = False
 
-        # 2 sets of 3 tries (Total 6 max, with lower top_k on 2nd set)
         for set_num in range(1, 3):
             top_k_val = 40 if set_num == 1 else 20
             for try_num in range(1, 4):
@@ -768,14 +1113,12 @@ class Orchestrator:
                     logger.warning("Repair turn generation failed: %s", e)
                     continue
 
-                # Strip markdown code blocks if present
                 clean_repaired = repaired_code.strip()
                 if clean_repaired.startswith("```"):
                     lines = clean_repaired.splitlines()
                     if len(lines) > 2:
                         clean_repaired = "\n".join(lines[1:-1])
 
-                # Write to bot sandbox
                 self.tool_manager.bot_workspace_write(bot_id=bot_id, filepath=filepath, content=clean_repaired)
                 bot_dir = self.tool_manager.get_bot_workspace_dir(bot_id)
                 full_repair_path = os.path.abspath(os.path.join(bot_dir, filepath))
@@ -793,20 +1136,17 @@ class Orchestrator:
                 else:
                     new_stderr = eval_res.get("stderr", "") or eval_syntax.get("error", "")
                     new_error_count = len(new_stderr.splitlines()) if new_stderr else 999
-                    # Early stopping / best-of retention: Accept only if error count strictly decreases
                     if new_error_count < best_error_count:
                         best_artifact = clean_repaired
                         best_error_count = new_error_count
                         stderr = new_stderr
                     else:
-                        # Revert to last best artifact
                         self.tool_manager.bot_workspace_write(bot_id=bot_id, filepath=filepath, content=best_artifact)
 
             if refined_successfully:
                 break
 
         if not refined_successfully:
-            # Revert to original passing or best artifact
             self.tool_manager.bot_workspace_write(bot_id=bot_id, filepath=filepath, content=best_artifact)
             self.add_chat_message(
                 sender="System / Refinement Router",
@@ -815,7 +1155,6 @@ class Orchestrator:
                 is_admin=True
             )
 
-        # Log per-turn outcome to shared memory
         outcome_log = {
             "timestamp": time.time(),
             "filepath": filepath,
@@ -830,7 +1169,6 @@ class Orchestrator:
 
     @staticmethod
     def _directive_payload(response_text: str, opening_token: str) -> Optional[str]:
-        """Extracts an inline directive's payload, or None when the directive is unterminated."""
         start = response_text.find(opening_token) + len(opening_token)
         end = response_text.find("]", start)
         if end == -1:
@@ -838,7 +1176,6 @@ class Orchestrator:
         return response_text[start:end].strip()
 
     def _report_directive_failure(self, directive: str, model_cfg: Dict[str, Any], reason: str):
-        """Announces a dropped directive so an unapplied instruction is never invisible."""
         logger.warning("Directive [%s] from %s failed: %s", directive, model_cfg.get("name"), reason)
         self.add_chat_message(
             sender="System / Directive Parser",
@@ -863,7 +1200,6 @@ class Orchestrator:
             self._report_directive_failure(directive, model_cfg, str(e))
 
     def _apply_config_directive(self, model_id: str, model_cfg: Dict[str, Any], payload: str):
-        """Applies an [UPDATE_CONFIG: key=value, ...] directive, rejecting malformed payloads loudly."""
         numeric_keys = {"top_p": float, "temperature": float, "repeat_penalty": float, "top_k": int}
         updates: Dict[str, Any] = {}
         target_id = model_id
@@ -899,7 +1235,6 @@ class Orchestrator:
         )
 
     def _apply_task_directive(self, model_id: str, model_cfg: Dict[str, Any], payload: str):
-        """Applies an [UPDATE_TASK: key=value, ...] directive, updating an existing task or creating one."""
         kwargs: Dict[str, str] = {}
         for part in [p.strip() for p in payload.split(",") if p.strip()]:
             if "=" not in part:
@@ -950,7 +1285,6 @@ class Orchestrator:
             while turns < max_turns and self.loop_active:
                 current_phase = self.memory_manager.get_phase()
 
-                # Hard-cap Discussion Phase (turns and wall clock) to auto-advance to Execution
                 if current_phase == "discussion":
                     discussion_turns += 1
                     elapsed_disc = time.time() - start_time
@@ -967,7 +1301,6 @@ class Orchestrator:
                 if not next_speaker:
                     break
 
-                # Manage VRAM allocation prior to turn (ensure Moderator & Refiner get priority)
                 self.manage_vram_allocation(next_speaker)
 
                 try:
@@ -993,11 +1326,6 @@ class Orchestrator:
             self.loop_active = False
 
     def manage_vram_allocation(self, active_speaker_id: str):
-        """
-        Dynamic Resource Management:
-        Ensures active speaker, upcoming roster models, and Moderator are prioritized in VRAM based on who is expected to be needed next.
-        Offloads remaining models to RAM if VRAM headroom is tight.
-        """
         hw = self.model_manager.get_hardware_info()
         has_gpu = bool(hw.get("gpu_name") or hw.get("vram_total_gb", 0) > 0)
         if not has_gpu:
@@ -1005,12 +1333,9 @@ class Orchestrator:
 
         mod_id = self.moderator_model_id or "model_architect"
 
-        # Priority 1: Active speaker & Moderator
-        # Priority 2: Upcoming speakers in turn roster
         upcoming_roster = self.turn_schedule[:3] if self.turn_schedule else []
         priority_ids = set([active_speaker_id, mod_id] + upcoming_roster)
 
-        # Preload priority GGUF models into VRAM if room exists
         for pid in priority_ids:
             if pid in self.models and self.models[pid].get("provider") == "gguf_local":
                 pcfg = self.models[pid]
@@ -1027,7 +1352,6 @@ class Orchestrator:
                     except Exception as e:
                         logger.warning("Priority VRAM preload for %s skipped: %s", pid, e)
 
-        # If VRAM headroom is tight (< 1.5 GB), offload non-priority inactive models to RAM
         if hw.get("vram_free_gb", 0) < 1.5:
             for m_id, m_cfg in list(self.models.items()):
                 if m_cfg.get("provider") == "gguf_local" and m_id not in priority_ids:
@@ -1066,11 +1390,6 @@ class Orchestrator:
         return vote_req
 
     def _execute_tool_sync(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
-        """Runs a tool from synchronous code.
-
-        Loop discovery is separated from tool execution so a failing tool is never silently
-        retried - and therefore executed twice - by a catch-all fallback.
-        """
         try:
             running_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
         except RuntimeError:
@@ -1095,7 +1414,6 @@ class Orchestrator:
         return running_loop.run_until_complete(self._execute_tool_async(tool_name, args, caller_id))
 
     async def _execute_tool_async(self, tool_name: str, args: Dict[str, Any], caller_id: str = "Admin") -> Dict[str, Any]:
-        # Lock write tools during discussion phase
         current_phase = self.memory_manager.get_phase()
         if current_phase == "discussion" and tool_name in ["write_file", "patch_file", "bot_workspace_write", "bot_workspace_merge"]:
             return {
@@ -1119,10 +1437,29 @@ class Orchestrator:
                 query = args.get("query", "")
                 self.set_model_live_status(caller_id, f"Searching web for '{query}'")
                 return await self.tool_manager.internet_search(query, domain_filter=args.get("domain_filter"))
+            elif tool_name in ["web_fetch", "web_open"]:
+                url = args.get("url", "")
+                max_chars = args.get("max_chars", 4000)
+                self.set_model_live_status(caller_id, f"Retrieving web page {url[:30]}...")
+                return await self.tool_manager.web_fetch(url, max_chars=max_chars)
             elif tool_name == "search_huggingface":
                 query = args.get("query", "")
                 self.set_model_live_status(caller_id, f"Researching HuggingFace for '{query}'")
                 return await self.tool_manager.search_huggingface(query, limit=args.get("limit", 5))
+            elif tool_name == "patch_file":
+                filepath = args.get("filepath", "")
+                search_block = args.get("search_block", "")
+                replace_block = args.get("replace_block", "")
+                self.set_model_live_status(caller_id, f"Patching {filepath}")
+                res = self.tool_manager.patch_file(filepath, search_block, replace_block, bot_id=caller_id)
+                if res.get("success"):
+                    self.memory_manager.log_file_edit(
+                        filepath=filepath,
+                        author=caller_id,
+                        action="patch",
+                        diff_snippet=f"Patched block in {filepath}"
+                    )
+                return res
             elif tool_name == "copy_file":
                 src = args.get("src", "")
                 dest = args.get("dest", "")
@@ -1162,7 +1499,6 @@ class Orchestrator:
                 self.set_model_live_status(caller_id, f"Writing workspace sandbox {filepath}")
                 res = self.tool_manager.bot_workspace_write(bot_id=caller_id, filepath=filepath, content=args.get("content", ""))
                 if res.get("success") and filepath.endswith(".py"):
-                    # Auto-trigger isolated out-of-chat self-refinement feedback loop on Python write failure
                     asyncio.create_task(self.trigger_sandbox_refinement_loop(bot_id=caller_id, filepath=filepath))
                 return res
             elif tool_name == "bot_workspace_merge":

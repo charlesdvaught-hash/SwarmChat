@@ -3,8 +3,10 @@
 node_modules/
 frontend/node_modules/
 .swarmchat/
+.test_*
 __pycache__/
 *.pyc
 *.pyo
 .DS_Store
 .venv/
+*.log
