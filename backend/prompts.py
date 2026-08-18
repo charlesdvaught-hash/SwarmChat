@@ -9,8 +9,13 @@ Supports placeholders:
 """
 
 import json
+import logging
 import os
 from typing import Dict, Any, Optional, List
+
+from backend.errors import MemoryPersistenceError
+
+logger = logging.getLogger(__name__)
 
 SETTINGS_FILE = os.path.join(".swarmchat", "prompt_templates.json")
 
@@ -95,24 +100,40 @@ class PromptTemplateManager:
             "custom_role_prompts": {},
             "per_model_prompts": {}  # model_id -> {"start_prompt": str, "execution_prompt": str}
         }
+        self.last_load_error: Optional[str] = None
         self.load_templates()
 
     def load_templates(self):
-        if os.path.exists(self.storage_path):
-            try:
-                with open(self.storage_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    self.templates.update(data)
-            except Exception as e:
-                print(f"Error loading prompt templates: {e}")
+        """Loads saved templates, keeping defaults and recording the reason when the file is unusable."""
+        self.last_load_error = None
+        if not os.path.exists(self.storage_path):
+            return
+        try:
+            with open(self.storage_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self.last_load_error = f"Could not load prompt templates from '{self.storage_path}': {e}"
+            logger.error(self.last_load_error)
+            return
+        if not isinstance(data, dict):
+            self.last_load_error = (
+                f"Prompt template file '{self.storage_path}' contains {type(data).__name__}, expected object."
+            )
+            logger.error(self.last_load_error)
+            return
+        self.templates.update(data)
 
     def save_templates(self):
+        """Persists templates, raising so an API caller learns the edit was not stored."""
         try:
             os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
             with open(self.storage_path, "w", encoding="utf-8") as f:
                 json.dump(self.templates, f, indent=2)
-        except Exception as e:
-            print(f"Error saving prompt templates: {e}")
+        except (OSError, TypeError, ValueError) as e:
+            logger.exception("Failed to persist prompt templates to %s", self.storage_path)
+            raise MemoryPersistenceError(
+                f"Failed to persist prompt templates to '{self.storage_path}': {e}"
+            ) from e
 
     def update_templates(
         self,

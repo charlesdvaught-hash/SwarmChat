@@ -1,10 +1,14 @@
+import logging
 import os
 import json
 import shutil
 import subprocess
 import py_compile
+import time
 import httpx
 from typing import Dict, Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 class ToolManager:
     def __init__(self, workspace_root: str = "."):
@@ -69,8 +73,9 @@ class ToolManager:
             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
             return {"success": True, "filepath": filepath, "content": content}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        except OSError as e:
+            logger.warning("Failed to read %s: %s", full_path, e)
+            return {"success": False, "error": f"Failed to read '{filepath}': {e}"}
 
     def list_files(self, rel_dir: str = ".", bot_id: Optional[str] = None) -> Dict[str, Any]:
         root = self.get_bot_workspace_dir(bot_id) if bot_id else self.workspace_root
@@ -90,11 +95,13 @@ class ToolManager:
                     "path": os.path.relpath(p, self.workspace_root)
                 })
             return {"success": True, "items": items}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        except OSError as e:
+            logger.warning("Failed to list %s: %s", full_path, e)
+            return {"success": False, "error": f"Failed to list '{rel_dir}': {e}"}
 
     def search_workspace(self, query: str) -> Dict[str, Any]:
         results = []
+        skipped: List[Dict[str, str]] = []
         try:
             for root, dirs, files in os.walk(self.workspace_root):
                 dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ["node_modules", "__pycache__", "venv"]]
@@ -114,11 +121,20 @@ class ToolManager:
                                     })
                                     if len(results) >= 50:
                                         break
-                    except Exception:
-                        pass
-            return {"success": True, "query": query, "results": results}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+                    except OSError as e:
+                        # Unreadable files are reported back so callers know the search was partial.
+                        logger.debug("Skipping unreadable file %s during search: %s", rel_path, e)
+                        skipped.append({"filepath": rel_path, "error": str(e)})
+            return {
+                "success": True,
+                "query": query,
+                "results": results,
+                "skipped_files": skipped,
+                "partial": bool(skipped)
+            }
+        except OSError as e:
+            logger.warning("Workspace search failed: %s", e)
+            return {"success": False, "error": f"Workspace search failed: {e}"}
 
     async def internet_search(self, query: str, domain_filter: Optional[str] = None) -> Dict[str, Any]:
         domains = self.allowed_domains
@@ -132,24 +148,40 @@ class ToolManager:
         try:
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 resp = await client.get(f"https://html.duckduckgo.com/html/?q={query}")
-                if resp.status_code == 200:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    for a in soup.find_all("a", class_="result__url", limit=5):
-                        href = a.get("href", "")
-                        title = a.get_text(strip=True)
-                        results.append({"title": title, "url": href, "snippet": title})
-        except Exception:
-            pass
+        except httpx.HTTPError as e:
+            logger.warning("Internet search request failed for '%s': %s", query, e)
+            return {
+                "success": False,
+                "query": query,
+                "allowed_domains": domains,
+                "error": f"Internet search request failed: {e}"
+            }
 
-        if not results:
-            results = [
-                {
-                    "title": f"Documentation resource for '{query}'",
-                    "url": f"https://{domains[0] if domains else 'huggingface.co'}/search?q={query}",
-                    "snippet": f"Search result placeholder for '{query}' within allowed domain policy."
-                }
-            ]
+        if resp.status_code != 200:
+            logger.warning("Internet search returned HTTP %s for '%s'", resp.status_code, query)
+            return {
+                "success": False,
+                "query": query,
+                "allowed_domains": domains,
+                "error": f"Internet search returned HTTP {resp.status_code}."
+            }
+
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError as e:
+            logger.error("beautifulsoup4 is required for internet search: %s", e)
+            return {
+                "success": False,
+                "query": query,
+                "allowed_domains": domains,
+                "error": "beautifulsoup4 is not installed; cannot parse search results."
+            }
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", class_="result__url", limit=5):
+            href = a.get("href", "")
+            title = a.get_text(strip=True)
+            results.append({"title": title, "url": href, "snippet": title})
 
         return {
             "success": True,
@@ -164,65 +196,94 @@ class ToolManager:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(url)
-                if resp.status_code == 200:
-                    models_data = resp.json()
-                    formatted = []
-                    for m in models_data:
-                        m_id = m.get("id", "")
-                        downloads = m.get("downloads", 0)
-                        likes = m.get("likes", 0)
-                        pipeline_tag = m.get("pipeline_tag", "text-generation")
-                        tags = m.get("tags", [])
-                        is_gguf = any("gguf" in t.lower() for t in tags) or "gguf" in m_id.lower()
-                        formatted.append({
-                            "model_id": m_id,
-                            "url": f"https://huggingface.co/{m_id}",
-                            "downloads": downloads,
-                            "likes": likes,
-                            "pipeline_tag": pipeline_tag,
-                            "is_gguf": is_gguf,
-                            "tags": tags[:6]
-                        })
-                    return {
-                        "success": True,
-                        "query": clean_q,
-                        "count": len(formatted),
-                        "models": formatted
-                    }
-        except Exception as e:
-            pass
+        except httpx.HTTPError as e:
+            logger.warning("HuggingFace search request failed for '%s': %s", clean_q, e)
+            return {
+                "success": False,
+                "query": clean_q,
+                "count": 0,
+                "models": [],
+                "error": f"HuggingFace search request failed: {e}"
+            }
+
+        if resp.status_code != 200:
+            logger.warning("HuggingFace search returned HTTP %s for '%s'", resp.status_code, clean_q)
+            return {
+                "success": False,
+                "query": clean_q,
+                "count": 0,
+                "models": [],
+                "error": f"HuggingFace API returned HTTP {resp.status_code}: {resp.text[:200]}"
+            }
+
+        try:
+            models_data = resp.json()
+        except ValueError as e:
+            logger.warning("HuggingFace search returned non-JSON payload: %s", e)
+            return {
+                "success": False,
+                "query": clean_q,
+                "count": 0,
+                "models": [],
+                "error": f"HuggingFace API returned an unparseable payload: {e}"
+            }
+
+        formatted = []
+        for m in models_data:
+            m_id = m.get("id", "")
+            tags = m.get("tags", [])
+            formatted.append({
+                "model_id": m_id,
+                "url": f"https://huggingface.co/{m_id}",
+                "downloads": m.get("downloads", 0),
+                "likes": m.get("likes", 0),
+                "pipeline_tag": m.get("pipeline_tag", "text-generation"),
+                "is_gguf": any("gguf" in t.lower() for t in tags) or "gguf" in m_id.lower(),
+                "tags": tags[:6]
+            })
 
         return {
             "success": True,
             "query": clean_q,
-            "count": 1,
-            "models": [
-                {
-                    "model_id": f"TheBloke/{clean_q.replace(' ', '-')}-GGUF",
-                    "url": f"https://huggingface.co/TheBloke/{clean_q.replace(' ', '-')}-GGUF",
-                    "downloads": 1250,
-                    "likes": 42,
-                    "pipeline_tag": "text-generation",
-                    "is_gguf": True,
-                    "tags": ["gguf", "llama", "text-generation"]
-                }
-            ]
+            "count": len(formatted),
+            "models": formatted
         }
+
+    def _run_git(self, args: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.workspace_root,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
 
     def git_status(self) -> Dict[str, Any]:
         try:
-            res = subprocess.check_output(["git", "status", "--porcelain"], cwd=self.workspace_root, text=True)
-            branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=self.workspace_root, text=True).strip()
-            return {"success": True, "branch": branch, "changes": res.strip().split("\n") if res.strip() else []}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            status = self._run_git(["status", "--porcelain"])
+            if status.returncode != 0:
+                return {"success": False, "error": f"git status failed: {status.stderr.strip()}"}
+            branch = self._run_git(["branch", "--show-current"])
+            if branch.returncode != 0:
+                return {"success": False, "error": f"git branch failed: {branch.stderr.strip()}"}
+            return {
+                "success": True,
+                "branch": branch.stdout.strip(),
+                "changes": status.stdout.strip().split("\n") if status.stdout.strip() else []
+            }
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.warning("git status could not be run: %s", e)
+            return {"success": False, "error": f"git status could not be run: {e}"}
 
     def git_diff(self) -> Dict[str, Any]:
         try:
-            res = subprocess.check_output(["git", "diff"], cwd=self.workspace_root, text=True)
-            return {"success": True, "diff": res}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            res = self._run_git(["diff"])
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.warning("git diff could not be run: %s", e)
+            return {"success": False, "error": f"git diff could not be run: {e}"}
+        if res.returncode != 0:
+            return {"success": False, "error": f"git diff failed: {res.stderr.strip()}"}
+        return {"success": True, "diff": res.stdout}
 
     def validate_file_syntax(self, full_path: str) -> Dict[str, Any]:
         """Validates Python/JSON file syntax prior to merging."""
@@ -230,15 +291,19 @@ class ToolManager:
             try:
                 py_compile.compile(full_path, doraise=True)
                 return {"valid": True}
-            except Exception as e:
-                return {"valid": False, "error": f"Python syntax error: {str(e)}"}
+            except py_compile.PyCompileError as e:
+                return {"valid": False, "error": f"Python syntax error: {e}"}
+            except OSError as e:
+                return {"valid": False, "error": f"Could not compile '{full_path}': {e}"}
         elif full_path.endswith(".json"):
             try:
                 with open(full_path, "r", encoding="utf-8") as f:
                     json.load(f)
                 return {"valid": True}
-            except Exception as e:
-                return {"valid": False, "error": f"JSON syntax error: {str(e)}"}
+            except json.JSONDecodeError as e:
+                return {"valid": False, "error": f"JSON syntax error: {e}"}
+            except OSError as e:
+                return {"valid": False, "error": f"Could not read '{full_path}': {e}"}
         return {"valid": True}
 
     def bot_workspace_write(self, bot_id: str, filepath: str, content: str) -> Dict[str, Any]:
@@ -254,7 +319,7 @@ class ToolManager:
 
             # Syntax verification
             syntax_res = self.validate_file_syntax(full_path)
-            return {
+            res = {
                 "success": syntax_res["valid"],
                 "filepath": filepath,
                 "bytes_written": len(content),
@@ -262,8 +327,12 @@ class ToolManager:
                 "syntax_valid": syntax_res["valid"],
                 "syntax_error": syntax_res.get("error")
             }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+            if not syntax_res["valid"]:
+                res["error"] = syntax_res.get("error", "Syntax validation failed.")
+            return res
+        except OSError as e:
+            logger.warning("Sandbox write failed for %s/%s: %s", bot_id, filepath, e)
+            return {"success": False, "error": f"Sandbox write failed for '{filepath}': {e}"}
 
     def bot_workspace_merge_to_main(self, bot_id: str, filepath: str) -> Dict[str, Any]:
         """Validates and merges a file from bot workspace into main repository with git commit / rollback."""
@@ -278,32 +347,70 @@ class ToolManager:
         if not syntax_res["valid"]:
             return {"success": False, "error": f"Merge rejected due to syntax error: {syntax_res.get('error')}"}
 
+        # Keep a backup of the destination so a failed merge can be rolled back.
+        backup_path: Optional[str] = None
+        if os.path.exists(dest_path):
+            backup_path = f"{dest_path}.swarmchat-backup-{int(time.time() * 1000)}"
+            try:
+                shutil.copy2(dest_path, backup_path)
+            except OSError as e:
+                logger.warning("Could not back up %s before merge: %s", dest_path, e)
+                return {"success": False, "error": f"Could not back up '{filepath}' before merge: {e}"}
+
         try:
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
             shutil.copy2(src_path, dest_path)
-
-            # Auto git commit
-            try:
-                subprocess.run(["git", "add", filepath], cwd=self.workspace_root, capture_output=True, text=True)
-                commit_res = subprocess.run(
-                    ["git", "commit", "-m", f"Incremental bot update by {bot_id}: {filepath}"],
-                    cwd=self.workspace_root,
-                    capture_output=True,
-                    text=True
-                )
-                committed = (commit_res.returncode == 0)
-            except Exception:
-                committed = False
-
+        except OSError as e:
+            rollback_error = self._restore_backup(dest_path, backup_path)
+            logger.warning("Merge of %s failed: %s", filepath, e)
             return {
-                "success": True,
-                "filepath": filepath,
-                "bot_id": bot_id,
-                "git_committed": committed
+                "success": False,
+                "error": f"Merge failed with error: {e}",
+                "rolled_back": rollback_error is None,
+                "rollback_error": rollback_error
             }
-        except Exception as e:
-            # Rollback file copy
-            return {"success": False, "error": f"Merge failed with error: {str(e)}"}
+
+        git_error: Optional[str] = None
+        committed = False
+        try:
+            add_res = self._run_git(["add", filepath])
+            if add_res.returncode != 0:
+                git_error = f"git add failed: {add_res.stderr.strip()}"
+            else:
+                commit_res = self._run_git(["commit", "-m", f"Incremental bot update by {bot_id}: {filepath}"])
+                committed = commit_res.returncode == 0
+                if not committed:
+                    git_error = f"git commit failed: {(commit_res.stderr or commit_res.stdout).strip()}"
+        except (subprocess.SubprocessError, OSError) as e:
+            git_error = f"git commit could not be run: {e}"
+
+        if git_error:
+            logger.warning("Merge of %s was written but not committed: %s", filepath, git_error)
+
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError as e:
+                logger.debug("Could not remove merge backup %s: %s", backup_path, e)
+
+        return {
+            "success": True,
+            "filepath": filepath,
+            "bot_id": bot_id,
+            "git_committed": committed,
+            "git_error": git_error
+        }
+
+    def _restore_backup(self, dest_path: str, backup_path: Optional[str]) -> Optional[str]:
+        """Restores dest_path from backup_path. Returns an error string when rollback itself failed."""
+        if not backup_path:
+            return None
+        try:
+            shutil.move(backup_path, dest_path)
+            return None
+        except OSError as e:
+            logger.error("Rollback of %s from %s failed: %s", dest_path, backup_path, e)
+            return f"Rollback failed; backup retained at '{backup_path}': {e}"
 
     def copy_file(self, src: str, dest: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
         """Copies or clones a file within the workspace or bot sandbox."""
@@ -323,8 +430,9 @@ class ToolManager:
             os.makedirs(os.path.dirname(full_dest), exist_ok=True)
             shutil.copy2(full_src, full_dest)
             return {"success": True, "src": src, "dest": dest}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        except OSError as e:
+            logger.warning("Copy %s -> %s failed: %s", full_src, full_dest, e)
+            return {"success": False, "error": f"Copy '{src}' -> '{dest}' failed: {e}"}
 
     def write_file(self, filepath: str, content: str, bot_id: Optional[str] = None) -> Dict[str, Any]:
         """Standard write tool. If bot_id is provided, writes to bot workspace first."""
@@ -344,10 +452,11 @@ class ToolManager:
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
             return {"success": True, "filepath": filepath, "bytes_written": len(content)}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        except OSError as e:
+            logger.warning("Write of %s failed: %s", full_path, e)
+            return {"success": False, "error": f"Write of '{filepath}' failed: {e}"}
 
-    def run_terminal_cmd(self, command: str) -> Dict[str, Any]:
+    def run_terminal_cmd(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         try:
             res = subprocess.run(
                 command,
@@ -355,13 +464,25 @@ class ToolManager:
                 cwd=self.workspace_root,
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=timeout
             )
+        except subprocess.TimeoutExpired as e:
+            logger.warning("Terminal command timed out after %ss: %s", timeout, command)
             return {
-                "success": res.returncode == 0,
-                "returncode": res.returncode,
-                "stdout": res.stdout,
-                "stderr": res.stderr
+                "success": False,
+                "timed_out": True,
+                "error": f"Command timed out after {timeout}s.",
+                "stdout": e.stdout if isinstance(e.stdout, str) else "",
+                "stderr": e.stderr if isinstance(e.stderr, str) else ""
             }
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        except OSError as e:
+            logger.warning("Terminal command could not be started: %s", e)
+            return {"success": False, "error": f"Command could not be started: {e}"}
+
+        return {
+            "success": res.returncode == 0,
+            "returncode": res.returncode,
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+            "error": None if res.returncode == 0 else f"Command exited with code {res.returncode}."
+        }

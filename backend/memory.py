@@ -1,7 +1,12 @@
 import os
 import json
+import logging
 import time
 from typing import Dict, Any, List, Optional
+
+from backend.errors import MemoryPersistenceError
+
+logger = logging.getLogger(__name__)
 
 class MemoryManager:
     def __init__(self, storage_dir: str = ".swarmchat", project_id: str = "default_project"):
@@ -27,7 +32,14 @@ class MemoryManager:
             "tokens_used": {},
             "session_id": "default_session"
         }
-        self.load_memory()
+        # Startup must not hard-fail on a damaged archive, but the failure has to stay visible:
+        # load_memory() quarantines the bad file and the reason is exposed via last_load_error.
+        self.last_load_error: Optional[str] = None
+        try:
+            self.load_memory()
+        except MemoryPersistenceError as e:
+            self.last_load_error = str(e)
+            logger.error("Shared memory could not be loaded: %s", e)
 
     def get_project_id(self) -> str:
         return self.project_id
@@ -43,21 +55,41 @@ class MemoryManager:
             self.load_memory()
 
     def load_memory(self):
-        if os.path.exists(self.json_path):
+        """Loads persisted state, quarantining an unreadable archive instead of overwriting it."""
+        if not os.path.exists(self.json_path):
+            return
+        try:
+            with open(self.json_path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            quarantine_path = f"{self.json_path}.corrupt-{int(time.time())}"
             try:
-                with open(self.json_path, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                    self.state.update(saved)
-            except Exception as e:
-                print(f"Error loading shared memory: {e}")
+                os.replace(self.json_path, quarantine_path)
+            except OSError:
+                logger.exception("Could not quarantine unreadable memory archive %s", self.json_path)
+                raise MemoryPersistenceError(
+                    f"Shared memory at '{self.json_path}' is unreadable and could not be quarantined: {e}"
+                ) from e
+            raise MemoryPersistenceError(
+                f"Shared memory at '{self.json_path}' was unreadable ({e}); "
+                f"it has been preserved at '{quarantine_path}' and a fresh archive will be started."
+            ) from e
+
+        if not isinstance(saved, dict):
+            raise MemoryPersistenceError(
+                f"Shared memory at '{self.json_path}' has unexpected type {type(saved).__name__}, expected object."
+            )
+        self.state.update(saved)
 
     def save_memory(self):
+        """Persists state to disk. Raises MemoryPersistenceError so callers never assume a silent success."""
         try:
             with open(self.json_path, "w", encoding="utf-8") as f:
                 json.dump(self.state, f, indent=2)
-            self._render_markdown_archive()
-        except Exception as e:
-            print(f"Error saving shared memory: {e}")
+        except (OSError, TypeError, ValueError) as e:
+            logger.exception("Failed to persist shared memory to %s", self.json_path)
+            raise MemoryPersistenceError(f"Failed to persist shared memory to '{self.json_path}': {e}") from e
+        self._render_markdown_archive()
 
     def _render_markdown_archive(self):
         try:
@@ -107,20 +139,27 @@ class MemoryManager:
 
             with open(self.md_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
-        except Exception as e:
-            print(f"Error rendering markdown archive: {e}")
+        except (OSError, TypeError, ValueError) as e:
+            logger.exception("Failed to render markdown archive to %s", self.md_path)
+            raise MemoryPersistenceError(f"Failed to render markdown archive '{self.md_path}': {e}") from e
+
+    VALID_PHASES = ("discussion", "execution")
 
     def set_phase(self, new_phase: str) -> str:
-        if new_phase.lower() in ["discussion", "execution"]:
-            old_phase = self.state["phase"]
-            self.state["phase"] = new_phase.lower()
-            self.state["phase_last_changed"] = time.time()
-            self.add_entry(
-                author="System State Machine",
-                content=f"Phase switched from '{old_phase.upper()}' to '{new_phase.upper()}'."
+        """Switches phase. Raises ValueError on an unknown phase instead of silently keeping the old one."""
+        normalized = (new_phase or "").strip().lower()
+        if normalized not in self.VALID_PHASES:
+            raise ValueError(
+                f"Unknown phase '{new_phase}'. Valid phases: {', '.join(self.VALID_PHASES)}."
             )
-            self.save_memory()
-            return self.state["phase"]
+        old_phase = self.state["phase"]
+        self.state["phase"] = normalized
+        self.state["phase_last_changed"] = time.time()
+        self.add_entry(
+            author="System State Machine",
+            content=f"Phase switched from '{old_phase.upper()}' to '{normalized.upper()}'."
+        )
+        self.save_memory()
         return self.state["phase"]
 
     def get_phase(self) -> str:
@@ -178,8 +217,9 @@ class MemoryManager:
         try:
             with open(journal_path, "w", encoding="utf-8") as f:
                 json.dump(self.state["model_journals"][model_id], f, indent=2)
-        except Exception:
-            pass
+        except (OSError, TypeError, ValueError) as e:
+            logger.exception("Failed to write per-model journal for %s", model_id)
+            raise MemoryPersistenceError(f"Failed to write journal for model '{model_id}': {e}") from e
 
         # Automatically generate a NAC-style Episode checkpoint on Nap
         self.record_episode(
@@ -218,6 +258,7 @@ class MemoryManager:
         return task
 
     def update_itinerary_task(self, task_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Applies updates to a task, or returns None when the task id is unknown."""
         for task in self.state.get("task_itinerary", []):
             if task["id"] == task_id:
                 task.update(updates)
@@ -300,8 +341,9 @@ class MemoryManager:
         try:
             with open(spec_path, "w", encoding="utf-8") as f:
                 f.write(content)
-        except Exception:
-            pass
+        except OSError as e:
+            logger.exception("Failed to write spec notebook for %s", model_id)
+            raise MemoryPersistenceError(f"Failed to write spec file for model '{model_id}': {e}") from e
 
         self.save_memory()
         return content

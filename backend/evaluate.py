@@ -1,14 +1,24 @@
+import logging
 import time
 import asyncio
 from typing import Dict, Any, List
+from backend.errors import ModelInvocationError
 from backend.models import ModelManager
+
+logger = logging.getLogger(__name__)
 
 class EvaluateEngine:
     def __init__(self, model_manager: ModelManager):
         self.model_manager = model_manager
 
     async def run_candidate_evaluation(self, candidates: List[Dict[str, Any]], task_context: str) -> Dict[str, Any]:
+        """Trials every candidate.
+
+        A candidate whose backend fails is ranked last with its error attached, so a broken
+        candidate neither aborts the batch nor gets scored as if it had answered.
+        """
         results = []
+        errors: List[Dict[str, str]] = []
 
         for candidate in candidates:
             cand_id = candidate.get("id", "cand_unknown")
@@ -16,18 +26,34 @@ class EvaluateEngine:
             role = candidate.get("role", "Architect")
 
             disc_prompt = f"Evaluate task context in Discussion Phase as {role}. Context: {task_context[:200]}"
-            disc_resp = await self.model_manager.generate_response(
-                model_config=candidate,
-                system_prompt="Provide a philosophical, requirement-clarifying response.",
-                messages=[{"role": "user", "content": disc_prompt}]
-            )
-
             exec_prompt = f"Perform task in Execution Phase as {role}. Context: {task_context[:200]}"
-            exec_resp = await self.model_manager.generate_response(
-                model_config=candidate,
-                system_prompt="Provide concrete task execution plan and code.",
-                messages=[{"role": "user", "content": exec_prompt}]
-            )
+            try:
+                disc_resp = await self.model_manager.generate_response(
+                    model_config=candidate,
+                    system_prompt="Provide a philosophical, requirement-clarifying response.",
+                    messages=[{"role": "user", "content": disc_prompt}]
+                )
+                exec_resp = await self.model_manager.generate_response(
+                    model_config=candidate,
+                    system_prompt="Provide concrete task execution plan and code.",
+                    messages=[{"role": "user", "content": exec_prompt}]
+                )
+            except ModelInvocationError as e:
+                logger.warning("Candidate %s could not be evaluated: %s", cand_id, e)
+                errors.append({"candidate_id": cand_id, "error": str(e)})
+                results.append({
+                    "candidate_id": cand_id,
+                    "candidate_name": cand_name,
+                    "role": role,
+                    "discussion_score": 0,
+                    "execution_score": 0,
+                    "overall_score": 0.0,
+                    "error": str(e),
+                    "critic_qualitative_comment": f"Could not be evaluated: {e}",
+                    "discussion_sample": "",
+                    "execution_sample": ""
+                })
+                continue
 
             disc_score = min(85 + len(disc_resp) % 15, 98)
             exec_score = min(80 + len(exec_resp) % 20, 96)
@@ -50,11 +76,14 @@ class EvaluateEngine:
         for idx, res in enumerate(results, 1):
             res["rank"] = idx
 
+        scored = [r for r in results if not r.get("error")]
         return {
+            "success": not errors,
             "timestamp": time.time(),
             "task_context": task_context,
             "rankings": results,
-            "top_recommendation": results[0]["candidate_name"] if results else "None"
+            "errors": errors,
+            "top_recommendation": scored[0]["candidate_name"] if scored else "None"
         }
 
     def evaluate_room_health(self, active_models: Dict[str, Dict[str, Any]], chat_history: List[Dict[str, Any]], tokens_used: Dict[str, int]) -> Dict[str, Any]:

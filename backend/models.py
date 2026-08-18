@@ -1,10 +1,16 @@
+import logging
 import os
 import sys
+import time
 import psutil
 import shutil
 import subprocess
 import httpx
 from typing import Dict, Any, List, Optional
+
+from backend.errors import ModelInvocationError, ModelLoadError, ProviderNotConfiguredError
+
+logger = logging.getLogger(__name__)
 
 class ModelManager:
     def __init__(self, ollama_host: str = "http://localhost:11434"):
@@ -62,13 +68,15 @@ class ModelManager:
         # 3. Case-insensitive basename search in search_dirs
         for sdir in search_dirs:
             try:
-                for entry in os.listdir(sdir):
-                    if entry.lower() == basename.lower():
-                        full = os.path.join(sdir, entry)
-                        if os.path.isfile(full):
-                            return os.path.abspath(full)
-            except Exception:
-                pass
+                entries = os.listdir(sdir)
+            except OSError as e:
+                logger.warning("Skipping unreadable model search directory %s: %s", sdir, e)
+                continue
+            for entry in entries:
+                if entry.lower() == basename.lower():
+                    full = os.path.join(sdir, entry)
+                    if os.path.isfile(full):
+                        return os.path.abspath(full)
 
         return None
 
@@ -107,9 +115,22 @@ class ModelManager:
                 res2 = subprocess.run(fallback_cmd, env=env, capture_output=True, text=True, timeout=180)
                 if res2.returncode == 0:
                     return {"success": True, "message": "Successfully installed standard llama-cpp-python engine."}
-                return {"success": False, "error": f"Installation failed: {res.stderr or res.stdout}"}
-        except Exception as e:
-            return {"success": False, "error": f"Error during engine installation: {str(e)}"}
+                logger.error(
+                    "llama-cpp-python installation failed (primary and fallback attempts). primary=%s fallback=%s",
+                    res.stderr or res.stdout,
+                    res2.stderr or res2.stdout,
+                )
+                return {
+                    "success": False,
+                    "error": f"Installation failed: {res2.stderr or res2.stdout}",
+                    "primary_attempt_error": res.stderr or res.stdout,
+                }
+        except subprocess.TimeoutExpired as e:
+            logger.exception("llama-cpp-python installation timed out")
+            return {"success": False, "error": f"Engine installation timed out after {e.timeout}s.", "timed_out": True}
+        except OSError as e:
+            logger.exception("llama-cpp-python installation could not be started")
+            return {"success": False, "error": f"Error during engine installation: {e}"}
 
     def update_model_status(self, model_id: str, status: str, error: Optional[str] = None, tok_per_sec: Optional[float] = None, vram_used_gb: float = 0.0, location: str = "RAM"):
         current = self.model_statuses.get(model_id, {})
@@ -121,31 +142,24 @@ class ModelManager:
             "location": location  # "VRAM", "RAM", or "Cloud"
         }
 
-    def unload_gguf_model(self, model_id: str):
-        if model_id in self.gguf_instances:
-            try:
-                del self.gguf_instances[model_id]
-            except Exception:
-                pass
+    def unload_gguf_model(self, model_id: str) -> bool:
+        """Drops a loaded GGUF instance. Returns True when a model was actually unloaded."""
+        return self.gguf_instances.pop(model_id, None) is not None
 
     def load_gguf_model(self, model_id: str, gguf_path: str, max_tokens: int = 2048, mmproj_path: Optional[str] = None, force_device: Optional[str] = None) -> Optional[Any]:
         if not self.is_llama_cpp_installed():
-            self.update_model_status(
+            self._fail_load(
                 model_id,
-                status="error",
-                error="llama-cpp-python engine not installed. Use 1-click installer in Settings."
+                "llama-cpp-python engine not installed. Use 1-click installer in Settings."
             )
-            return None
 
         resolved_gguf = self.resolve_gguf_path(gguf_path)
         if not resolved_gguf:
             searched = ", ".join(self.get_search_paths())
-            self.update_model_status(
+            self._fail_load(
                 model_id,
-                status="error",
-                error=f"GGUF file not found at: '{gguf_path}'. Searched directories: [{searched}]"
+                f"GGUF file not found at: '{gguf_path}'. Searched directories: [{searched}]"
             )
-            return None
 
         if model_id in self.gguf_instances:
             return self.gguf_instances[model_id]
@@ -172,15 +186,7 @@ class ModelManager:
         chat_handler = None
         resolved_mmproj = self.resolve_gguf_path(mmproj_path) if mmproj_path else None
         if resolved_mmproj:
-            try:
-                from llama_cpp.llama_chat_handler import Llava15ChatHandler
-                chat_handler = Llava15ChatHandler(clip_model_path=resolved_mmproj)
-            except Exception:
-                try:
-                    from llama_cpp.llama_chat_handler import NanoLlavaChatHandler
-                    chat_handler = NanoLlavaChatHandler(clip_model_path=resolved_mmproj)
-                except Exception:
-                    pass
+            chat_handler = self._build_vision_chat_handler(model_id, resolved_mmproj)
 
         try:
             kwargs = {
@@ -204,12 +210,28 @@ class ModelManager:
             )
             return llm
         except Exception as e:
-            self.update_model_status(
-                model_id,
-                status="error",
-                error=f"Failed to load GGUF model: {str(e)}"
-            )
-            return None
+            self._fail_load(model_id, f"Failed to load GGUF model: {e}", cause=e)
+
+    def _fail_load(self, model_id: str, message: str, cause: Optional[BaseException] = None) -> None:
+        """Records a load failure on the model status board and raises it to the caller."""
+        logger.error("GGUF load failure for %s: %s", model_id, message)
+        self.update_model_status(model_id, status="error", error=message)
+        raise ModelLoadError(message, model_id=model_id, provider="gguf_local") from cause
+
+    def _build_vision_chat_handler(self, model_id: str, resolved_mmproj: str) -> Optional[Any]:
+        """Builds a vision projector chat handler, recording (not hiding) why it could not be built."""
+        errors: List[str] = []
+        for handler_name in ("Llava15ChatHandler", "NanoLlavaChatHandler"):
+            try:
+                from llama_cpp import llama_chat_handler
+                return getattr(llama_chat_handler, handler_name)(clip_model_path=resolved_mmproj)
+            except Exception as e:
+                errors.append(f"{handler_name}: {e}")
+        logger.warning(
+            "No vision chat handler could be built for %s from mmproj '%s' (%s); continuing text-only.",
+            model_id, resolved_mmproj, "; ".join(errors)
+        )
+        return None
 
     def get_hardware_info(self) -> Dict[str, Any]:
         mem = psutil.virtual_memory()
@@ -220,6 +242,7 @@ class ModelManager:
         vram_free_gb = 0.0
         vram_total_gb = 0.0
         gpu_name = None
+        gpu_probe_error: Optional[str] = None
 
         nvidia_smi_cmd = shutil.which("nvidia-smi")
         if not nvidia_smi_cmd and os.name == "nt":
@@ -243,14 +266,16 @@ class ModelManager:
                 gpu_name = parts[0].strip()
                 vram_total_gb = round(float(parts[1].strip()) / 1024.0, 2)
                 vram_free_gb = round(float(parts[2].strip()) / 1024.0, 2)
-            except Exception:
-                pass
+            except (subprocess.SubprocessError, OSError, IndexError, ValueError) as e:
+                gpu_probe_error = f"nvidia-smi probe failed: {e}"
+                logger.warning(gpu_probe_error)
 
         return {
             "ram_total_gb": total_ram_gb,
             "ram_available_gb": avail_ram_gb,
             "ram_percent": ram_percent,
             "gpu_name": gpu_name,
+            "gpu_probe_error": gpu_probe_error,
             "vram_total_gb": vram_total_gb,
             "vram_free_gb": vram_free_gb,
             "ollama_available": self.check_ollama_status()
@@ -260,7 +285,8 @@ class ModelManager:
         try:
             resp = httpx.get(f"{self.ollama_host}/api/version", timeout=1.5)
             return resp.status_code == 200
-        except Exception:
+        except httpx.HTTPError as e:
+            logger.debug("Ollama unreachable at %s: %s", self.ollama_host, e)
             return False
 
     def list_ollama_models(self) -> List[str]:
@@ -268,12 +294,17 @@ class ModelManager:
             return []
         try:
             resp = httpx.get(f"{self.ollama_host}/api/tags", timeout=2.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                return [m["name"] for m in data.get("models", [])]
-        except Exception:
-            pass
-        return []
+        except httpx.HTTPError as e:
+            logger.warning("Failed to list Ollama models from %s: %s", self.ollama_host, e)
+            return []
+        if resp.status_code != 200:
+            logger.warning("Ollama tag listing returned HTTP %s: %s", resp.status_code, resp.text[:200])
+            return []
+        try:
+            return [m["name"] for m in resp.json().get("models", [])]
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning("Unexpected Ollama tag listing payload: %s", e)
+            return []
 
     def can_load_model(self, estimated_size_gb: float) -> Dict[str, Any]:
         hw = self.get_hardware_info()
@@ -321,9 +352,14 @@ class ModelManager:
         role = model_config.get("role", "Participant")
         full_messages = normalize_messages_for_gguf(system_prompt, messages, role=role)
 
+        model_id = model_config.get("id", f"{provider}_model")
+
         if provider == "ollama":
             if not self.check_ollama_status():
-                return f"[{model_config.get('name', 'Model')} ({model_name})]: Checked context and discussion goals."
+                self._fail_generation(
+                    model_id, provider,
+                    f"Ollama is not reachable at {self.ollama_host}. Start Ollama or switch the model provider."
+                )
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     options = {
@@ -341,31 +377,44 @@ class ModelManager:
                             "options": options
                         }
                     )
-                    if resp.status_code == 200:
-                        raw_res = resp.json()["message"]["content"]
-                        return sanitize_message_content(raw_res)
-                    else:
-                        return f"Ollama API Error ({resp.status_code}): {resp.text}"
-            except Exception as e:
-                return f"Simulated response due to connection issue ({str(e)})."
+            except httpx.HTTPError as e:
+                self._fail_generation(model_id, provider, f"Ollama request failed: {e}", cause=e)
+
+            if resp.status_code != 200:
+                self._fail_generation(
+                    model_id, provider,
+                    f"Ollama API error {resp.status_code} for model '{model_name}': {resp.text[:300]}"
+                )
+            try:
+                raw_res = resp.json()["message"]["content"]
+            except (ValueError, KeyError, TypeError) as e:
+                self._fail_generation(model_id, provider, f"Unexpected Ollama response payload: {e}", cause=e)
+
+            self.update_model_status(model_id, status="online", error=None)
+            return sanitize_message_content(raw_res)
 
         elif provider in ["claude", "groq", "gemini"]:
             if not api_key:
-                return f"API key missing for provider {provider}. Please configure key in model settings."
-            last_user_msg = messages[-1]["content"] if messages else ""
-            return f"Processed context for '{last_user_msg[:40]}...' via Cloud-{provider}."
+                self._fail_generation(
+                    model_id, provider,
+                    f"API key missing for provider '{provider}'. Configure the key in model settings.",
+                    error_cls=ProviderNotConfiguredError
+                )
+            # Cloud providers are declared in the UI but no client is implemented yet; returning
+            # placeholder prose here would be indistinguishable from a genuine model answer.
+            self._fail_generation(
+                model_id, provider,
+                f"Provider '{provider}' is not implemented yet; no cloud client is wired up.",
+                error_cls=ProviderNotConfiguredError
+            )
 
         elif provider == "gguf_local":
-            import time
-            model_id = model_config.get("id", "gguf_model")
             gguf_path = model_config.get("gguf_path") or model_config.get("model_name", "")
             mmproj_path = model_config.get("mmproj_path") or model_config.get("clip_model_path", "")
             max_tokens = model_config.get("max_context_tokens", 2048)
 
+            # Raises ModelLoadError (a ModelInvocationError) if the model cannot be loaded.
             llm = self.load_gguf_model(model_id, gguf_path, max_tokens, mmproj_path=mmproj_path)
-            if not llm:
-                error_msg = self.model_statuses.get(model_id, {}).get("error", "Unknown GGUF loading error")
-                return f"[{model_config.get('name', 'Model')} Error]: {error_msg}"
 
             try:
                 start_time = time.time()
@@ -392,10 +441,27 @@ class ModelManager:
                     tok_per_sec=tok_per_sec
                 )
                 return sanitize_message_content(content)
+            except (KeyError, IndexError, TypeError, ValueError) as e:
+                self._fail_generation(model_id, provider, f"Unexpected GGUF completion payload: {e}", cause=e)
             except Exception as e:
-                err_str = f"GGUF inference error: {str(e)}"
-                self.update_model_status(model_id, status="error", error=err_str)
-                return f"GGUF Error: {err_str}"
+                self._fail_generation(model_id, provider, f"GGUF inference error: {e}", cause=e)
 
         else:
-            return "Prepared perspective based on shared context."
+            self._fail_generation(
+                model_id, provider,
+                f"Unknown provider '{provider}'. Supported: ollama, gguf_local.",
+                error_cls=ProviderNotConfiguredError
+            )
+
+    def _fail_generation(
+        self,
+        model_id: str,
+        provider: str,
+        message: str,
+        cause: Optional[BaseException] = None,
+        error_cls: type = ModelInvocationError
+    ) -> None:
+        """Records a generation failure on the status board and raises it instead of returning filler text."""
+        logger.error("Generation failure for %s (%s): %s", model_id, provider, message)
+        self.update_model_status(model_id, status="error", error=message)
+        raise error_cls(message, model_id=model_id, provider=provider) from cause
