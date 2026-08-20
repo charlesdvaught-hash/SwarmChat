@@ -600,17 +600,53 @@ def switch_project(req: ProjectReq):
 
 @app.post("/api/projects/delete")
 def delete_project(req: ProjectReq):
-    """Archives a project (memory + workspaces) into trash. The active project cannot
-    be deleted - switch away first, so the running room never loses its own state."""
+    """Archives a project (memory + workspaces) into trash.
+
+    Deleting the ACTIVE project used to be refused outright ("switch away first"). The UI
+    only ever offers the active project for deletion - selecting a project in the switcher
+    IS switching to it - so that refusal made the Delete button impossible to satisfy: the
+    project you had selected was always the one you could not delete. Auto-switch away
+    instead, which is what "switch away first" was asking the user to do by hand anyway.
+
+    The one case still refused is the last project standing - there is nowhere to switch to,
+    and a room with no project has no memory archive, no itinerary and no workspace root.
+    """
     from backend.tools import slugify_project_id
     pid = slugify_project_id(req.project_id)
-    if pid == memory_mgr.get_project_id():
-        raise HTTPException(status_code=400, detail="Switch to another project before deleting this one.")
     pdir = os.path.join(".swarmchat", "projects", pid)
     if not os.path.isdir(pdir):
         raise HTTPException(status_code=404, detail=f"Project '{pid}' not found.")
+
+    switched_to = None
+    if pid == memory_mgr.get_project_id():
+        others = [
+            p["project_id"] for p in memory_mgr.list_projects()
+            if p.get("project_id") and p["project_id"] != pid
+        ]
+        if not others:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"'{pid}' is the only project. Create another project first, then delete "
+                    f"this one."
+                )
+            )
+        # A turn in flight would keep writing into the project we are about to archive.
+        orchestrator.loop_active = False
+        switched_to = orchestrator.set_project(others[0])
+        _save_active_project_id(switched_to)
+
     dest = tool_mgr.move_to_trash(pdir, label=f"project_{pid}")
-    return {"success": True, "trashed_to": dest, "projects": memory_mgr.list_projects()}
+    return {
+        "success": True,
+        "trashed_to": dest,
+        "deleted_project_id": pid,
+        # Non-null when deleting the active project forced a switch, so the UI can say where
+        # the room ended up instead of silently changing under the user.
+        "switched_to": switched_to,
+        "active_project_id": memory_mgr.get_project_id(),
+        "projects": memory_mgr.list_projects()
+    }
 
 @app.get("/api/frontend/status")
 def frontend_status():

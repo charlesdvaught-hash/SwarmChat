@@ -1607,13 +1607,28 @@ export default function App() {
                       </button>
                       <button
                         onClick={async () => {
-                          if (!window.confirm(`Archive project "${activeProjectId}"? Its memory and workspaces move to .swarmchat/trash. Switch to another project first.`)) return;
+                          // Selecting a project in the switcher IS switching to it, so the only
+                          // project this button can ever target is the active one. The backend
+                          // used to refuse exactly that, which made the button impossible to
+                          // satisfy; it now switches the room to another project first.
+                          const fallback = projects.find((p) => p.project_id !== activeProjectId)?.project_id;
+                          if (!fallback) {
+                            window.alert(`"${activeProjectId}" is your only project. Create another one first.`);
+                            return;
+                          }
+                          if (!window.confirm(
+                            `Archive project "${activeProjectId}"?\n\nIts memory, chat history and bot workspaces move to .swarmchat/trash, and the room switches to "${fallback}".`
+                          )) return;
                           await runAction('Deleting the project', async () => {
                             await postJson('/api/projects/delete', { project_id: activeProjectId });
                           });
                           fetchState();
                         }}
-                        className="bg-rose-950/80 hover:bg-rose-900 text-rose-300 border border-rose-900 px-3 py-2 rounded-xl font-medium"
+                        disabled={projects.length < 2}
+                        title={projects.length < 2
+                          ? 'Create a second project before deleting this one'
+                          : 'Archive this project and switch the room to another one'}
+                        className="bg-rose-950/80 hover:bg-rose-900 text-rose-300 border border-rose-900 px-3 py-2 rounded-xl font-medium disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         Delete Project
                       </button>
