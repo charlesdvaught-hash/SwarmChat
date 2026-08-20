@@ -28,6 +28,24 @@ MAX_GENERATION_TOKENS = 3072
 # instead of pinning the room forever.
 GGUF_GENERATION_TIMEOUT_SECONDS = float(os.environ.get("SWARMCHAT_GGUF_TIMEOUT", "300"))
 
+# KV cache quantization.
+#
+# The KV cache is stored at fp16 by default, which on a 12 GB card is the difference between
+# two resident models and one. Quantizing it to q8_0 halves that footprint for a quality cost
+# that is not measurable on these roles. This is the single highest-leverage flag for keeping
+# more than one model resident.
+#
+# Set SWARMCHAT_KV_QUANT=off to restore fp16 (use this to A/B a suspected quality regression).
+# Note: llama.cpp only supports a quantized *V* cache when flash attention is on, so the load
+# ladder below falls back to fp16 KV if flash attention is unavailable in this build.
+_GGML_TYPE_F16 = 1
+_GGML_TYPE_Q8_0 = 8
+KV_CACHE_QUANT = os.environ.get("SWARMCHAT_KV_QUANT", "q8").strip().lower()
+KV_CACHE_QUANTIZED = KV_CACHE_QUANT not in ("off", "0", "false", "f16", "fp16")
+# Bytes per KV element used by the capacity estimator. Must track the flag above or the gate
+# reserves memory the load will never actually take.
+KV_BYTES_PER_ELEMENT = 1 if KV_CACHE_QUANTIZED else 2
+
 # Turn-terminating tokens. Several GGUFs in the wild ship a ChatML chat template but declare
 # a generic EOS (e.g. <|endoftext|>), so llama.cpp never stops at <|im_end|> and the model
 # runs until it hits max_tokens - which reads as "the model rambled and never answered".
@@ -372,11 +390,34 @@ class ModelManager:
             # Flash attention shrinks the KV cache and is what the Qwen3.5 cards ask for
             # (-fa). Not every llama-cpp-python build accepts the argument, so fall back
             # rather than failing the load over it.
-            try:
-                llm = llama_cpp.Llama(flash_attn=True, **kwargs)
-            except (TypeError, ValueError) as e:
-                logger.debug("flash_attn unavailable for %s (%s); loading without it", model_id, e)
-                llm = llama_cpp.Llama(**kwargs)
+            #
+            # Load ladder, best to worst. A quantized V cache REQUIRES flash attention in
+            # llama.cpp, so the two are attempted together and degrade together:
+            #   1. flash attention + q8_0 KV cache   (target: ~half the KV footprint)
+            #   2. flash attention + fp16 KV cache   (old behaviour)
+            #   3. no flash attention, fp16 KV cache (oldest builds)
+            llm = None
+            if KV_CACHE_QUANTIZED:
+                try:
+                    llm = llama_cpp.Llama(
+                        flash_attn=True,
+                        type_k=_GGML_TYPE_Q8_0,
+                        type_v=_GGML_TYPE_Q8_0,
+                        **kwargs
+                    )
+                    logger.info("Loaded %s with q8_0 KV cache (flash attention on)", model_id)
+                except (TypeError, ValueError) as e:
+                    logger.warning(
+                        "q8_0 KV cache unavailable for %s (%s); falling back to fp16 KV. "
+                        "Expect roughly double the KV footprint.",
+                        model_id, e
+                    )
+            if llm is None:
+                try:
+                    llm = llama_cpp.Llama(flash_attn=True, **kwargs)
+                except (TypeError, ValueError) as e:
+                    logger.debug("flash_attn unavailable for %s (%s); loading without it", model_id, e)
+                    llm = llama_cpp.Llama(**kwargs)
 
             # Some GGUFs (base-model conversions, sloppy requants) ship with no chat template
             # at all. llama-cpp-python then silently falls back to a Llama-2 prompt format,
@@ -519,9 +560,13 @@ class ModelManager:
         headroom_gb = 1.5
         effective_avail = max(avail_ram - headroom_gb, 0.0) + avail_vram
 
-        # Account for KV cache + compute buffer overhead (n_ctx * n_layer * n_kv_heads * head_dim * 2 * 2 bytes)
-        # Approximate average LLM layer config: ~32 layers, ~8 KV heads, ~128 head dim for 1-3B models (~0.2 - 0.5 GB at 4k ctx)
-        kv_cache_bytes = n_ctx * 32 * 8 * 128 * 2 * 2
+        # Account for KV cache + compute buffer overhead
+        #   n_ctx * n_layer * n_kv_heads * head_dim * 2 (K and V) * bytes_per_element
+        # Approximate average LLM layer config: ~32 layers, ~8 KV heads, ~128 head dim for 1-3B models.
+        # bytes_per_element tracks KV_CACHE_QUANT: 1 for q8_0, 2 for fp16. Hardcoding 2 here while
+        # loading a q8 cache made the gate reserve twice the memory the load actually took, which
+        # is what evicted a model that would have fit.
+        kv_cache_bytes = n_ctx * 32 * 8 * 128 * 2 * KV_BYTES_PER_ELEMENT
         compute_buffer_bytes = 256 * 1024 * 1024  # ~256MB compute overhead
         overhead_gb = round((kv_cache_bytes + compute_buffer_bytes) / (1024 ** 3), 2)
         total_needed_gb = estimated_size_gb + overhead_gb
