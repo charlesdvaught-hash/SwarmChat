@@ -497,13 +497,30 @@ class Orchestrator:
         return self._architect_id(self.get_active_model_ids())
 
     def _find_model_by_role(self, active_models: List[str], role_substrings: tuple, exclude: Optional[str] = None) -> Optional[str]:
+        """First active model whose role claims one of `role_substrings`.
+
+        `exclude` is a *preference*, not a hard rule. It exists so a Coder does not review
+        its own patch, which is right whenever someone else can. On a collapsed roster
+        nobody else can: the single resident model authored the file and also holds the
+        Critic seat, so a hard exclusion returned None, `_outstanding_work` dropped the
+        task, and it sat on needs_review forever while the room looked busy. Self-review by
+        a model explicitly wearing the Critic hat is weaker than peer review but is not a
+        deadlock - and the Tester stage behind it is deterministic anyway."""
+        fallback = None
         for m_id in active_models:
-            if exclude and m_id == exclude:
-                continue
             role_lower = self.models[m_id].get("role", "").lower()
-            if any(s in role_lower for s in role_substrings):
-                return m_id
-        return None
+            if not any(s in role_lower for s in role_substrings):
+                continue
+            if exclude and m_id == exclude:
+                fallback = fallback or m_id
+                continue
+            return m_id
+        if fallback:
+            logger.info(
+                "No reviewer other than %s holds a %s seat; allowing self-review rather than "
+                "stalling the task.", fallback, "/".join(role_substrings)
+            )
+        return fallback
 
     # --- PRE-EXECUTION PLANNING GATE -------------------------------------------------
     # Discussion used to be shapeless: the round-robin roster picked whoever was next and
@@ -1038,7 +1055,7 @@ class Orchestrator:
         from difflib import SequenceMatcher
         return SequenceMatcher(None, str1, str2).ratio()
 
-    def _build_system_prompt(self, model_id: str, model_cfg: Dict[str, Any], current_phase: str, active_task: Optional[Dict[str, Any]], is_first_turn: bool) -> str:
+    def _build_system_prompt(self, model_id: str, model_cfg: Dict[str, Any], current_phase: str, active_task: Optional[Dict[str, Any]], is_first_turn: bool, seat: Optional[str] = None) -> str:
         # Previously every turn after a model's first collapsed to a one-line
         # "continue contributing concisely" prompt, throwing away the entire role/phase
         # directive block. Small local models then had nothing telling them to emit code,
@@ -1056,7 +1073,18 @@ class Orchestrator:
         )
         if not is_first_turn:
             base += "\n\nYou have already introduced yourself. Do not re-introduce or restate the task - produce the next concrete increment of work."
-        return base + self._role_output_contract(model_cfg, current_phase)
+        if seat is None:
+            seat = self._seat_for_turn(model_cfg, current_phase, active_task)
+        # A multi-seat model is told which hat it is wearing. Without this it reads its own
+        # role line ("Architect/Coder/Critic/Tester") and picks a hat at random each turn.
+        seat_banner = ""
+        if seat and len(self._claimed_seats(model_cfg)) > 1:
+            seat_banner = (
+                f"\n\nYOU ARE SPEAKING AS: {seat.upper()}. You hold several seats in this room, "
+                f"but for THIS turn you are the {seat.title()} and nothing else. Do not answer "
+                f"in any other capacity, and do not debate yourself."
+            )
+        return base + seat_banner + self._role_output_contract(model_cfg, current_phase, seat=seat)
 
     ROLE_OUTPUT_CONTRACTS = {
         "coder": (
@@ -1170,38 +1198,137 @@ class Orchestrator:
         role = (model_cfg.get("role") or "").lower()
         return "architect" in role or "planner" in role
 
-    def _role_output_contract(self, model_cfg: Dict[str, Any], current_phase: str) -> str:
+    # --- SEATS ---------------------------------------------------------------------
+    # A *seat* is what a model is doing on THIS turn. A *role* is what it is allowed to do
+    # in general. They used to be the same thing, because every seat was held by a
+    # different model.
+    #
+    # On a 12 GB card they cannot be. Four 3-4B models at Q4 is ~10 GB of weights before a
+    # single KV byte, so the roster collapses to one resident "brain" holding several seats
+    # (role = "Architect/Coder/Critic/Tester"). The role-substring branches this file used
+    # to rely on then break in three ways:
+    #   - _role_output_contract picked by a fixed if/elif precedence, so a Critic turn on a
+    #     needs_review task was handed the *Coder* contract;
+    #   - the supervisor file-write guard keyed off "architect" in role, so a multi-seat
+    #     model was blocked from ever writing code;
+    #   - the two-call/grammar split was disabled for anything Architect-ish, so the Coder
+    #     seat lost its action schema.
+    #
+    # The seat is derived from what the pipeline actually asked for - task status during
+    # execution, plan stage during discussion - and is only granted if the model's role
+    # genuinely claims it. One-model-per-seat rosters resolve exactly as before.
+    SEAT_ARCHITECT = "architect"
+    SEAT_CODER = "coder"
+    SEAT_CRITIC = "critic"
+    SEAT_TESTER = "tester"
+
+    _SEAT_ROLE_CLAIMS = {
+        SEAT_ARCHITECT: ("architect", "planner"),
+        SEAT_CODER: _PROGRAMMER_ROLES,
+        SEAT_CRITIC: _CRITIC_ROLES,
+        SEAT_TESTER: ("tester", "debugger", "refiner"),
+    }
+
+    _EXECUTION_STATUS_SEATS = {
+        "in_progress": SEAT_CODER,
+        "failed": SEAT_CODER,
+        "needs_review": SEAT_CRITIC,
+        "needs_test": SEAT_TESTER,
+        "pending": SEAT_ARCHITECT,
+    }
+
+    _PLAN_STAGE_SEATS = {
+        "awaiting_plan": SEAT_ARCHITECT,
+        "critic_review": SEAT_CRITIC,
+        "programmer_review": SEAT_CODER,
+        "approved": SEAT_ARCHITECT,
+    }
+
+    def _model_claims_seat(self, model_cfg: Dict[str, Any], seat: Optional[str]) -> bool:
+        """True when this model's role string entitles it to sit in `seat`."""
+        if not seat:
+            return False
+        role = (model_cfg.get("role") or "").lower()
+        return any(s in role for s in self._SEAT_ROLE_CLAIMS.get(seat, ()))
+
+    def _claimed_seats(self, model_cfg: Dict[str, Any]) -> List[str]:
+        """Every seat this model's role entitles it to. Length > 1 means a collapsed roster."""
+        return [
+            seat for seat in
+            (self.SEAT_ARCHITECT, self.SEAT_CODER, self.SEAT_CRITIC, self.SEAT_TESTER)
+            if self._model_claims_seat(model_cfg, seat)
+        ]
+
+    def _default_seat_from_role(self, model_cfg: Dict[str, Any]) -> Optional[str]:
+        """Fallback when the pipeline did not name a seat this model can hold.
+
+        Preserves the exact precedence the old _role_output_contract if/elif chain used, so
+        one-model-per-seat rosters behave identically to before."""
+        for seat in (self.SEAT_CODER, self.SEAT_CRITIC, self.SEAT_TESTER, self.SEAT_ARCHITECT):
+            if self._model_claims_seat(model_cfg, seat):
+                return seat
+        return None
+
+    def _seat_for_turn(
+        self,
+        model_cfg: Dict[str, Any],
+        current_phase: str,
+        active_task: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Which seat this model occupies for this turn, or None if it holds none.
+
+        None is a real answer: during discussion a model that does not own the current gate
+        stage gets no contract, which is exactly what the old code did by falling off the
+        end of its if/elif chain."""
+        if current_phase != "execution":
+            # Discussion is the planning gate; the stage names the seat outright.
+            wanted = self._PLAN_STAGE_SEATS.get(
+                self.memory_manager.get_plan_stage(), self.SEAT_ARCHITECT
+            )
+            return wanted if self._model_claims_seat(model_cfg, wanted) else None
+
+        if active_task:
+            wanted = self._EXECUTION_STATUS_SEATS.get(active_task.get("status"))
+        else:
+            # No pinned task: somebody has to turn intent into work, which is Architect duty.
+            wanted = self.SEAT_ARCHITECT
+        if self._model_claims_seat(model_cfg, wanted):
+            return wanted
+        return self._default_seat_from_role(model_cfg)
+
+    def _role_output_contract(
+        self,
+        model_cfg: Dict[str, Any],
+        current_phase: str,
+        seat: Optional[str] = None,
+    ) -> str:
         """Role-specific, phase-specific instruction on what a *usable* turn looks like.
 
         The generic execution prompt only mentions that fenced code is auto-saved; it never
         tells a 3-4B local model that emitting code is the point. These contracts are the
         difference between the pipeline producing a file and producing chat."""
-        role = (model_cfg.get("role") or "").lower()
+        if seat is None:
+            seat = self._seat_for_turn(model_cfg, current_phase)
+        if seat is None:
+            return ""
+
         if current_phase != "execution":
             # Discussion is now the planning gate, so all three gate seats carry a contract
             # and the Architect's depends on where the gate is. Previously only the Architect
             # had one and it told it to declare readiness on every single turn - which is why
             # plans went to execution without the Critic ever having read them.
-            stage = self.memory_manager.get_plan_stage()
-            if self._is_supervisor(model_cfg):
+            if seat == self.SEAT_ARCHITECT:
+                stage = self.memory_manager.get_plan_stage()
                 key = "architect_approved" if stage == "approved" else "architect_discussion"
                 return self.ROLE_OUTPUT_CONTRACTS[key]
-            if stage == "critic_review" and any(s in role for s in self._CRITIC_ROLES):
+            if seat == self.SEAT_CRITIC:
                 return self.ROLE_OUTPUT_CONTRACTS["critic_discussion"]
-            if stage == "programmer_review" and any(s in role for s in self._PROGRAMMER_ROLES):
+            if seat == self.SEAT_CODER:
                 return self.ROLE_OUTPUT_CONTRACTS["programmer_discussion"]
             return ""
-        if "coder" in role:
-            key = "coder"
-        elif "critic" in role:
-            key = "critic"
-        elif "tester" in role or "debugger" in role or "refiner" in role:
-            key = "tester"
-        elif self._is_supervisor(model_cfg):
-            key = "architect"
-        else:
-            return ""
-        return self.ROLE_OUTPUT_CONTRACTS[key]
+
+        # Execution contracts are keyed by seat name directly.
+        return self.ROLE_OUTPUT_CONTRACTS.get(seat, "")
 
     def _build_episode_context(self, active_task: Optional[Dict[str, Any]] = None) -> str:
         """Handoff checkpoints for THIS task, not the room's last three of anything.
@@ -1378,7 +1505,12 @@ class Orchestrator:
         is_first_turn = model_id not in self.spoken_models
         self.spoken_models.add(model_id)
 
-        sys_prompt = self._build_system_prompt(model_id, model_cfg, current_phase, active_task, is_first_turn)
+        # Which hat this model is wearing for this one turn. Computed once and threaded
+        # through every downstream guard, so a model holding several seats is judged by what
+        # the pipeline asked it to do rather than by the first keyword in its role string.
+        seat = self._seat_for_turn(model_cfg, current_phase, active_task)
+
+        sys_prompt = self._build_system_prompt(model_id, model_cfg, current_phase, active_task, is_first_turn, seat=seat)
         ep_summary = self._build_episode_context(active_task)
         task_context = self._build_task_context(active_task)
         journal_context = self._build_journal_context(latest_journal)
@@ -1536,7 +1668,11 @@ class Orchestrator:
         # grammar-constrained action schema on a second call made small models mirror that
         # JSON back as their actual answer (and it then got saved as a source file). It
         # plans in prose with [UPDATE_TASK: ...] brackets instead, which they emit reliably.
-        if "architect" in role_lower or "planner" in role_lower:
+        #
+        # Keyed on the SEAT, not the role string: a collapsed roster's single model is
+        # Architect-ish by role on every turn, and the old check therefore stripped the
+        # action schema from its Coder and Tester turns too.
+        if seat == self.SEAT_ARCHITECT:
             use_two_call = False
 
         response_text = ""
@@ -1824,7 +1960,7 @@ class Orchestrator:
         if (
             current_phase == "execution"
             and not active_task
-            and ("architect" in role_lower or "planner" in role_lower)
+            and seat == self.SEAT_ARCHITECT
             and "[UPDATE_TASK" not in response_text.upper()
         ):
             plan = self._strip_directive_tags(response_text).strip()
@@ -1854,7 +1990,7 @@ class Orchestrator:
             )
             resp_lower = response_text.lower()
 
-            if "critic" in role_lower and fresh_task.get("status") == "needs_review":
+            if seat == self.SEAT_CRITIC and fresh_task.get("status") == "needs_review":
                 # Verdict resolution, most-trustworthy signal first. A small Critic that
                 # rambles past its token budget used to leave the task on needs_review
                 # forever, and the execution router re-picked the Critic every turn - the
@@ -1876,7 +2012,7 @@ class Orchestrator:
                         logger.info("Critic %s produced no verdict; advancing task to needs_test", model_id)
                     self.memory_manager.update_itinerary_task(fresh_task["id"], {"status": "needs_test"})
 
-            elif ("tester" in role_lower or "debugger" in role_lower) and fresh_task.get("status") == "needs_test":
+            elif seat == self.SEAT_TESTER and fresh_task.get("status") == "needs_test":
                 await self._execute_task_test_run(model_cfg, fresh_task)
 
         # Auto-extract markdown code blocks and save into model workspace, tracking a diff summary
@@ -1887,7 +2023,13 @@ class Orchestrator:
         # write the code yourself") while the extractor below was role-blind, so an Architect
         # that ignored the instruction silently got a file written into its own sandbox -
         # work no Coder owned and no Critic reviewed. Enforce it here instead of asking.
-        if self._is_supervisor(model_cfg) and "```" in response_text:
+        #
+        # Keyed on the SEAT, not the role string. On a collapsed roster the one resident
+        # model holds the Architect seat permanently by role, so `_is_supervisor` was true on
+        # every single turn and this guard threw away ALL of its code - the pipeline could
+        # never produce a file at all. It is the Architect *turn* that may not write, not the
+        # model that is sometimes the Architect.
+        if seat == self.SEAT_ARCHITECT and "```" in response_text:
             logger.info(
                 "Discarding %d code block(s) from supervisor %s - Architect turns do not write files",
                 response_text.count("```") // 2, model_id
@@ -1971,7 +2113,7 @@ class Orchestrator:
                     # it to the Critic next - stamp attribution on the task itself so the
                     # state-machine router (and the next speaker's own context) knows which
                     # file and whose workspace to look at.
-                    if current_phase == "execution" and active_task and "coder" in role_lower:
+                    if current_phase == "execution" and active_task and seat == self.SEAT_CODER:
                         self.memory_manager.update_itinerary_task(active_task["id"], {
                             "status": "needs_review",
                             "filename": fn,
