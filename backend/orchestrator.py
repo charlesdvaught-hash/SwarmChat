@@ -1380,6 +1380,83 @@ class Orchestrator:
             own_spec = own_spec[:500] + "... [truncated]"
         return f"\n\n### YOUR PERSONAL SPEC NOTEBOOK:\n{own_spec if own_spec else '(Empty)'}"
 
+    def _static_review(self, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Run the linter over the task's file before any Critic model sees it.
+
+        Returns None when there is nothing to say (no python file, ruff missing, file gone).
+        `available: False` must never be read as 'the code is clean'."""
+        filename = task.get("filename")
+        author_id = task.get("author_bot_id")
+        if not filename or not author_id or not filename.endswith(".py"):
+            return None
+        res = self.tool_manager.lint_file(filename, bot_id=author_id)
+        if not res.get("success"):
+            if not res.get("available", True):
+                logger.info("ruff not installed - skipping the static Critic pre-pass")
+            return None
+        return res
+
+    async def _critic_static_gate(self, task: Dict[str, Any]) -> bool:
+        """Deterministic first half of code review. True = handled, skip the Critic's turn.
+
+        A 3-4B Critic asked to 'review this code' writes a paragraph of agreeable prose.
+        ruff writes `game.py:14:5: F821 Undefined name 'board'`. When the linter finds a real
+        defect there is nothing for a small model to add, and asking it costs a turn, a model
+        load, and the risk that it says APPROVE anyway - so the task goes straight back to
+        the Coder with the exact lines. The model is only consulted on what ruff cannot see:
+        logic, missing requirements, bad decomposition."""
+        report = self._static_review(task)
+        if not report or not report.get("blocking"):
+            return False
+
+        findings = report["blocking"]
+        shown = findings[:8]
+        more = len(findings) - len(shown)
+        detail = "\n".join(f"  {ln}" for ln in shown) + (f"\n  ...and {more} more" if more > 0 else "")
+
+        self.memory_manager.update_itinerary_task(task["id"], {
+            "status": "failed",
+            "blocked_reason": f"Static analysis found {len(findings)} defect(s):\n{detail}",
+            "attempt_count": task.get("attempt_count", 0) + 1,
+        })
+        self.add_chat_message(
+            sender="System / Static Review",
+            role="System",
+            content=(
+                f"🔍 [LINT FAILED] `{task.get('filename')}` has {len(findings)} real defect(s). "
+                f"Back to the Coder without spending a Critic turn:\n```\n{detail}\n```"
+            ),
+            is_admin=True
+        )
+        self.memory_manager.add_entry(
+            "Static Review",
+            f"{task.get('filename')}: {len(findings)} blocking lint finding(s)."
+        )
+        logger.info("Static gate failed task %s with %d blocking finding(s)", task["id"], len(findings))
+        return True
+
+    def _static_review_context(self, task: Optional[Dict[str, Any]]) -> str:
+        """Linter output injected into the Critic's prompt, so its turn starts from evidence
+        instead of from the file alone. Empty string when there is nothing to report."""
+        if not task:
+            return ""
+        report = self._static_review(task)
+        if not report:
+            return ""
+        lines = (report.get("blocking") or []) + (report.get("advisory") or [])
+        if not lines:
+            return (
+                "\n\n### STATIC ANALYSIS\nruff reports no defects in this file. "
+                "A linter cannot see logic errors, missing requirements, or wrong output - "
+                "review for those, and do not invent syntax problems it would have caught."
+            )
+        shown = "\n".join(lines[:12])
+        return (
+            "\n\n### STATIC ANALYSIS (ruff - already verified, do not re-derive)\n"
+            f"{shown}\n"
+            "Treat these as established fact. Add only what a linter cannot see."
+        )
+
     async def _execute_task_test_run(self, tester_cfg: Dict[str, Any], task: Dict[str, Any]) -> None:
         """Deterministically runs the active task's file in its author's sandbox and
         advances the task to completed/failed - the Tester's own turn doesn't need to
@@ -1510,15 +1587,42 @@ class Orchestrator:
         # the pipeline asked it to do rather than by the first keyword in its role string.
         seat = self._seat_for_turn(model_cfg, current_phase, active_task)
 
+        # Deterministic half of code review, before a single token is generated. If ruff
+        # finds a real defect the task is already back with the Coder and this turn is over -
+        # no model load, no generation, no chance of a small Critic saying APPROVE to code
+        # with an undefined name in it.
+        if (
+            seat == self.SEAT_CRITIC
+            and current_phase == "execution"
+            and active_task
+            and active_task.get("status") == "needs_review"
+            and await self._critic_static_gate(active_task)
+        ):
+            self.set_model_live_status(model_id, "Idle")
+            return {
+                "model_id": model_id,
+                "skipped": True,
+                "reason": "static_review_failed",
+                "message": f"Static analysis rejected {active_task.get('filename')}; returned to the Coder.",
+            }
+
         sys_prompt = self._build_system_prompt(model_id, model_cfg, current_phase, active_task, is_first_turn, seat=seat)
         ep_summary = self._build_episode_context(active_task)
         task_context = self._build_task_context(active_task)
         journal_context = self._build_journal_context(latest_journal)
         spec_context = self._build_spec_context(model_id)
 
+        # Critic turns that survived the static gate still get the linter's verdict, so the
+        # review starts from evidence rather than from the file alone. On a clean file this
+        # says so explicitly - otherwise a small Critic invents syntax problems ruff would
+        # have caught, and the Coder burns a turn "fixing" code that was already correct.
+        static_context = (
+            self._static_review_context(active_task) if seat == self.SEAT_CRITIC else ""
+        )
+
         # Prefix Cache Optimization: Put stable content FIRST (system prompt, task details, personal spec)
         # and volatile context LAST (shared memory summary, episodes, journal)
-        context_prompt = f"{sys_prompt}{task_context}{spec_context}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{journal_context}"
+        context_prompt = f"{sys_prompt}{task_context}{spec_context}{static_context}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{journal_context}"
 
         # Check model token usage against limits - enforce context reset if exceeded to prevent degradation
         tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)

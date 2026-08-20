@@ -274,6 +274,75 @@ class ToolManager:
         except Exception as e:
             return {"success": False, "error": f"Execution failed: {e}"}
 
+    # Ruff rules that mean "this code is wrong", not "this code is untidy".
+    #   E9  syntax errors / IO errors
+    #   F821 undefined name          F811 redefinition       F401 unused import
+    #   F841 unused local variable   F632 `is` on a literal
+    # A 3-4B Coder produces exactly these: calls a helper it never wrote, imports a module
+    # it never uses, references a variable from a paragraph of prose it didn't turn into code.
+    BLOCKING_LINT_RULES = "E9,F821,F811,F632"
+    ADVISORY_LINT_RULES = "F401,F841"
+
+    def lint_file(self, filepath: str, bot_id: str, timeout: int = 20) -> Dict[str, Any]:
+        """Static analysis of one file in a bot's sandbox. Deterministic Critic pre-pass.
+
+        This exists because asking a 3-4B model to 'review this code' produces a paragraph of
+        agreeable prose, while ruff produces `game.py:14:5: F821 Undefined name 'board'` in
+        about 20ms. The model should only be asked about what a linter cannot see.
+
+        Returns `blocking` (real defects - the task goes straight back to the Coder without
+        spending a Critic turn) separately from `advisory` (smells worth mentioning, not
+        worth failing over). `available: False` means ruff is not installed; callers must
+        treat that as "no opinion", never as "the code is clean"."""
+        bot_dir = self.get_bot_workspace_dir(bot_id)
+        full_path = os.path.abspath(os.path.join(bot_dir, filepath))
+        if not os.path.exists(full_path):
+            full_path = os.path.abspath(os.path.join(self.workspace_root, filepath))
+        if not os.path.exists(full_path):
+            return {"success": False, "available": True, "error": f"File '{filepath}' not found."}
+
+        def _run(rules: str) -> List[str]:
+            res = subprocess.run(
+                [sys.executable, "-m", "ruff", "check",
+                 "--select", rules, "--no-cache",
+                 "--output-format", "concise", full_path],
+                cwd=bot_dir, capture_output=True, text=True, timeout=timeout
+            )
+            # ruff exits 1 when it finds violations - that is a successful run, not a failure.
+            lines = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+            return [ln for ln in lines if "All checks passed" not in ln and not ln.startswith("Found ")]
+
+        try:
+            blocking = _run(self.BLOCKING_LINT_RULES)
+            advisory = _run(self.ADVISORY_LINT_RULES)
+        except FileNotFoundError:
+            return {"success": False, "available": False, "error": "ruff is not installed."}
+        except subprocess.TimeoutExpired:
+            return {"success": False, "available": True, "error": f"ruff timed out after {timeout}s"}
+        except Exception as e:
+            msg = str(e)
+            # `python -m ruff` on a machine without ruff surfaces as a non-zero exit, not
+            # FileNotFoundError. Treat that as "no opinion" too rather than a clean bill.
+            available = "No module named" not in msg
+            return {"success": False, "available": available, "error": f"Lint failed: {e}"}
+
+        # Strip the absolute path so the model sees `game.py:14:5:` not a C:\Users\... prefix
+        # that eats its context window and leaks the sandbox layout into the chat.
+        def _tidy(items: List[str]) -> List[str]:
+            base = os.path.basename(full_path)
+            return [ln.replace(full_path, base).replace(full_path.replace("\\", "/"), base) for ln in items]
+
+        blocking, advisory = _tidy(blocking), _tidy(advisory)
+        return {
+            "success": True,
+            "available": True,
+            "clean": not blocking and not advisory,
+            "blocking": blocking,
+            "advisory": advisory,
+            "filepath": filepath,
+            "bot_id": bot_id,
+        }
+
     def run_tests(self, bot_id: str, test_path: Optional[str] = None, timeout: int = 15) -> Dict[str, Any]:
         """Runs pytest on bot's workspace sandbox without shell=True."""
         bot_dir = self.get_bot_workspace_dir(bot_id)
