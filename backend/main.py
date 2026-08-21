@@ -290,6 +290,10 @@ class VoteOverrideReq(BaseModel):
     action: str
     modified_args: Optional[Dict[str, Any]] = None
 
+class PlanQuestionAnswerReq(BaseModel):
+    question_id: str
+    answer: str
+
 class HireVoteReq(BaseModel):
     model_id: str
     model_name: str
@@ -490,6 +494,10 @@ def get_full_state():
         "known_models": orchestrator.known_models,
         "model_statuses": model_mgr.model_statuses,
         "pending_votes": orchestrator.pending_tool_votes,
+        # The planning question board. A question routed to the Admin is PARKED, not
+        # blocking - the room carries on - so the UI has to surface it independently of
+        # whose turn it is, the same way pending tool votes are surfaced.
+        "plan_questions": orchestrator.plan_questions(),
         "chat_history": orchestrator.chat_history,
         # What the UI labels "up next". During execution the roster queue is not what drives
         # turns (the task router is), so showing the raw queue there was fiction.
@@ -508,7 +516,15 @@ def get_full_state():
         "projects": memory_mgr.list_projects(),
         "frontend_status": get_frontend_status(),
         "memory_error": memory_mgr.last_load_error,
-        "last_background_error": last_background_error
+        "last_background_error": last_background_error,
+        # Whether a server-side conversation loop is mid-flight. The Auto toggle needs
+        # this: sending a chat message already starts a loop, and the UI must not drive
+        # `/api/chat/step` on top of one that is already taking turns.
+        "loop_active": orchestrator.loop_active,
+        # What is ACTUALLY resident, as opposed to what is on the roster. These two lists
+        # diverging is the symptom of a leak, and until now nothing surfaced it.
+        "loaded_model_ids": list(model_mgr.gguf_instances.keys()),
+        "hardware": model_mgr.get_hardware_info()
     }
 
 @app.post("/api/roster/update")
@@ -849,6 +865,19 @@ def override_vote(req: VoteOverrideReq):
     if not res.get("success"):
         status = 404 if "not found" in str(res.get("error", "")).lower() else 400
         raise HTTPException(status_code=status, detail=res.get("error", "Vote override failed."))
+    return res
+
+@app.post("/api/plan/questions/answer")
+def answer_plan_question(req: PlanQuestionAnswerReq):
+    """The Admin's answer to a parked planning question.
+
+    The room never waited for this - the question was checkpointed and the next item was
+    worked - so answering RESUMES the gate rather than unblocking it, and nothing that
+    happened in the meantime is lost."""
+    res = orchestrator.answer_plan_question(req.question_id, req.answer)
+    if not res.get("success"):
+        status = 404 if "not found" in str(res.get("error", "")).lower() else 400
+        raise HTTPException(status_code=status, detail=res.get("error", "Answering the question failed."))
     return res
 
 @app.post("/api/hiring/vote")

@@ -23,6 +23,22 @@ def stub_generation(model_manager: ModelManager, text: str = "Stubbed model turn
     model_manager.generate_response = _generate
 
 
+def capture_generation(model_manager: ModelManager, text: str = "Stubbed model turn."):
+    """Like stub_generation, but returns a list that collects each system prompt used.
+
+    A turn can call generate_response more than once (the empty-generation retry), so the
+    caller should assert against the whole list or its first entry, never assume one call.
+    """
+    prompts = []
+
+    async def _generate(model_config, system_prompt, messages):
+        prompts.append(system_prompt)
+        return text
+
+    model_manager.generate_response = _generate
+    return prompts
+
+
 def fail_generation(model_manager: ModelManager, message: str = "backend unavailable"):
     async def _generate(model_config, system_prompt, messages):
         raise ModelInvocationError(message, model_id=model_config.get("id", ""))
@@ -116,7 +132,12 @@ def test_malformed_directive_is_announced():
 
 def test_valid_config_directive_is_applied():
     mm = ModelManager()
-    mem = MemoryManager(storage_dir=".test_swarmchat")
+    # Its own storage dir on purpose. Chat history is PERSISTED per storage root and
+    # reloaded by Orchestrator.__init__, so a test asserting the ABSENCE of a message
+    # inherits every "DIRECTIVE IGNORED" line the shared-root tests wrote before it -
+    # which is exactly how this test failed depending on run order, with nothing wrong
+    # in the code under test.
+    mem = MemoryManager(storage_dir=".test_swarmchat_config_directive")
     orch = Orchestrator(mm, mem, ToolManager())
     stub_generation(mm, "Adjusting. [UPDATE_CONFIG: temperature=0.35, top_k=20]")
 
@@ -421,22 +442,126 @@ def test_fs_browser_and_validation():
     val_res = validate_model_path(ValidatePathReq(path="non_existent_file.gguf"))
     assert val_res["valid"] is False
 
-def test_action_tag_parsing_and_context_reset():
+def test_narration_is_admin_only_and_never_reaches_a_model(tmp_path):
+    """Chat narration goes in `content`; models read `model_visible`.
+
+    Discussion turns feed chat_history[-3:] back into the next speaker, so anything written
+    into `content` is model input by default. The moment presentation text becomes model
+    input, models start responding to the narration instead of to the work. This pins the
+    one-way boundary.
+    """
     mm = ModelManager()
-    stub_generation(mm, "Stubbed turn after context refresh.")
-    mem = MemoryManager(storage_dir=".test_swarmchat_tags")
+    mem = MemoryManager(storage_dir=str(tmp_path / "mem_narrate"))
     tm = ToolManager()
     orch = Orchestrator(mm, mem, tm)
 
-    # Test UPDATE_TASK tag parsing
+    msg = orch.add_chat_message(
+        sender="Coder",
+        role="Coder",
+        content="\U0001f527 shipped `word_count.py` (+4/-1).",
+        model_visible="Updated `word_count.py` (+4/-1).",
+    )
+    assert "shipped" in msg["content"]
+    assert "shipped" not in msg["model_visible"]
+
+    # Callers that pass no narration must be unaffected - model_visible mirrors content.
+    plain = orch.add_chat_message(sender="Admin", role="Admin", content="build a parser", is_admin=True)
+    assert plain["model_visible"] == "build a parser"
+
+    # And the discussion-phase context builder must read the un-narrated body.
+    prompts = capture_generation(mm, "Acknowledged.")
+    asyncio.run(orch.step_model_turn("model_architect"))
+    assert prompts, "the turn should have called generate_response"
+
+
+def test_status_headline_is_built_from_facts_only():
+    """Every headline traces to a diff, a verdict or a directive - never to model prose."""
+    orch_cls = Orchestrator
+    updates = [{"filename": "word_count.py", "added": 4, "removed": 1, "is_new": False}]
+
+    coder = orch_cls._status_headline(orch_cls.SEAT_CODER, updates, "here is the code")
+    assert "word_count.py" in coder and "+4/-1" in coder
+
+    created = orch_cls._status_headline(
+        orch_cls.SEAT_CODER, [{"filename": "new.py", "added": 12, "removed": 0, "is_new": True}], ""
+    )
+    assert "+12" in created
+
+    # The Critic's headline follows the verdict, not the prose around it.
+    assert "back" in orch_cls._status_headline(orch_cls.SEAT_CRITIC, updates, "Looks fine to me.\nREJECT")
+    assert "approved" in orch_cls._status_headline(orch_cls.SEAT_CRITIC, updates, "Some notes.\nAPPROVE")
+    # No verdict means no claim about the review either way.
+    assert orch_cls._status_headline(orch_cls.SEAT_CRITIC, updates, "I am still reading it.") == ""
+
+    # A turn with no recorded fact gets no headline rather than an invented one.
+    assert orch_cls._status_headline(orch_cls.SEAT_CODER, [], "I thought about it a lot.") == ""
+
+    # The Architect never gets one: its deliverable is prose, so a headline would either
+    # duplicate the paragraph or restate the directive sentence the body already carries.
+    assert orch_cls._status_headline(
+        orch_cls.SEAT_ARCHITECT, [], "[UPDATE_TASK: title=Add parser, status=in_progress]"
+    ) == ""
+
+
+def test_narration_does_not_duplicate_the_fallback_summary():
+    """A turn with unusable prose must not read its own diff out twice."""
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=".test_swarmchat_narrate2")
+    tm = ToolManager()
+    orch = Orchestrator(mm, mem, tm)
+
+    updates = [{"filename": "word_count.py", "added": 4, "removed": 1, "is_new": False}]
+    cfg = {"name": "Coder", "role": "Coder"}
+    display = orch._build_chat_display_text("{}", cfg, updates)   # garbage prose -> synthesized summary
+    narrated = orch._narrate_turn(Orchestrator.SEAT_CODER, updates, "{}", display)
+
+    assert narrated.count("word_count.py") == 1
+    assert "shipped" in narrated
+
+
+def test_context_trim_measures_the_prompt_not_words_spoken():
+    """The context trim must gate on the PROMPT size, not on how much the model has talked.
+
+    It used to compare `tokens_used` - a running total of words the model had SPOKEN - against
+    its context WINDOW. Those are unrelated quantities: the prompt is rebuilt from scratch each
+    turn and every component of it is capped, so measured prompts stay flat regardless of how
+    long the room runs. The trim therefore fired on whichever model had been most productive,
+    at a moment with no relationship to how full anything was, and it dropped the task details
+    while keeping the project-wide digest - backwards for a small model.
+    """
+    mem = MemoryManager(storage_dir=".test_swarmchat_tags")
+    tm = ToolManager()
     mem.add_itinerary_task("Initial Task", "Task description")
 
-    # Exceed model token limit to trigger context refresh
+    # --- A big "words spoken" total must NOT trim anything ---
+    mm = ModelManager()
+    prompts = capture_generation(mm, "Stubbed turn.")
+    orch = Orchestrator(mm, mem, tm)
     mem.state.setdefault("tokens_used", {})["model_architect"] = 4000
+    mm.last_prompt_tokens["model_architect"] = 120  # the real prompt is small
     asyncio.run(orch.step_model_turn("model_architect"))
 
-    # Token counter should reset to 0 after turn
-    assert mem.state["tokens_used"]["model_architect"] < 4000
+    assert prompts, "the turn should have called generate_response"
+    assert "CONTEXT TRIMMED" not in prompts[0]
+    assert "SHARED MEMORY SUMMARY" in prompts[0]
+    # The counter is a usage statistic now, not a gate - it accumulates instead of being zeroed.
+    assert mem.state["tokens_used"]["model_architect"] > 4000
+
+    # --- A genuinely large measured prompt DOES trim ---
+    mm2 = ModelManager()
+    prompts2 = capture_generation(mm2, "Stubbed turn after trim.")
+    orch2 = Orchestrator(mm2, mem, tm)
+    mm2.last_prompt_tokens["model_architect"] = 99999
+    asyncio.run(orch2.step_model_turn("model_architect"))
+
+    assert prompts2, "the trimmed turn should have called generate_response"
+    trimmed = prompts2[0]
+    assert "CONTEXT TRIMMED" in trimmed
+    # Specific context survives, diffuse context does not.
+    assert "ACTIVE ITINERARY ITEM" in trimmed
+    assert "SHARED MEMORY SUMMARY" not in trimmed
+    assert "RECENT EPISODE CHECKPOINTS" not in trimmed
+    # A trim is still journalled so the event is traceable.
     assert len(mem.state.get("model_journals", {}).get("model_architect", [])) > 0
 
 def test_note_chunking_and_workspace_auto_save(tmp_path):
@@ -497,3 +622,163 @@ def test_search_endpoint_reports_upstream_failure(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(main.search_huggingface("Llama-3-GGUF"))
     assert exc.value.status_code == 502
+
+
+# --- QUESTION-DRIVEN DISCUSSION ---
+# Full coverage lives in verify_discussion_phase.py; these are the load-bearing few, so a
+# plain `pytest` run catches a regression in the parser and in the gate's new shape.
+
+def _planning_room(tmp_path, same_weights=False):
+    """A three-seat room sitting at the start of the planning gate."""
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=str(tmp_path / "mem"))
+    orch = Orchestrator(mm, mem, ToolManager(workspace_root=str(tmp_path)),
+                        storage_root=str(tmp_path / "root"))
+    seats = {
+        "arch": ("Otis", "Architect"),
+        "crit": ("Vera", "Critic"),
+        "code": ("Bill", "Coder"),
+    }
+    orch.models = {
+        k: {
+            "id": k, "name": n, "role": r, "provider": "gguf_local",
+            "gguf_path": ("shared.gguf" if same_weights else k + ".gguf"), "enabled": True,
+        }
+        for k, (n, r) in seats.items()
+    }
+    orch.known_models = dict(orch.models)
+    orch.chat_history = []
+    orch.save_chat_history = lambda *a, **k: None
+    mem.set_phase("discussion")
+    return mem, orch
+
+
+def _gate_turn(orch, model_id, text):
+    cfg = orch.models[model_id]
+    orch.add_chat_message(cfg["name"], "Assistant", text, model_id=model_id)
+    orch._advance_plan_gate(model_id, cfg, text)
+    return orch.memory_manager.get_plan_stage()
+
+
+def test_directive_parser_keeps_commas_inside_a_signature():
+    """The bug the question board would otherwise have inherited: a naive comma split
+    turned `title=Implement char_count(text, strip)` into the task `Implement char_count(text`."""
+    from backend.directives import parse_fields
+
+    fields = parse_fields(
+        "title=Implement char_count(text, strip), description=Add to counter.py, handling empties",
+        ("id", "title", "description", "priority", "status", "assigned_model"),
+    )
+    assert fields["title"] == "Implement char_count(text, strip)"
+    assert fields["description"] == "Add to counter.py, handling empties"
+
+
+def test_question_cap_is_enforced_in_code(tmp_path):
+    mem, orch = _planning_room(tmp_path)
+    assert mem.get_plan_stage() == "awaiting_questions"
+    stage = _gate_turn(orch, "arch", "\n".join(
+        "[QUESTION: ask=Question %d, what behaviour do we want?, for=team]" % i for i in range(9)
+    ))
+    assert len(mem.get_plan_questions()) == Orchestrator.MAX_PLAN_QUESTIONS
+    assert stage == "resolving_questions"
+
+
+def test_one_question_is_settled_per_turn(tmp_path):
+    mem, orch = _planning_room(tmp_path)
+    _gate_turn(orch, "arch", "[QUESTION: ask=Should punctuation count as part of a word?, for=team]\n"
+                             "[QUESTION: ask=Should numbers count as words?, for=team]")
+    _gate_turn(orch, "arch", "[ANSWER: Punctuation is stripped before counting.]")
+    assert len(mem.questions_by_status("resolved")) == 1
+    assert mem.get_plan_stage() == "resolving_questions"
+
+
+def test_reject_becomes_a_question_not_a_rewrite(tmp_path):
+    mem, orch = _planning_room(tmp_path)
+    mem.set_plan_stage("awaiting_plan")
+    _gate_turn(orch, "arch", "Goal: a word counter. Create counter.py with count_words(text) "
+                             "returning an int, and test_counter.py covering the empty string.")
+    stage = _gate_turn(orch, "crit", "count_words says nothing about hyphenated words.\nREJECT")
+    assert stage == "resolving_questions"
+    assert "hyphenated" in mem.get_plan_questions()[0]["text_internal"]
+    _gate_turn(orch, "arch", "[ANSWER: A hyphenated word counts as one word.]")
+    assert mem.get_plan_stage() == "awaiting_plan"
+    # And the decision reaches the next plan prompt, which is the whole point.
+    assert "counts as one word" in orch._build_questions_context()
+
+
+def test_admin_question_parks_without_blocking_the_room(tmp_path):
+    mem, orch = _planning_room(tmp_path)
+    _gate_turn(orch, "arch",
+               "[QUESTION: ask=How do you want to see the answer?, "
+               "options=On the screen: it prints when you run it | "
+               "In a file: it writes it out for you to open, "
+               "recommended=On the screen, why=You can try it immediately, for=admin]\n"
+               "[QUESTION: ask=Should punctuation count as part of a word?, for=team]")
+    admin_q = next(q for q in mem.get_plan_questions() if q["resolvable_by"] == "admin")
+    assert admin_q["status"] == "parked"
+    # The room moved on to the team question rather than waiting.
+    assert mem.next_open_question()["resolvable_by"] == "model"
+    assert orch.answer_plan_question(admin_q["id"], "On the screen")["success"] is True
+    assert mem.get_plan_question(admin_q["id"])["decided_by"] == "admin"
+
+
+def test_admin_question_written_in_jargon_is_never_asked(tmp_path):
+    mem, orch = _planning_room(tmp_path)
+    _gate_turn(orch, "arch", "[QUESTION: ask=Do you want a CLI or a library?, options=CLI | Library, "
+                             "recommended=CLI, why=Faster to try, for=admin]")
+    # Admin is not a coder. A question whose options are implementation nouns is a defect in
+    # the question, so the room settles it instead of stalling on an unanswerable prompt.
+    assert mem.get_plan_questions()[0]["resolvable_by"] == "model"
+
+
+def test_a_vote_needs_two_distinct_models_not_two_seats(tmp_path):
+    mem, orch = _planning_room(tmp_path, same_weights=True)
+    assert len(orch._distinct_model_paths()) == 1
+    orch.loop_active = True  # Auto Mode: nobody is watching for the question to appear.
+    _gate_turn(orch, "arch",
+               "[QUESTION: ask=How do you want to see the answer?, "
+               "options=On the screen: it prints when you run it | "
+               "In a file: it writes it out for you to open, "
+               "recommended=On the screen, why=You can try it immediately, for=admin]")
+    q = mem.get_plan_questions()[0]
+    assert q["decided_by"] == "default", "one set of weights cannot outvote itself"
+    assert q["answer"] == "On the screen"
+
+
+def test_switching_project_clears_the_admin_facing_room(tmp_path):
+    """A project owns its chat, its question board and its pending votes.
+
+    The admin-facing chat is where parked "[YOUR CALL]" question cards live, and those are
+    clickable - a question belonging to a project you just left must not still be sitting in
+    the room, or answering it would record a decision against the wrong project."""
+    mm = ModelManager()
+    mem = MemoryManager(storage_dir=str(tmp_path / "mem"))
+    orch = Orchestrator(mm, mem, ToolManager(workspace_root=str(tmp_path)),
+                        storage_root=str(tmp_path / "root"))
+    orch.models = {"arch": {"id": "arch", "name": "Otis", "role": "Architect",
+                            "provider": "gguf_local", "gguf_path": "a.gguf", "enabled": True}}
+    orch.known_models = dict(orch.models)
+
+    first = mem.get_project_id()
+    orch.add_chat_message("Otis", "Assistant", "Plan for the first project", model_id="arch")
+    orch.add_chat_message("System / Plan Questions", "System",
+                          "[YOUR CALL] How do you want to see the answer?", is_admin=True)
+    mem.add_plan_question("How should output appear?", question_admin="How do you want to see the answer?",
+                          options=[{"label": "On screen", "means": "it prints when you run it"}],
+                          recommended="On screen", resolvable_by="admin")
+    orch.pending_tool_votes.append({"id": "vote_1", "status": "pending", "tool_name": "x",
+                                    "args": {}, "model_id": "arch", "model_name": "Otis",
+                                    "risk_level": "high", "votes": {}, "created_at": 0})
+
+    orch.set_project("second_project")
+    assert orch.chat_history == [], "the previous project's admin chat followed the switch"
+    assert mem.get_plan_questions() == [], "a parked question followed the switch"
+    assert orch.pending_tool_votes == []
+
+    # And switching back restores that project's own room rather than losing it.
+    orch.set_project(first)
+    assert [m["content"] for m in orch.chat_history] == [
+        "Plan for the first project",
+        "[YOUR CALL] How do you want to see the answer?",
+    ]
+    assert len(mem.get_plan_questions()) == 1

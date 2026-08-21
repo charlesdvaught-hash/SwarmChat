@@ -5,8 +5,13 @@ could emit [READY_FOR_EXECUTION] and flip the room, and the autonomous loop forc
 execution after a turn/time cap regardless. A plan could therefore reach the Coder with
 nobody having read it.
 
-The gate now runs Architect -> Critic -> Programmer -> Architect-opens-execution, skipping
-review seats the roster does not contain. No LLM is invoked.
+The gate now runs questions -> resolution -> Architect -> Critic -> Programmer ->
+Architect-opens-execution, skipping review seats the roster does not contain. No LLM is
+invoked.
+
+This file covers the PLAN half of the gate, so `build()` starts each case at awaiting_plan
+with the question board already clear - that is a legitimate real state (the Architect had
+nothing undecided to raise). The question half has its own file, verify_discussion_phase.py.
 """
 import os
 import sys
@@ -55,6 +60,10 @@ def build(tmp, seats=("arch", "crit", "code"), phase="discussion"):
     orch.chat_history = []
     orch.save_chat_history = lambda *a, **k: None
     mem.set_phase(phase)
+    # Start past the question stages: this file is about the plan/review half of the gate.
+    # A room whose Architect raised no open questions legitimately lands here on turn one.
+    mem.set_plan_stage("awaiting_plan")
+    mem.state["plan_revision"] = 0
     return mem, orch
 
 
@@ -77,8 +86,8 @@ def main():
     orch.turn_schedule = ["code", "crit", "arch"]
     check("Planning opens on the Architect", orch.get_next_speaker() == "arch",
           "got %r" % orch.get_next_speaker())
-    check("Gate starts at awaiting_plan", mem.get_plan_stage() == "awaiting_plan",
-          "got %r" % mem.get_plan_stage())
+    check("Gate starts at awaiting_plan once questions are clear",
+          mem.get_plan_stage() == "awaiting_plan", "got %r" % mem.get_plan_stage())
 
     # 2. The full happy path: plan -> critic -> programmer -> approved -> execution.
     mem, orch = build(tmp)
@@ -101,16 +110,24 @@ def main():
     #    and it does not slide forward.
     mem, orch = build(tmp)
     turn(orch, "arch", PLAN)
-    check("Critic REJECT returns to the Architect",
-          turn(orch, "crit", "Step 2 contradicts step 1 on the header row.\nREJECT") == "awaiting_plan")
+    # A REJECT no longer triggers a blind rewrite: the objection is recorded as a question,
+    # settled, and the room lands back on awaiting_plan carrying that decision.
+    check("Critic REJECT returns to the Architect via a recorded objection",
+          turn(orch, "crit", "Step 2 contradicts step 1 on the header row.\nREJECT") == "resolving_questions")
+    check("The Critic's objection became a question",
+          len(mem.get_plan_questions()) == 1 and mem.get_plan_questions()[0]["status"] == "open",
+          "got %r" % mem.get_plan_questions())
+    turn(orch, "arch", "[ANSWER: The header row is written once, inside write_rows.]")
+    check("Settling the objection returns the room to the plan",
+          mem.get_plan_stage() == "awaiting_plan", "got %r" % mem.get_plan_stage())
     check("Architect owns the rehash turn", orch.get_next_speaker() == "arch",
           "got %r" % orch.get_next_speaker())
     turn(orch, "arch", PLAN + " Revised: the header row is written once, in write_rows.")
     check("Rehashed plan goes back to the Critic", mem.get_plan_stage() == "critic_review",
           "got %r" % mem.get_plan_stage())
     turn(orch, "crit", "Fixed.\nAPPROVE")
-    check("Programmer REJECT also returns to the Architect",
-          turn(orch, "code", "rows has no defined type, I cannot build this.\nREJECT") == "awaiting_plan")
+    check("Programmer REJECT also becomes a question",
+          turn(orch, "code", "rows has no defined type, I cannot build this.\nREJECT") == "resolving_questions")
     check("Plan revision counter tracks the rehashes", mem.get_plan_revision() == 2,
           "got %r" % mem.get_plan_revision())
 
@@ -179,8 +196,10 @@ def main():
     turn(orch, "code", "APPROVE")
     mem.set_phase("discussion")
     mem.reset_plan_gate()
-    check("Back to discussion restarts the gate", mem.get_plan_stage() == "awaiting_plan",
-          "got %r" % mem.get_plan_stage())
+    check("Back to discussion restarts the gate at the question stage",
+          mem.get_plan_stage() == "awaiting_questions", "got %r" % mem.get_plan_stage())
+    check("Restarting the gate clears the question board",
+          mem.get_plan_questions() == [], "got %r" % mem.get_plan_questions())
 
     print()
     if failures:

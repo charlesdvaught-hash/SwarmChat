@@ -2,8 +2,13 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   MessageSquare, Zap, Settings, Shield, BrainCircuit, AlertTriangle,
   Play, Crown, Cpu, Sparkles, Send, X, Users, Check, Plus, FolderOpen, Trash2,
-  ChevronDown, ChevronRight, UserMinus, UserPlus, RefreshCw, FileText, CheckSquare, Activity
+  ChevronDown, ChevronRight, UserMinus, UserPlus, RefreshCw, FileText, CheckSquare, Activity,
+  HelpCircle
 } from 'lucide-react';
+
+// How often Auto mode asks for the next turn. Turns are serialised client-side, so this
+// is a floor on the gap between turns, not a rate: a 40s turn simply takes 40s.
+const AUTO_TURN_INTERVAL_MS = 2000;
 
 interface ChatMessage {
   id: string;
@@ -46,8 +51,32 @@ interface PendingVote {
   status: string;
 }
 
+// A planning question the room has put on the board. One routed to the Admin is PARKED,
+// never blocking: the room moves on to the next question or the next task, and answering
+// resumes it. So this card is not a modal and does not interrupt anything.
+interface PlanQuestionOption {
+  label: string;
+  means: string;
+}
+
+interface PlanQuestion {
+  id: string;
+  number: number;
+  text_internal: string;
+  question_admin: string;
+  options: PlanQuestionOption[];
+  recommended: string;
+  rationale: string;
+  resolvable_by: 'model' | 'admin';
+  status: 'open' | 'parked' | 'resolved';
+  answer: string;
+  decided_by: string;
+}
+
 // Pre-execution planning gate, in running order.
 const PLAN_STAGE_LABELS: Record<string, string> = {
+  awaiting_questions: '❓ QUESTIONS',
+  resolving_questions: '🧩 RESOLVING',
   awaiting_plan: '📝 PLAN',
   critic_review: '🔍 CRITIC REVIEW',
   programmer_review: '🔧 BUILDABILITY',
@@ -66,6 +95,12 @@ export default function App() {
   const [knownModels, setKnownModels] = useState<Record<string, ModelConfig>>({});
   const [modelStatuses, setModelStatuses] = useState<Record<string, any>>({});
   const [pendingVotes, setPendingVotes] = useState<PendingVote[]>([]);
+  const [planQuestions, setPlanQuestions] = useState<PlanQuestion[]>([]);
+  // Only questions actually routed to the Admin appear in the UI. Questions the room
+  // settles itself are room business and would be noise on a non-coder's screen.
+  const parkedQuestions = planQuestions.filter(
+    (q) => q.status === 'parked' && q.resolvable_by === 'admin' && (q.options || []).length > 0
+  );
   const [sharedMemory, setSharedMemory] = useState<any[]>([]);
   const [hardware, setHardware] = useState<any>(null);
   const [dependencies, setDependencies] = useState<any>(null);
@@ -111,6 +146,9 @@ export default function App() {
   // Roster & Auto-Turn State
   const [turnSchedule, setTurnSchedule] = useState<string[]>([]);
   const [isAutoTurn, setIsAutoTurn] = useState(false);
+  // True while the backend is already running its own conversation loop (which is what
+  // sending a chat message starts). Auto must yield to it rather than step in parallel.
+  const [loopActive, setLoopActive] = useState(false);
   const [showRosterModal, setShowRosterModal] = useState(false);
   const [editedRoster, setEditedRoster] = useState<string[]>([]);
 
@@ -148,6 +186,7 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState<'models' | 'browse_hf' | 'search_paths'>('models');
 
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const loopActiveRef = useRef(false);
 
   // Backend failures are shown to the Admin instead of only reaching the browser console.
   const [apiError, setApiError] = useState<string | null>(null);
@@ -192,17 +231,44 @@ export default function App() {
     }
   };
 
+  // Everything on screen that belongs to ONE project. Switching or archiving a project
+  // must blank these BEFORE the request goes out, not after the refetch lands.
+  //
+  // The backend already swaps correctly (chat history, the question board and pending votes
+  // are all per-project and are cleared in Orchestrator.set_project). The stale window was
+  // purely visual: the switch does real file I/O, so for that beat the room still showed the
+  // previous project's admin chat - including "[YOUR CALL]" question cards belonging to a
+  // project you had just left, which are clickable. Worse, if the refetch failed, the old
+  // conversation simply stayed on screen with nothing saying it was stale. An empty room
+  // plus an error is honest; another project's room is not.
+  const clearRoomView = () => {
+    setMessages([]);
+    setPlanQuestions([]);
+    setPendingVotes([]);
+    setSharedMemory([]);
+    setEpisodes([]);
+    setTaskItinerary([]);
+    setActiveTask(null);
+    setFileAuditLog([]);
+    setActiveFileLocks({});
+    setTurnSchedule([]);
+    setPlanStage('awaiting_questions');
+    setPlanStageOwnerName(null);
+    setPlanRevision(0);
+  };
+
   const fetchState = async () => {
     try {
       const data = await apiRequest<any>('/api/state');
       setPhase(data.phase);
-      setPlanStage(data.plan_stage || 'awaiting_plan');
+      setPlanStage(data.plan_stage || 'awaiting_questions');
       setPlanStageOwnerName(data.plan_stage_owner_name || null);
       setPlanRevision(data.plan_revision || 0);
       setModels(data.models || {});
       setKnownModels(data.known_models || data.models || {});
       setModelStatuses(data.model_statuses || {});
       setPendingVotes(data.pending_votes || []);
+      setPlanQuestions(data.plan_questions || []);
       setMessages(data.chat_history || []);
       setSharedMemory(data.shared_memory || []);
       setEpisodes(data.episodes || []);
@@ -211,6 +277,7 @@ export default function App() {
       setFileAuditLog(data.file_audit_log || []);
       setActiveFileLocks(data.active_file_locks || {});
       setTurnSchedule(data.turn_schedule || []);
+      setLoopActive(Boolean(data.loop_active));
       setProjects(data.projects || []);
       setActiveProjectId(data.project_id || 'default_project');
       setFrontendStatus(data.frontend_status || null);
@@ -286,6 +353,54 @@ export default function App() {
     const interval = setInterval(fetchState, 3000);
     return () => clearInterval(interval);
   }, []);
+
+  // Auto mode.
+  //
+  // The toggle used to be decoration: `isAutoTurn` was read in exactly two places, both
+  // of them its own label and colour. Nothing advanced a turn, so "Auto: ON" and
+  // "Auto: OFF" behaved identically and the room only ever moved when the Admin pressed
+  // "Next Turn" or sent a message.
+  //
+  // It now drives the same endpoint the manual button uses - one turn at a time, never
+  // overlapping, and never while the backend is already running its own loop. A rejected
+  // step (409: no eligible speaker) switches Auto off and says why, instead of retrying
+  // forever against a room that cannot move.
+  useEffect(() => {
+    if (!isAutoTurn) return;
+    let cancelled = false;
+    let inFlight = false;
+
+    const tick = async () => {
+      if (cancelled || inFlight) return;
+      // The backend loop started by /api/chat/message is already taking turns. Wait it out.
+      if (loopActiveRef.current) return;
+      inFlight = true;
+      try {
+        await post('/api/chat/step');
+        if (!cancelled) await fetchState();
+      } catch (e) {
+        if (!cancelled) {
+          setIsAutoTurn(false);
+          setApiError(`Auto mode stopped: ${errorText(e)}`);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void tick();
+    const id = setInterval(tick, AUTO_TURN_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [isAutoTurn]);
+
+  // A ref, not the state value: the interval closure above is created once per toggle and
+  // would otherwise read whatever `loopActive` was at that moment, forever.
+  useEffect(() => {
+    loopActiveRef.current = loopActive;
+  }, [loopActive]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -379,6 +494,13 @@ export default function App() {
       const data = await postJson<any>('/api/votes/override', { vote_id: voteId, action });
       // The vote can be recorded while the approved tool itself fails.
       if (data.executed === false && data.error) throw new Error(data.error);
+    });
+    fetchState();
+  };
+
+  const handleAnswerQuestion = async (questionId: string, answer: string) => {
+    await runAction('Answer planning question', async () => {
+      await postJson<any>('/api/plan/questions/answer', { question_id: questionId, answer });
     });
     fetchState();
   };
@@ -667,6 +789,54 @@ export default function App() {
         {/* CENTER CHAT ARENA (Takes Center Stage) */}
         <div className="flex-1 flex flex-col bg-slate-950 relative">
           
+          {/* PENDING ADMIN CHOICE. Deliberately phrased by what the person USING the
+              software would see, never by implementation noun - a question whose options
+              are engineering terms is a broken question, and the backend refuses to route
+              one here. Nothing is blocked while this sits unanswered. */}
+          {parkedQuestions.length > 0 && (
+            <div className="bg-sky-500/10 border-b border-sky-500/30 px-5 py-3 text-xs text-sky-200">
+              <div className="flex items-start gap-2 mb-2">
+                <HelpCircle className="w-4 h-4 text-sky-300 mt-0.5 shrink-0" />
+                <div>
+                  <div className="font-semibold text-sky-100">
+                    Your call{parkedQuestions.length > 1 ? ` (${parkedQuestions.length} waiting)` : ''}:
+                  </div>
+                  <div className="text-sky-200/90 mt-0.5">
+                    {parkedQuestions[0].question_admin || parkedQuestions[0].text_internal}
+                  </div>
+                  {parkedQuestions[0].rationale && (
+                    <div className="text-sky-300/60 mt-0.5">Why it matters: {parkedQuestions[0].rationale}</div>
+                  )}
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2 pl-6">
+                {parkedQuestions[0].options.map((opt) => (
+                  <button
+                    key={opt.label}
+                    onClick={() => handleAnswerQuestion(parkedQuestions[0].id, opt.label)}
+                    title={opt.means}
+                    className={`text-left px-3 py-1.5 rounded-lg border transition max-w-sm ${
+                      opt.label === parkedQuestions[0].recommended
+                        ? 'bg-sky-600/30 border-sky-400/50 hover:bg-sky-600/50'
+                        : 'bg-slate-800/70 border-slate-700 hover:bg-slate-700/70'
+                    }`}
+                  >
+                    <span className="font-medium text-sky-100">{opt.label}</span>
+                    {opt.label === parkedQuestions[0].recommended && (
+                      <span className="ml-1 text-[10px] text-sky-300">· suggested</span>
+                    )}
+                    {opt.means && opt.means !== opt.label && (
+                      <span className="block text-[11px] text-slate-300/80 mt-0.5">{opt.means}</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+              <div className="pl-6 mt-2 text-[11px] text-sky-300/50">
+                The room keeps working while you decide — it will use the suggestion if it has to move on.
+              </div>
+            </div>
+          )}
+
           {/* Pending Tool Vote Banner */}
           {pendingVotes.filter(v => v.status === 'pending').length > 0 && (
             <div className="bg-amber-500/10 border-b border-amber-500/30 px-5 py-2.5 flex items-center justify-between text-xs text-amber-300">
@@ -804,7 +974,7 @@ export default function App() {
                 }`}
               >
                 <Zap className="w-3.5 h-3.5" />
-                <span>Auto: {isAutoTurn ? 'ON' : 'OFF'}</span>
+                <span>Auto: {isAutoTurn ? (loopActive ? 'ON (room busy)' : 'ON') : 'OFF'}</span>
               </button>
             </div>
 
@@ -1571,6 +1741,9 @@ export default function App() {
                         onChange={async (e) => {
                           const target = e.target.value;
                           if (target === activeProjectId) return;
+                          // Blank the room first: a project owns its chat, its question board
+                          // and its tasks, and none of it should survive the switch on screen.
+                          clearRoomView();
                           await runAction('Switching project', async () => {
                             await postJson('/api/projects/switch', { project_id: target });
                           });
@@ -1619,6 +1792,9 @@ export default function App() {
                           if (!window.confirm(
                             `Archive project "${activeProjectId}"?\n\nIts memory, chat history and bot workspaces move to .swarmchat/trash, and the room switches to "${fallback}".`
                           )) return;
+                          // Deleting the active project auto-switches the room server-side,
+                          // so the same rule applies: clear before, not after.
+                          clearRoomView();
                           await runAction('Deleting the project', async () => {
                             await postJson('/api/projects/delete', { project_id: activeProjectId });
                           });

@@ -1,5 +1,12 @@
 @echo off
 title SwarmChat - 1-Click Launch ^& Setup
+
+:: Force the working directory to this script's own folder, no matter how it
+:: was launched (Windows Terminal profiles and "Run as administrator" can both
+:: start a .bat with a different current directory - e.g. %USERPROFILE% or
+:: System32 - which breaks every relative path below, like backend\requirements.txt).
+cd /d "%~dp0"
+
 echo ====================================================
 echo               SwarmChat Launch Script
 echo ====================================================

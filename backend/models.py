@@ -95,6 +95,11 @@ class ModelManager:
         # eviction and pick a least-recently-used victim instead of guessing.
         self.gguf_paths: Dict[str, str] = {}
         self.model_last_used: Dict[str, float] = {}
+        # Prompt tokens llama.cpp reported for each model's most recent generation. This is
+        # the ONLY honest measure of context pressure available - the orchestrator's
+        # `tokens_used` counts words a model has spoken, which is a different quantity
+        # entirely and must never be used to decide whether a context window is filling up.
+        self.last_prompt_tokens: Dict[str, int] = {}
         self.custom_search_paths: List[str] = []
         self._cached_search_paths: Optional[List[str]] = None
 
@@ -229,14 +234,29 @@ class ModelManager:
             logger.exception("llama-cpp-python installation could not be started")
             return {"success": False, "error": f"Error during engine installation: {e}"}
 
-    def update_model_status(self, model_id: str, status: str, error: Optional[str] = None, tok_per_sec: Optional[float] = None, vram_used_gb: float = 0.0, location: str = "RAM"):
+    def update_model_status(
+        self,
+        model_id: str,
+        status: str,
+        error: Optional[str] = None,
+        tok_per_sec: Optional[float] = None,
+        vram_used_gb: Optional[float] = None,
+        location: Optional[str] = None
+    ):
+        """Updates a model's status board entry, preserving fields the caller did not set.
+
+        `vram_used_gb` and `location` used to default to 0.0 / "RAM" rather than "unchanged".
+        Only the loader passes them, so the FIRST generation after a load overwrote the real
+        placement with "RAM, 0.0 GB". A model sitting in VRAM reported itself as CPU-resident
+        the moment it spoke, which made a genuine leak invisible: the board showed every
+        model in RAM using no VRAM while the process held 8.5 GB of it."""
         current = self.model_statuses.get(model_id, {})
         self.model_statuses[model_id] = {
             "status": status,  # "online", "offline", "error"
             "error": error,
             "tok_per_sec": tok_per_sec if tok_per_sec is not None else current.get("tok_per_sec", 0.0),
-            "vram_used_gb": vram_used_gb,
-            "location": location  # "VRAM", "RAM", or "Cloud"
+            "vram_used_gb": vram_used_gb if vram_used_gb is not None else current.get("vram_used_gb", 0.0),
+            "location": location if location is not None else current.get("location", "RAM")
         }
 
     def unload_gguf_model(self, model_id: str) -> bool:
@@ -262,6 +282,24 @@ class ModelManager:
         self.model_last_used.pop(model_id, None)
         return True
 
+    def unload_orphaned_gguf_models(self, keep_ids: Optional[List[str]] = None) -> List[str]:
+        """Releases every loaded GGUF that is no longer on the roster.
+
+        Kicking a model only removed it from `orchestrator.models`; the llama.cpp instance
+        stayed in `gguf_instances` holding its VRAM and RAM for the life of the process.
+        The room then showed 2 models while 3 were resident. Nothing else reclaims these,
+        because the eviction path only runs when some *other* load needs the space."""
+        keep = set(keep_ids or [])
+        dropped: List[str] = []
+        for m_id in list(self.gguf_instances.keys()):
+            if m_id in keep:
+                continue
+            if self.unload_gguf_model(m_id):
+                dropped.append(m_id)
+                self.model_statuses.pop(m_id, None)
+                logger.info("Released orphaned GGUF %s - no longer in the room", m_id)
+        return dropped
+
     def loaded_gguf_size_gb(self) -> float:
         """Total on-disk size of every currently loaded GGUF - the practical VRAM/RAM footprint."""
         total = 0.0
@@ -271,7 +309,13 @@ class ModelManager:
                 total += os.path.getsize(p) / (1024 ** 3)
         return round(total, 2)
 
-    def free_gguf_capacity(self, needed_gb: float, keep_ids: Optional[List[str]] = None) -> List[str]:
+    def free_gguf_capacity(
+        self,
+        needed_gb: float,
+        keep_ids: Optional[List[str]] = None,
+        device: Optional[str] = None,
+        n_ctx: int = 4096
+    ) -> List[str]:
         """Unloads least-recently-used GGUFs until `needed_gb` fits. Returns the ids evicted.
 
         Without this the app happily accepts a roster larger than the GPU, loads models
@@ -283,8 +327,13 @@ class ModelManager:
             key=lambda m: self.model_last_used.get(m, 0.0)
         )
         for m_id in candidates:
-            fit = self.can_load_model(needed_gb)
-            if fit.get("allowed"):
+            fit = self.can_load_model(needed_gb, n_ctx=n_ctx)
+            # When the caller specifically wants VRAM, "allowed" is not good enough:
+            # `allowed` is satisfied by system RAM, and stopping there is exactly how a
+            # model that should have been on the GPU ended up crawling on the CPU while
+            # a stale GGUF kept its VRAM.
+            satisfied = fit.get("fits_vram") if device == "VRAM" else fit.get("allowed")
+            if satisfied:
                 break
             if self.unload_gguf_model(m_id):
                 evicted.append(m_id)
@@ -333,8 +382,30 @@ class ModelManager:
         # with no room left either OOM'd or silently fell back to CPU and appeared to hang.
         size_gb = round(os.path.getsize(resolved_gguf) / (1024 ** 3), 2)
         fit = self.can_load_model(size_gb, n_ctx=max_tokens)
+
+        hw = self.get_hardware_info()
+        has_gpu = bool(hw.get("gpu_name") or hw.get("vram_total_gb", 0) > 0)
+        wants_gpu = has_gpu and force_device != "cpu"
+
+        # Falling back to system RAM is not a free consolation prize. A CPU-resident 4B
+        # model runs at a fraction of the speed AND competes with the OS for the same
+        # 16 GB that keeps the desktop responsive - the observed end state was three
+        # models on the CPU, 0.5 GB of free RAM, and 25 tok/s. If the GPU is the intended
+        # home and the model does not fit there, evict the least-recently-used resident
+        # GGUF first, and only consider RAM once there is nothing left to evict.
+        if wants_gpu and not fit.get("fits_vram"):
+            evicted = self.free_gguf_capacity(
+                size_gb, keep_ids=[model_id], device="VRAM", n_ctx=max_tokens
+            )
+            if evicted:
+                logger.info(
+                    "Unloaded %s to make VRAM room for %s (%.2f GB)",
+                    ", ".join(evicted), model_id, size_gb
+                )
+                fit = self.can_load_model(size_gb, n_ctx=max_tokens)
+
         if not fit.get("allowed"):
-            evicted = self.free_gguf_capacity(size_gb, keep_ids=[model_id])
+            evicted = self.free_gguf_capacity(size_gb, keep_ids=[model_id], n_ctx=max_tokens)
             fit = self.can_load_model(size_gb, n_ctx=max_tokens)
             if evicted:
                 logger.info("Unloaded %s to make room for %s (%.2f GB)", ", ".join(evicted), model_id, size_gb)
@@ -345,31 +416,22 @@ class ModelManager:
                 f"{fit.get('message', '')} Remove a model from the roster or pick a smaller quant."
             )
 
-        hw = self.get_hardware_info()
-        # Assume VRAM preferred by default if GPU present
-        has_gpu = bool(hw.get("gpu_name") or hw.get("vram_total_gb", 0) > 0)
-        if force_device == "gpu":
-            # "gpu" is a preference, not a promise: a full offload that doesn't fit in free
-            # VRAM is exactly the case that used to OOM or crawl. Fall back to RAM instead.
-            fits_vram = hw.get("vram_free_gb", 0) >= (size_gb + 0.7)
-            n_gpu_layers = -1 if (has_gpu and fits_vram) else 0
-            location = "VRAM" if (has_gpu and fits_vram) else "RAM"
-            if has_gpu and not fits_vram:
-                logger.warning(
-                    "Requested GPU load for %s (%.2f GB) but only %.2f GB VRAM free - loading on CPU instead",
-                    model_id, size_gb, hw.get("vram_free_gb", 0)
-                )
-        elif force_device == "cpu":
-            n_gpu_layers = 0
-            location = "RAM"
+        # One decision, one source of truth. The device used to be re-derived here from a
+        # raw `vram_free_gb >= size + 0.7` check that ignored the KV cache and compute
+        # buffer the gate had just accounted for, so a model could pass the gate and then
+        # be placed on a GPU that could not really hold it.
+        if force_device == "cpu":
+            n_gpu_layers, location = 0, "RAM"
+        elif has_gpu and fit.get("fits_vram"):
+            n_gpu_layers, location = -1, "VRAM"
         else:
-            # Prefer VRAM if free VRAM exists and GPU is detected
-            if has_gpu and hw.get("vram_free_gb", 0) >= (size_gb + 0.7):
-                n_gpu_layers = -1
-                location = "VRAM"
-            else:
-                n_gpu_layers = 0
-                location = "RAM"
+            n_gpu_layers, location = 0, "RAM"
+            if wants_gpu:
+                logger.warning(
+                    "Wanted a GPU load for %s (needs %.2f GB) but only %.2f GB of usable VRAM "
+                    "remains after eviction - loading on CPU instead",
+                    model_id, fit.get("needed_gb", size_gb), fit.get("vram_avail_gb", 0.0)
+                )
 
         # Resolve mmproj (clip/vision projector) if provided
         chat_handler = None
@@ -557,8 +619,19 @@ class ModelManager:
         hw = self.get_hardware_info()
         avail_ram = hw["ram_available_gb"]
         avail_vram = hw["vram_free_gb"]
-        headroom_gb = 1.5
-        effective_avail = max(avail_ram - headroom_gb, 0.0) + avail_vram
+        ram_headroom_gb = 1.5
+        vram_headroom_gb = 0.7
+
+        # A GGUF loads either fully onto the GPU or fully into system RAM - llama.cpp does
+        # not split one model across both. The old gate summed the two pools
+        # (`(ram - 1.5) + vram`), so it would approve a load using headroom on the device
+        # the model was never going to occupy. Eviction therefore never fired, every load
+        # was "allowed", and models stacked until BOTH pools were exhausted - which is how
+        # a 2-model roster ended up with 8.5 GB of leaked VRAM and 0.5 GB of free RAM.
+        # Judge each device separately and report which one, if either, can actually take it.
+        ram_avail = max(avail_ram - ram_headroom_gb, 0.0)
+        vram_avail = max(avail_vram - vram_headroom_gb, 0.0)
+        effective_avail = max(ram_avail, vram_avail)
 
         # Account for KV cache + compute buffer overhead
         #   n_ctx * n_layer * n_kv_heads * head_dim * 2 (K and V) * bytes_per_element
@@ -582,25 +655,45 @@ class ModelManager:
                     "Q5_K_M minimum or Q6_K/Q8_0 is recommended for models ≤5B."
                 )
 
-        if total_needed_gb > effective_avail:
+        fits_vram = total_needed_gb <= vram_avail
+        fits_ram = total_needed_gb <= ram_avail
+        device = "VRAM" if fits_vram else ("RAM" if fits_ram else None)
+        base = {
+            "quant_warning": quant_warning,
+            "fits_vram": fits_vram,
+            "fits_ram": fits_ram,
+            "device": device,
+            "vram_avail_gb": round(vram_avail, 2),
+            "ram_avail_gb": round(ram_avail, 2),
+            "needed_gb": round(total_needed_gb, 2),
+        }
+
+        if device is None:
             return {
+                **base,
                 "allowed": False,
                 "warning": True,
-                "quant_warning": quant_warning,
-                "message": f"Total memory needed ({total_needed_gb:.2f} GB = {estimated_size_gb:.1f} GB model + {overhead_gb:.2f} GB KV/compute) exceeds safe available memory ({effective_avail:.1f} GB with headroom).{quant_warning}"
+                "message": (
+                    f"Total memory needed ({total_needed_gb:.2f} GB = {estimated_size_gb:.1f} GB model + "
+                    f"{overhead_gb:.2f} GB KV/compute) fits neither device: {vram_avail:.1f} GB usable VRAM, "
+                    f"{ram_avail:.1f} GB usable RAM.{quant_warning}"
+                )
             }
-        elif total_needed_gb > (effective_avail * 0.8):
+        if total_needed_gb > (effective_avail * 0.8):
             return {
+                **base,
                 "allowed": True,
                 "warning": True,
-                "quant_warning": quant_warning,
-                "message": f"High memory utilization warning: Loading model ({total_needed_gb:.2f} GB total) leaves tight RAM/VRAM margin.{quant_warning}"
+                "message": (
+                    f"High memory utilization warning: loading this model ({total_needed_gb:.2f} GB total) "
+                    f"into {device} leaves a tight margin.{quant_warning}"
+                )
             }
         return {
+            **base,
             "allowed": True,
             "warning": bool(quant_warning),
-            "quant_warning": quant_warning,
-            "message": f"Sufficient memory headroom available ({total_needed_gb:.2f} GB needed).{quant_warning}"
+            "message": f"Sufficient {device} headroom available ({total_needed_gb:.2f} GB needed).{quant_warning}"
         }
 
     @staticmethod
@@ -903,8 +996,21 @@ class ModelManager:
                 content = response["choices"][0]["message"]["content"]
 
                 # Calculate speed (tok/sec)
-                completion_tokens = response.get("usage", {}).get("completion_tokens", len(content.split()))
+                usage = response.get("usage", {}) or {}
+                completion_tokens = usage.get("completion_tokens", len(content.split()))
                 tok_per_sec = round(completion_tokens / max(elapsed, 0.001), 1)
+
+                # The one number that says whether the room is drifting into context bloat.
+                # Nothing measured it before: `tokens_used` counts only the words a model has
+                # SPOKEN, never the prompt it was handed, so a prompt could grow without limit
+                # and no counter, log line or UI field would move.
+                prompt_tokens = usage.get("prompt_tokens", prompt_tokens_est)
+                self.last_prompt_tokens[model_id] = int(prompt_tokens)
+                logger.info(
+                    "%s turn: prompt=%d tok (%.0f%% of n_ctx=%d), completion=%d tok, %.1fs, %.1f tok/s",
+                    model_id, prompt_tokens, 100.0 * prompt_tokens / max(n_ctx, 1),
+                    n_ctx, completion_tokens, elapsed, tok_per_sec
+                )
 
                 self.update_model_status(
                     model_id,

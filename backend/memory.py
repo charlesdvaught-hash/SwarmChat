@@ -42,8 +42,14 @@ class MemoryManager:
             # unstructured - whoever the roster happened to pick talked until a turn/time cap
             # force-flipped the phase, so a plan could reach execution with nobody having
             # reviewed it. See MemoryManager.PLAN_STAGES.
-            "plan_stage": "awaiting_plan",
+            "plan_stage": "awaiting_questions",
             "plan_revision": 0,
+            # The open questions the room must settle before a plan is written, and the
+            # answers it settled them with. Discussion produces STATE, not opinions: the
+            # exit condition is "no question is still open", which is countable, rather
+            # than "the reviewer approved", which is a judgement a <=5B model cannot make
+            # the same way twice. See PLAN_STAGES and add_plan_question().
+            "plan_questions": [],
             "shared_entries": [],
             "model_journals": {},
             "model_spec_files": {},  # Per-model spec files/notebooks (model_id -> str content)
@@ -192,13 +198,36 @@ class MemoryManager:
     # --- PRE-EXECUTION PLANNING GATE ---
     # Discussion is no longer a free-for-all. The room walks a fixed sequence before any
     # file can be written, and only the Architect closes it out:
-    #   awaiting_plan     -> Architect proposes / rehashes the build plan
-    #   critic_review     -> Critic hunts for weak or contradictory parts
-    #   programmer_review -> Coder confirms the plan is actually buildable
-    #   approved          -> Architect may call [READY_FOR_EXECUTION]
-    # A rejection at either review step returns to awaiting_plan, so the Architect rehashes
-    # rather than the room drifting into execution on an unreviewed plan.
-    PLAN_STAGES = ("awaiting_plan", "critic_review", "programmer_review", "approved")
+    #   awaiting_questions  -> Architect lists what is genuinely undecided (capped in code)
+    #   resolving_questions -> exactly ONE question is settled per turn
+    #   awaiting_plan       -> Architect writes the plan AGAINST those decisions
+    #   critic_review       -> Critic hunts for weak or contradictory parts
+    #   programmer_review   -> Coder confirms the plan is actually buildable
+    #   approved            -> Architect may call [READY_FOR_EXECUTION]
+    #
+    # The two question stages exist because the old gate looped. A REJECT dumped the room
+    # back to awaiting_plan for a full rewrite, and the objection survived only as one
+    # 300-character chat message that fell out of the 3-message window within two turns -
+    # so revision 2 did not reliably address revision 1's complaint. Observed live:
+    # "Critic rejected the plan" -> "build plan revision 2" -> rejected again, with nothing
+    # accumulating. The waste was never that discussion is long; it is that each turn
+    # restated instead of resolving.
+    #
+    # So a REJECT now becomes a NEW QUESTION rather than a rewrite (see
+    # Orchestrator._advance_plan_gate), and the exit condition is countable: zero open
+    # questions. "Does the plan say what word_count('') returns?" is something a 3B model
+    # can check twice and get the same answer; "is this plan good?" is not.
+    PLAN_STAGES = (
+        "awaiting_questions",
+        "resolving_questions",
+        "awaiting_plan",
+        "critic_review",
+        "programmer_review",
+        "approved",
+    )
+
+    # Statuses a question record may hold.
+    QUESTION_STATUSES = ("open", "parked", "resolved")
 
     def set_plan_stage(self, stage: str) -> str:
         normalized = (stage or "").strip().lower()
@@ -226,10 +255,89 @@ class MemoryManager:
 
     def reset_plan_gate(self) -> str:
         """Back to square one - a new project, or a return to discussion, starts planning over."""
-        self.state["plan_stage"] = "awaiting_plan"
+        self.state["plan_stage"] = "awaiting_questions"
         self.state["plan_revision"] = 0
+        self.state["plan_questions"] = []
         self.save_memory()
-        return "awaiting_plan"
+        return "awaiting_questions"
+
+    # --- PLANNING QUESTIONS ---
+    # Shape mirrors pending_tool_votes (id / votes / status / created_at) on purpose, so the
+    # Admin-response plumbing and the UI card pattern are the ones that already exist.
+    #
+    #   text_internal   what the room actually needs to know, in its own words
+    #   question_admin  the same thing phrased by what the USER experiences (admin-routed only)
+    #   options         [{label, means}] - `means` is what it means in practice, not a noun
+    #   recommended     the label the Architect would pick, used as the default
+    #   rationale       one line of why
+    #   resolvable_by   "model" (the room settles it) | "admin" (only the Admin can)
+    #   status          open | parked | resolved
+    #   decided_by      admin | vote | default  - provenance, so a later session can tell a
+    #                   real decision from the room guessing
+    def get_plan_questions(self) -> List[Dict[str, Any]]:
+        questions = self.state.get("plan_questions")
+        if not isinstance(questions, list):
+            questions = []
+            self.state["plan_questions"] = questions
+        return questions
+
+    def add_plan_question(
+        self,
+        text_internal: str,
+        question_admin: str = "",
+        options: Optional[List[Dict[str, str]]] = None,
+        recommended: str = "",
+        rationale: str = "",
+        resolvable_by: str = "model",
+        asked_by: str = "",
+    ) -> Dict[str, Any]:
+        questions = self.get_plan_questions()
+        record = {
+            "id": f"q_{int(time.time() * 1000)}_{len(questions)}",
+            "number": len(questions) + 1,
+            "text_internal": (text_internal or "").strip(),
+            "question_admin": (question_admin or "").strip(),
+            "options": options or [],
+            "recommended": (recommended or "").strip(),
+            "rationale": (rationale or "").strip(),
+            "resolvable_by": "admin" if resolvable_by == "admin" else "model",
+            "status": "open",
+            "answer": "",
+            "decided_by": "",
+            "votes": {},
+            "asked_by": asked_by,
+            "created_at": time.time(),
+        }
+        questions.append(record)
+        self.save_memory()
+        return record
+
+    def update_plan_question(self, question_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for q in self.get_plan_questions():
+            if q["id"] == question_id:
+                if "status" in updates and updates["status"] not in self.QUESTION_STATUSES:
+                    raise ValueError(
+                        f"Unknown question status '{updates['status']}'. "
+                        f"Valid: {', '.join(self.QUESTION_STATUSES)}."
+                    )
+                q.update(updates)
+                self.save_memory()
+                return q
+        return None
+
+    def get_plan_question(self, question_id: str) -> Optional[Dict[str, Any]]:
+        return next((q for q in self.get_plan_questions() if q["id"] == question_id), None)
+
+    def questions_by_status(self, status: str) -> List[Dict[str, Any]]:
+        return [q for q in self.get_plan_questions() if q.get("status") == status]
+
+    def next_open_question(self) -> Optional[Dict[str, Any]]:
+        """The ONE question on the table this turn.
+
+        Exactly one question is pinned per turn - the same rule the batch scheduler already
+        applies to tasks. That is the token control: bounded work per turn, and the model
+        physically cannot re-litigate the whole plan."""
+        return next((q for q in self.get_plan_questions() if q.get("status") == "open"), None)
 
     def add_entry(self, author: str, content: str):
         entry = {

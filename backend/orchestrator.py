@@ -6,6 +6,14 @@ import re
 import time
 import asyncio
 from typing import Callable, Dict, Any, List, Optional
+from backend.directives import (
+    find_payload,
+    find_payloads,
+    parse_fields,
+    parse_strict_pairs,
+    split_options,
+    split_title,
+)
 from backend.errors import DirectiveParseError, ModelInvocationError, SwarmChatError
 from backend.models import ModelManager, DEFAULT_N_CTX
 from backend.prompts import get_system_prompt
@@ -353,6 +361,15 @@ class Orchestrator:
             was_moderator = self._is_supervisor(self.models[model_id])
             del self.models[model_id]
 
+        # Removing a model from the roster used to leave its llama.cpp instance loaded for
+        # the life of the process. The room reported two models while three were resident,
+        # and the third one's VRAM was never coming back - nothing else reclaims it,
+        # because eviction only runs when some other load needs the space.
+        try:
+            self.model_manager.unload_gguf_model(model_id)
+        except Exception as e:
+            logger.warning("Unload on kick for %s skipped: %s", model_id, e)
+
         # No auto-reassignment any more: the supervisor seat follows the Architect role, so
         # kicking the Architect leaves the room genuinely without one until another
         # Architect-role model is added. Silently promoting an arbitrary survivor (the old
@@ -386,13 +403,34 @@ class Orchestrator:
             return {"success": True, "model": self.models[model_id]}
         return {"success": False, "error": "Model not found in known models library"}
 
-    def add_chat_message(self, sender: str, role: str, content: str, is_admin: bool = False, model_id: Optional[str] = None) -> Dict[str, Any]:
+    def add_chat_message(
+        self,
+        sender: str,
+        role: str,
+        content: str,
+        is_admin: bool = False,
+        model_id: Optional[str] = None,
+        model_visible: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Appends a turn to the room.
+
+        `content` is what the ADMIN reads - it may carry role flavour, headlines, emoji.
+        `model_visible` is what a teammate model is allowed to read on a later turn.
+
+        These are deliberately two fields. Discussion turns feed `chat_history[-3:]` back into
+        the next speaker, so anything written into `content` is model input by default - and
+        the moment presentation text becomes model input, models start responding to the
+        narration instead of to the work. Flavour goes in `content` only; `model_visible`
+        stays the plain pipeline reflection. Defaults to `content` so every existing caller
+        (admin messages, system notices) behaves exactly as before.
+        """
         msg = {
             "id": f"msg_{int(time.time()*1000)}",
             "timestamp": time.time(),
             "sender": sender,
             "role": role,
             "content": content,
+            "model_visible": model_visible if model_visible is not None else content,
             "is_admin": is_admin,
             "model_id": model_id,
             "phase": self.memory_manager.get_phase()
@@ -426,12 +464,20 @@ class Orchestrator:
         self.turn_schedule = schedule
         return self.turn_schedule
 
+    # Canonical role-substring sets. Defined here (rather than only down by
+    # _PLAN_STAGE_ROLES) so _EXECUTION_STAGE_ROLES can share them instead of hardcoding a
+    # narrower ("coder",)/("critic",)-only copy that silently drifts from what
+    # _SEAT_ROLE_CLAIMS[SEAT_CODER]/[SEAT_CRITIC] actually accept - a "developer" or
+    # "reviewer" role used to claim the seat fine but never got handed the task.
+    _CRITIC_ROLES = ("critic", "reviewer")
+    _PROGRAMMER_ROLES = ("coder", "programmer", "developer", "engineer")
+
     # Execution-phase task status -> which role should take the next turn.
     _EXECUTION_STAGE_ROLES = {
-        "in_progress": ("coder",),
-        "needs_review": ("critic",),
+        "in_progress": _PROGRAMMER_ROLES,
+        "needs_review": _CRITIC_ROLES,
         "needs_test": ("tester", "debugger"),
-        "failed": ("coder",),
+        "failed": _PROGRAMMER_ROLES,
     }
 
     # Order in which outstanding work is considered. Same precedence the old single-task
@@ -477,6 +523,21 @@ class Orchestrator:
                     roles = self._EXECUTION_STAGE_ROLES.get(status)
                     exclude = t.get("author_bot_id") if status == "needs_review" else None
                     owner = self._find_model_by_role(active_models, roles, exclude=exclude) if roles else None
+                    if not owner and status in ("in_progress", "failed"):
+                        # No dedicated Coder-role model in the roster - let the Architect
+                        # cover Coder-stage work rather than stalling the task silently.
+                        # Mirrors the tiered fallback already used for the refiner seat in
+                        # trigger_sandbox_refinement_loop (Tester/Debugger -> Critic/Coder -> bot_id).
+                        owner = self._architect_id(active_models)
+                    elif not owner and status == "needs_test":
+                        # No dedicated Tester/Debugger model either - same tiered fallback as
+                        # trigger_sandbox_refinement_loop's refiner seat: try Critic or Coder
+                        # next, then the Architect as last resort (no bot_id to fall back to
+                        # here, unlike the sandbox-refinement path).
+                        owner = (
+                            self._find_model_by_role(active_models, self._CRITIC_ROLES + self._PROGRAMMER_ROLES)
+                            or self._architect_id(active_models)
+                        )
                 if owner:
                     work.append((t, owner))
         return work
@@ -534,11 +595,13 @@ class Orchestrator:
     #   approved          Architect - and only the Architect - calls [READY_FOR_EXECUTION]
     #
     # A REJECT at either review returns the room to awaiting_plan for a rehash.
-    _CRITIC_ROLES = ("critic", "reviewer")
-    _PROGRAMMER_ROLES = ("coder", "programmer", "developer", "engineer")
+    # _CRITIC_ROLES / _PROGRAMMER_ROLES now live earlier in the class, next to
+    # _EXECUTION_STAGE_ROLES, so both consumers share one definition.
 
     # stage -> the roles that own the turn at that stage.
     _PLAN_STAGE_ROLES = {
+        "awaiting_questions": "architect",
+        "resolving_questions": "architect",
         "awaiting_plan": "architect",
         "critic_review": "critic",
         "programmer_review": "programmer",
@@ -592,6 +655,8 @@ class Orchestrator:
         """Move the gate forward and say so in chat, so the room's state is legible."""
         new_stage = self.memory_manager.set_plan_stage(stage)
         labels = {
+            "awaiting_questions": "❓ OPEN QUESTIONS",
+            "resolving_questions": "🧩 RESOLVING",
             "awaiting_plan": "📝 PLAN REVISION",
             "critic_review": "🔍 CRITIC REVIEW",
             "programmer_review": "🔧 PROGRAMMER REVIEW",
@@ -988,20 +1053,462 @@ class Orchestrator:
         )
         return True
 
+    # --- QUESTION-DRIVEN DISCUSSION ---
+    #
+    # Cap enforced in CODE, not requested in the prompt. A <=5B model satisfies a format
+    # instruction over a substantive one, so "list the ambiguities, at most five" reliably
+    # produces fifteen, half of them "which Python version?". Ask for the real thing; take
+    # the first five.
+    MAX_PLAN_QUESTIONS = 5
+
+    # Below this a "question" is a fragment ("Ok?"), not something anyone can answer.
+    MIN_QUESTION_CHARS = 12
+
+    # Engineering nouns that must never reach the Admin as a bare option label.
+    #
+    # This list is the load-bearing part of the whole feature. Admin is not a coder and said
+    # so exactly: "If an AI asks me if I want a CLI or a library it might as well be asking
+    # would you like your software extra cheesy." An admin-routed question has to be phrased
+    # by what the USER EXPERIENCES, never by implementation noun. When a label is jargon and
+    # carries no plain-English account of what it means in practice, the question is not
+    # asked at all - it is handed back to the room, because a question the Admin cannot
+    # parse is worse than no question: it stalls the room AND produces a coin-flip answer.
+    _ADMIN_JARGON = (
+        "cli", "api", "sdk", "library", "module", "framework", "schema", "orm", "endpoint",
+        "repository", "dependency", "abstraction", "interface", "refactor", "serialization",
+        "async", "thread", "daemon", "binary", "package", "namespace", "regex", "stdout",
+        "stdin", "json", "yaml", "sqlite", "dataclass", "tuple", "dict", "monolith",
+        "microservice", "middleware", "singleton", "polymorphism", "recursion", "wrapper",
+    )
+
+    _QUESTION_KEYS = ("ask", "question", "text", "options", "recommended", "why", "rationale", "for", "needs")
+    _VOTE_KEYS = ("q", "question", "choice", "option")
+
+    def plan_questions(self) -> List[Dict[str, Any]]:
+        """Public read for /api/state - the whole question board, in ask order."""
+        return self.memory_manager.get_plan_questions()
+
+    def _distinct_model_paths(self) -> List[str]:
+        """Distinct resolved GGUF paths across the active room.
+
+        DISTINCT MODELS, not distinct seats. One set of weights holding both the Architect
+        and the Critic seat made every "second opinion" theatre - the failure the roster
+        note recorded - and a vote among seats backed by one model is that same failure
+        wearing a ballot box. Fewer than two of these means no vote happens at all."""
+        paths: List[str] = []
+        for m_id in self.get_active_model_ids():
+            cfg = self.models.get(m_id, {})
+            raw = cfg.get("gguf_path") or cfg.get("model_name") or m_id
+            try:
+                resolved = self.model_manager.resolve_gguf_path(raw)
+            except Exception:
+                resolved = None
+            key = str(resolved or raw)
+            if key not in paths:
+                paths.append(key)
+        return paths
+
+    def _auto_mode_active(self) -> bool:
+        """Auto Mode = the room is taking its own turns. Nobody is watching for a question
+        to appear, so a parked question must never be allowed to stall the loop."""
+        return bool(self.loop_active)
+
+    def _question_is_askable(self, q: Dict[str, Any]) -> bool:
+        """Whether an admin-routed question is fit to put in front of a non-coder.
+
+        Required structure: a plain question, two or three options each described by what it
+        means in practice, a recommendation, and a one-line why. Anything short of that is a
+        defect in the question, not a decision for the Admin to make."""
+        if len(q.get("options") or []) < 2:
+            return False
+        if not q.get("recommended"):
+            return False
+        text = q.get("question_admin") or q.get("text_internal") or ""
+        if len(text.strip()) < self.MIN_QUESTION_CHARS:
+            return False
+        for opt in q["options"]:
+            label = (opt.get("label") or "").lower()
+            means = (opt.get("means") or "").strip().lower()
+            is_jargon = any(re.search(r"\b" + re.escape(j) + r"\b", label) for j in self._ADMIN_JARGON)
+            # Jargon is tolerable ONLY when the option also says, in different words, what it
+            # means in practice. "Library: a piece other programs can call, with no screen of
+            # its own" is fine. A bare "Library" is not.
+            if is_jargon and (not means or means == label.strip()):
+                return False
+        return True
+
+    def _make_question(self, fields: Dict[str, str], asked_by: str) -> Optional[Dict[str, Any]]:
+        text = (fields.get("ask") or fields.get("question") or fields.get("text") or "").strip()
+        if len(text) < self.MIN_QUESTION_CHARS:
+            return None
+        options = split_options(fields.get("options", ""))
+        recommended = (fields.get("recommended") or "").strip()
+        if options and not recommended:
+            recommended = options[0]["label"]
+        audience = (fields.get("for") or fields.get("needs") or "").strip().lower()
+        resolvable_by = "admin" if audience.startswith("admin") else "model"
+
+        record = self.memory_manager.add_plan_question(
+            text_internal=text,
+            question_admin=text if resolvable_by == "admin" else "",
+            options=options,
+            recommended=recommended,
+            rationale=(fields.get("why") or fields.get("rationale") or "").strip(),
+            resolvable_by=resolvable_by,
+            asked_by=asked_by,
+        )
+
+        if record["resolvable_by"] == "admin" and not self._question_is_askable(record):
+            # Hand it back to the room rather than asking the Admin something they cannot
+            # answer. Logged, because a silently downgraded question looks like the room
+            # deciding things behind the Admin's back.
+            self.memory_manager.update_plan_question(record["id"], {"resolvable_by": "model"})
+            record["resolvable_by"] = "model"
+            logger.info(
+                "Question %s was routed to Admin but is not askable (jargon label, or missing "
+                "options/recommendation); the room will settle it instead", record["id"]
+            )
+        return record
+
+    def _harvest_questions(self, model_id: str, model_cfg: Dict[str, Any], response_text: str) -> int:
+        """Pull this turn's questions off the wire. Returns how many were kept.
+
+        Structured `[QUESTION: ...]` directives first; bare interrogative lines are the
+        backstop, because a small model told to "list what is undecided" very often produces
+        a numbered list of plain questions and no brackets at all. Discarding those would
+        throw away the exact output we asked for, over syntax."""
+        existing = len(self.memory_manager.get_plan_questions())
+        room = self.MAX_PLAN_QUESTIONS - existing
+        if room <= 0:
+            return 0
+
+        kept = 0
+        asked_by = model_cfg.get("name", model_id)
+        for payload in self._directive_payloads(response_text, "[QUESTION:"):
+            if kept >= room:
+                break
+            if payload is None:
+                self._report_directive_failure("QUESTION", model_cfg, "missing closing ']'")
+                continue
+            fields = parse_fields(payload, self._QUESTION_KEYS)
+            if not fields:
+                # No recognised key at all: the whole payload is the question text.
+                fields = {"ask": payload}
+            if self._make_question(fields, asked_by):
+                kept += 1
+
+        if kept:
+            return kept
+
+        prose = self._strip_directive_tags(response_text)
+        prose = re.sub(r"```[\s\S]*?```", "", prose)
+        for line in self._extract_prose_questions(prose):
+            if kept >= room:
+                break
+            if self._make_question({"ask": line}, asked_by):
+                kept += 1
+        return kept
+
+    def _extract_prose_questions(self, prose: str) -> List[str]:
+        """Interrogative lines from plain prose, de-duplicated, in order."""
+        found: List[str] = []
+        for raw_line in (prose or "").splitlines():
+            line = raw_line.strip().lstrip("-*\u2022").strip()
+            line = re.sub(r"^\(?\d+[\).]\s*", "", line).strip()
+            if not line.endswith("?") or len(line) < self.MIN_QUESTION_CHARS:
+                continue
+            if any(self._calculate_similarity(line.lower(), f.lower()) > 0.85 for f in found):
+                continue
+            found.append(line[:400])
+        return found
+
+    def _park_admin_question(self, q: Dict[str, Any]) -> None:
+        """Post an Admin choice and MOVE ON.
+
+        Never block the room: the question is checkpointed as pending and the next available
+        item - the next question, or the next task - is worked immediately. The parked
+        question resumes the moment the Admin answers, with nothing lost."""
+        self.memory_manager.update_plan_question(q["id"], {"status": "parked"})
+        lines = ["🙋 [YOUR CALL] " + self._question_admin_text(q)]
+        for opt in q.get("options") or []:
+            mark = " \u2190 recommended" if opt["label"] == q.get("recommended") else ""
+            means = opt["means"] if opt["means"] != opt["label"] else ""
+            lines.append("  \u2022 **" + opt["label"] + "**" + (" \u2014 " + means if means else "") + mark)
+        if q.get("rationale"):
+            lines.append("  Why: " + q["rationale"])
+        lines.append("The room carries on in the meantime \u2014 answer whenever you like.")
+        self.add_chat_message(
+            sender="System / Plan Questions",
+            role="System",
+            content="\n".join(lines),
+            is_admin=True,
+        )
+
+    @staticmethod
+    def _question_admin_text(q: Dict[str, Any]) -> str:
+        return q.get("question_admin") or q.get("text_internal") or "A decision is needed."
+
+    def _resolve_question(self, q: Dict[str, Any], answer: str, decided_by: str) -> Dict[str, Any]:
+        """Record an answer with its PROVENANCE.
+
+        admin / vote / default must stay distinguishable so a later session can see which
+        decisions were real and which were the room guessing - and so the plan can say
+        "assumed:" out loud instead of presenting a guess as a requirement."""
+        updated = self.memory_manager.update_plan_question(q["id"], {
+            "status": "resolved",
+            "answer": (answer or "").strip()[:600],
+            "decided_by": decided_by,
+        }) or q
+        source = {
+            "admin": "you decided",
+            "vote": "the room voted",
+            "default": "nobody could decide, so the recommendation stands",
+        }.get(decided_by, decided_by)
+        self.memory_manager.add_entry(
+            author="System / Plan Questions",
+            content=(
+                "Q" + str(updated.get("number")) + " settled (" + decided_by + "): "
+                + updated["text_internal"] + " -> " + updated["answer"]
+            ),
+        )
+        self.add_chat_message(
+            sender="System / Plan Questions",
+            role="System",
+            content="\u2705 Q" + str(updated.get("number")) + " settled \u2014 " + updated["answer"] + " (" + source + ").",
+            is_admin=True,
+        )
+        return updated
+
+    def _record_question_ballots(self, model_id: str, model_cfg: Dict[str, Any], response_text: str) -> None:
+        """`[VOTE: q=<number>, choice=<label>]` from any planning seat.
+
+        Deliberately not restricted to the stage owner: a vote whose ballots all come from
+        the seat that wrote the question is not a vote."""
+        for payload in self._directive_payloads(response_text, "[VOTE:"):
+            if payload is None:
+                self._report_directive_failure("VOTE", model_cfg, "missing closing ']'")
+                continue
+            fields = parse_fields(payload, self._VOTE_KEYS)
+            choice = (fields.get("choice") or fields.get("option") or "").strip()
+            ref = (fields.get("q") or fields.get("question") or "").strip()
+            if not choice:
+                continue
+            target = None
+            for q in self.memory_manager.get_plan_questions():
+                if q.get("status") != "parked":
+                    continue
+                if not ref or ref == q["id"] or ref.lstrip("Qq#") == str(q.get("number")):
+                    target = q
+                    break
+            if not target:
+                continue
+            votes = dict(target.get("votes") or {})
+            votes[model_id] = choice[:80]
+            self.memory_manager.update_plan_question(target["id"], {"votes": votes})
+
+    def _close_ballot(self, q: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Decide a parked question in Auto Mode, or leave it parked for the Admin.
+
+        The rule that matters: fewer than two DISTINCT MODELS means no vote. Take the
+        Architect's recommendation and record `decided_by: default` - honest about being a
+        guess - rather than staging a ballot between two seats wearing the same weights."""
+        if not self._auto_mode_active():
+            return None
+        recommended = q.get("recommended") or (q["options"][0]["label"] if q.get("options") else "")
+        if len(self._distinct_model_paths()) < 2:
+            if not recommended:
+                return None
+            return self._resolve_question(q, recommended, "default")
+
+        votes = q.get("votes") or {}
+        if not votes:
+            return None
+        tally: Dict[str, int] = {}
+        for choice in votes.values():
+            tally[choice] = tally.get(choice, 0) + 1
+        top = max(tally.values())
+        winners = [c for c, n in tally.items() if n == top]
+        if len(winners) == 1:
+            return self._resolve_question(q, winners[0], "vote")
+        # A tie is not a decision. Fall back to the recommendation, recorded as a default.
+        return self._resolve_question(q, recommended, "default") if recommended else None
+
+    def _settle_questions(self, reason: str) -> bool:
+        """Route, auto-close, and advance the gate when the board is clear.
+
+        Returns True when the gate moved on to awaiting_plan."""
+        for q in list(self.memory_manager.get_plan_questions()):
+            if q.get("status") == "open" and q.get("resolvable_by") == "admin":
+                self._park_admin_question(q)
+        for q in list(self.memory_manager.questions_by_status("parked")):
+            self._close_ballot(q)
+
+        if self.memory_manager.next_open_question():
+            return False
+
+        parked = self.memory_manager.questions_by_status("parked")
+        note = (
+            " " + str(len(parked)) + " still with you \u2014 the plan will mark those as assumptions."
+            if parked else ""
+        )
+        self._advance_plan_stage("awaiting_plan", reason + note)
+        return True
+
+    def answer_plan_question(self, question_id: str, answer: str) -> Dict[str, Any]:
+        """The Admin's answer to a parked question. Resumes the gate without losing work."""
+        q = self.memory_manager.get_plan_question(question_id)
+        if not q:
+            return {"success": False, "error": "Question '" + str(question_id) + "' not found"}
+        answer = (answer or "").strip()
+        if not answer:
+            return {"success": False, "error": "An answer is required."}
+        # Admin always wins, including over a ballot the room already closed - the point of
+        # the vote was to avoid waiting, not to overrule the person being waited on.
+        was_resolved = q.get("status") == "resolved"
+        self._resolve_question(q, answer, "admin")
+        if was_resolved:
+            self.add_chat_message(
+                sender="System / Plan Questions",
+                role="System",
+                content=(
+                    "\u21a9\ufe0f Q" + str(q.get("number")) + " was re-decided by you; the room's "
+                    "earlier answer is superseded."
+                ),
+                is_admin=True,
+            )
+        if self.memory_manager.get_plan_stage() == "resolving_questions":
+            self._settle_questions("Every open question is settled.")
+        return {"success": True, "question": self.memory_manager.get_plan_question(question_id)}
+
+    def _build_questions_context(self) -> str:
+        """What a planning prompt is allowed to see of the question board.
+
+        During resolving_questions it is exactly ONE question - the pinned one - so the
+        model cannot re-open the whole plan in a turn. From awaiting_plan onward it is the
+        settled decisions, so the plan is written against decisions instead of vibes, with
+        assumptions labelled as assumptions."""
+        stage = self.memory_manager.get_plan_stage()
+        if stage == "awaiting_questions":
+            return ""
+
+        if stage == "resolving_questions":
+            q = self.memory_manager.next_open_question()
+            if not q:
+                return ""
+            lines = [
+                "\n\n### THE ONE QUESTION ON THE TABLE",
+                "Q" + str(q.get("number")) + ": " + q["text_internal"],
+            ]
+            for opt in q.get("options") or []:
+                lines.append("- " + opt["label"] + ": " + opt["means"])
+            if q.get("recommended"):
+                lines.append("Leaning towards: " + q["recommended"])
+            lines.append("Answer THIS question and nothing else. Do not re-open the plan.")
+            return "\n".join(lines)
+
+        resolved = self.memory_manager.questions_by_status("resolved")
+        parked = self.memory_manager.questions_by_status("parked")
+        if not resolved and not parked:
+            return ""
+        lines = ["\n\n### DECISIONS ALREADY MADE - build on these, do not re-litigate them"]
+        for q in resolved:
+            tag = {"admin": "decided by the Admin", "vote": "decided by vote"}.get(q.get("decided_by"), "assumed")
+            lines.append("- " + q["text_internal"] + " -> " + q["answer"] + " (" + tag + ")")
+        for q in parked:
+            fallback = q.get("recommended") or "unresolved"
+            lines.append("- " + q["text_internal"] + " -> assumed: " + fallback + " (still with the Admin)")
+        return "\n".join(lines)
+
+    def _reject_becomes_question(self, seat: str, name: str, prose: str) -> bool:
+        """A REJECT is a new question, not a rewrite.
+
+        This single change is what breaks the revision loop. Previously the objection
+        survived only as one truncated chat message and fell out of the 3-message discussion
+        window within two turns, so revision 2 did not reliably address revision 1's
+        complaint and the room rewrote the same plan indefinitely. As a question it is
+        STATE: it stays on the board until answered, and the answer goes into the next plan
+        prompt.
+
+        Returns False when the board is full, in which case the caller falls back to the old
+        full-rewrite behaviour rather than dropping the objection on the floor."""
+        if len(self.memory_manager.get_plan_questions()) >= self.MAX_PLAN_QUESTIONS:
+            return False
+        objection = (prose or "").strip()[:400] or (seat + " rejected the plan without saying why.")
+        q = self.memory_manager.add_plan_question(
+            text_internal=seat + "'s objection to the plan: " + objection,
+            resolvable_by="model",
+            asked_by=name,
+        )
+        self._advance_plan_stage(
+            "resolving_questions",
+            name + " (" + seat + ") rejected the plan. That objection is now question Q"
+            + str(q["number"]) + " \u2014 it gets settled once, instead of the plan being "
+            "rewritten from scratch.",
+        )
+        self._settle_questions("Every open question is settled.")
+        return True
+
     def _advance_plan_gate(self, model_id: str, model_cfg: Dict[str, Any], response_text: str) -> None:
         """Walk the pre-execution gate on the back of the turn that just happened.
 
         Called only in discussion phase, and only for the model whose stage it is - a model
         speaking out of turn (an @mention, or the 15-message fairness rule) must not be able
-        to advance or reset the gate."""
+        to advance or reset the gate. Ballots are the exception and are counted first,
+        because a vote needs voices other than the stage owner's."""
         stage = self.memory_manager.get_plan_stage()
         active_models = self.get_active_model_ids()
+        self._record_question_ballots(model_id, model_cfg, response_text)
         if self._plan_stage_owner(stage, active_models) != model_id:
             return
 
         name = model_cfg.get("name", model_id)
         prose = self._strip_directive_tags(response_text)
         prose = re.sub(r"```[\s\S]*?```", "", prose).strip()
+
+        if stage == "awaiting_questions":
+            kept = self._harvest_questions(model_id, model_cfg, response_text)
+            if kept:
+                self._advance_plan_stage(
+                    "resolving_questions",
+                    name + " put " + str(kept) + " question(s) on the board. One gets settled per turn.",
+                )
+                self._settle_questions("Every open question is settled.")
+                return
+            # No questions is a legitimate answer for a small, obvious job - but only from a
+            # turn that actually said something. A garbled or echoed turn holds the stage.
+            if (
+                len(prose) >= self.MIN_PLAN_CHARS
+                and not self._looks_like_garbage(prose)
+                and not self._is_prompt_echo(prose)
+            ):
+                self._advance_plan_stage(
+                    "awaiting_plan",
+                    name + " raised nothing that needs deciding first. Straight to the plan.",
+                )
+            else:
+                logger.info(
+                    "Architect %s produced no usable question list; holding at awaiting_questions",
+                    model_id
+                )
+            return
+
+        if stage == "resolving_questions":
+            q = self.memory_manager.next_open_question()
+            if not q:
+                self._settle_questions("Every open question is settled.")
+                return
+            answer = self._directive_payload(response_text, "[ANSWER:") or prose
+            answer = (answer or "").strip()
+            if len(answer) < 3 or self._looks_like_garbage(answer) or self._is_prompt_echo(answer):
+                # Nothing usable came back. Take the recommendation rather than pinning the
+                # same question again next turn: a stage that cannot fail forward is a
+                # deadlock, and `decided_by: default` says plainly that this was a guess.
+                fallback = q.get("recommended") or "no decision recorded; the Architect's judgement stands"
+                self._resolve_question(q, fallback, "default")
+            else:
+                self._resolve_question(q, answer, "default")
+            self._settle_questions("Every open question is settled.")
+            return
 
         if stage == "awaiting_plan":
             if (
@@ -1022,10 +1529,13 @@ class Orchestrator:
             verdict = self._resolve_verdict(response_text)
             seat = "Critic" if stage == "critic_review" else "Programmer"
             if verdict == "reject":
-                self._advance_plan_stage(
-                    "awaiting_plan",
-                    f"{name} ({seat}) rejected the plan: {prose[:160]}"
-                )
+                # The objection becomes a question so that it ACCUMULATES. Only when the
+                # board is full does this fall back to the old full-rewrite behaviour.
+                if not self._reject_becomes_question(seat, name, prose):
+                    self._advance_plan_stage(
+                        "awaiting_plan",
+                        f"{name} ({seat}) rejected the plan: {prose[:160]}"
+                    )
             elif verdict == "approve":
                 self._advance_plan_stage(
                     self._next_plan_stage(stage),
@@ -1119,15 +1629,27 @@ class Orchestrator:
         # planning, which surfaced as an apparently "empty" or dead Architect across every
         # model tried, including an 8B. Keep the format spec in the middle and finish on a
         # concrete instruction so there is no dangling pattern to continue.
+        #
+        # The format spec is a SCHEMA, never a worked example. It used to read
+        # "[UPDATE_TASK: title=Add CSV export, description=Create exporter.py with a
+        # write_rows(path, rows) function that writes a UTF-8 CSV with a header row, ...]",
+        # and a 4B Architect with no standing brief and nothing completing on its board
+        # copied it out verbatim: the room built `exporter.py` with a `write_rows(path, rows)`
+        # function writing a UTF-8 CSV with a header row, twice, for a project that had
+        # nothing to do with CSV. Every field matched the example. A complete, plausible,
+        # BUILDABLE example is the nearest well-formed thing in the context, so an
+        # under-constrained model reaches for it and then writes a justification paragraph
+        # to fit. Placeholders in angle brackets cannot be built, so they cannot be copied.
         "architect": (
             "\n\nOUTPUT CONTRACT (Architect, execution phase):\n"
             "1. Write one short paragraph naming the single next piece of work, then on its own "
             "final line emit the task directive.\n"
-            "2. The directive line looks exactly like this worked example:\n"
-            "   [UPDATE_TASK: title=Add CSV export, description=Create exporter.py with a "
-            "write_rows(path, rows) function that writes a UTF-8 CSV with a header row, "
-            "priority=high, status=in_progress]\n"
-            "   Use the same four keys with your own values.\n"
+            "2. The directive line uses exactly these four keys, in this order:\n"
+            "   [UPDATE_TASK: title=<short name for the work>, description=<the file to create "
+            "or change and what it must contain>, priority=<high|medium|low>, status=in_progress]\n"
+            "   The angle-bracket parts are placeholders. Replace every one of them with your own "
+            "values for THIS project. Do not emit the placeholders literally, and do not treat "
+            "them as a suggestion of what to build.\n"
             "3. The description must be implementable by a Coder who has never seen this "
             "conversation - name the file and what it must contain.\n"
             "4. If a task keeps failing, read its failure reason and describe a DIFFERENT approach, "
@@ -1148,12 +1670,49 @@ class Orchestrator:
             "and which teammate role does each step.\n"
             "2. Keep it concrete enough that a Coder who never saw this conversation could "
             "start. Name files. Name functions.\n"
-            "3. If the Critic or Programmer rejected the last revision, address their objection "
-            "explicitly and say what you changed — do not re-post the same plan.\n"
-            "4. You supervise; you do not implement. Fenced code from you is discarded in this "
+            "3. The decisions listed above are settled. Build the plan on them, state any "
+            "marked 'assumed' out loud as assumptions, and do not re-open them.\n"
+            "4. If the Critic or Programmer rejected the last revision, that objection is "
+            "already a settled decision above — apply it and say what you changed. Do not "
+            "re-post the same plan.\n"
+            "5. You supervise; you do not implement. Fenced code from you is discarded in this "
             "phase, and file-writing tools are locked for everyone until execution begins.\n"
-            "5. Do NOT declare readiness yet. The plan goes to review first; you will be asked "
+            "6. Do NOT declare readiness yet. The plan goes to review first; you will be asked "
             "again once it clears."
+        ),
+        # The two question-stage contracts. Note what they do NOT do: they never say "at
+        # most five questions". The cap is applied in code after the fact, because a small
+        # model told both to obey a count and to be substantive will obey the count. Ask for
+        # the real thing; take the first five.
+        "architect_questions": (
+            "\n\nOUTPUT CONTRACT (Architect, open questions — you are NOT writing the plan yet):\n"
+            "1. List only what is genuinely undecided and would change what gets built. Skip "
+            "anything you can reasonably decide yourself, and skip housekeeping (versions, "
+            "folder names, formatting).\n"
+            "2. Write each one on its own line as: [QUESTION: ask=<the question>, "
+            "options=<first choice>: <what it means in practice> | <second choice>: <what it "
+            "means in practice>, recommended=<your pick>, why=<one line>, for=<admin|team>]\n"
+            "   The angle-bracket parts are placeholders. Replace every one of them, and do "
+            "not treat them as a suggestion of what to ask.\n"
+            "3. Use for=admin ONLY when the answer is a matter of what the human wants, and "
+            "then write the question and every option in plain English, by what the person "
+            "USING the software would see or do. Never name a tool, a file format or a code "
+            "structure in an option. The person answering is not a programmer: an option "
+            "they cannot picture is a broken question.\n"
+            "4. Use for=team for anything technical — the room settles those itself.\n"
+            "5. If nothing is genuinely undecided, say so in one sentence and ask nothing.\n"
+            "6. Emit no code and no plan this turn."
+        ),
+        "architect_resolving": (
+            "\n\nOUTPUT CONTRACT (Architect, settling ONE question):\n"
+            "1. Exactly one question is on the table above. Answer that one and nothing else. "
+            "Do not revisit the others and do not start the plan.\n"
+            "2. Give the decision in one or two sentences: what the answer is, and what it "
+            "means for what gets built.\n"
+            "3. Put the decision itself on a final line as [ANSWER: <the decision>].\n"
+            "4. If the choice is genuinely arbitrary, pick one and say it was arbitrary. An "
+            "arbitrary decision recorded beats an open question.\n"
+            "5. Emit no code."
         ),
         "architect_approved": (
             "\n\nOUTPUT CONTRACT (Architect, plan approved — you are opening EXECUTION):\n"
@@ -1172,8 +1731,12 @@ class Orchestrator:
             "cannot be fixed.\n"
             "3. End your reply with exactly one verdict word on its own line: APPROVE or REJECT.\n"
             "4. REJECT only with a specific, fixable reason. If you find nothing blocking, "
-            "APPROVE — you are not required to find a problem.\n"
-            "5. Do not rewrite the plan yourself and emit no code."
+            "APPROVE — you are not required to find a problem. A REJECT no longer sends the "
+            "plan back to the drawing board: your objection becomes one question the room "
+            "settles, so raise one answerable objection rather than a list.\n"
+            "5. Do not rewrite the plan yourself and emit no code.\n"
+            "6. If a choice above is still with the Admin, you may cast one ballot with "
+            "[VOTE: q=<number>, choice=<option label>] so the room is not left waiting."
         ),
         "programmer_discussion": (
             "\n\nOUTPUT CONTRACT (Programmer, buildability check):\n"
@@ -1183,7 +1746,11 @@ class Orchestrator:
             "2. Name what you would need that the plan does not give you.\n"
             "3. End your reply with exactly one verdict word on its own line: APPROVE or REJECT.\n"
             "4. Do not start implementing. File-writing tools are locked until the Architect "
-            "opens Execution, and code in this turn is wasted."
+            "opens Execution, and code in this turn is wasted.\n"
+            "5. A REJECT becomes one question the room settles, not a rewrite — so raise one "
+            "answerable objection, not a list.\n"
+            "6. If a choice above is still with the Admin, you may cast one ballot with "
+            "[VOTE: q=<number>, choice=<option label>]."
         ),
     }
 
@@ -1238,6 +1805,8 @@ class Orchestrator:
     }
 
     _PLAN_STAGE_SEATS = {
+        "awaiting_questions": SEAT_ARCHITECT,
+        "resolving_questions": SEAT_ARCHITECT,
         "awaiting_plan": SEAT_ARCHITECT,
         "critic_review": SEAT_CRITIC,
         "programmer_review": SEAT_CODER,
@@ -1294,7 +1863,39 @@ class Orchestrator:
             wanted = self.SEAT_ARCHITECT
         if self._model_claims_seat(model_cfg, wanted):
             return wanted
+
+        # The seat the pipeline asked for is EMPTY in this room. `_outstanding_work` already
+        # falls back in exactly this case (no Coder-role model -> the Architect covers
+        # Coder-stage work; no Tester -> Critic/Coder/Architect covers it) and hands this
+        # model the task. Without the matching grant here the fallback was only half wired:
+        # the Architect was handed an in_progress task, then `_default_seat_from_role` gave
+        # it the *Architect* contract, so it answered a "write the code" task with yet
+        # another [UPDATE_TASK: ...] - forever. That is the hackrawler failure: five
+        # consecutive Architect turns re-creating the same "define core game loop" task and
+        # not one line of code. A vacant seat is granted to whoever the pipeline routed the
+        # work to; when someone else in the room does claim the seat, nothing changes.
+        if wanted and not self._seat_claimed_by_anyone(wanted):
+            logger.info(
+                "Seat '%s' is unfilled in this roster; granting it to %s for this turn "
+                "(role=%s) so the task can actually advance.",
+                wanted, model_cfg.get("name"), model_cfg.get("role"),
+            )
+            return wanted
         return self._default_seat_from_role(model_cfg)
+
+    def _seat_claimed_by_anyone(
+        self, seat: str, active_models: Optional[List[str]] = None
+    ) -> bool:
+        """True when some active model's role genuinely claims `seat`.
+
+        False means the seat is vacant, which is the condition `_outstanding_work` already
+        uses to route that stage's work to a stand-in."""
+        active_models = self.get_active_model_ids() if active_models is None else active_models
+        return any(
+            self._model_claims_seat(self.models[m_id], seat)
+            for m_id in active_models
+            if m_id in self.models
+        )
 
     def _role_output_contract(
         self,
@@ -1319,7 +1920,11 @@ class Orchestrator:
             # plans went to execution without the Critic ever having read them.
             if seat == self.SEAT_ARCHITECT:
                 stage = self.memory_manager.get_plan_stage()
-                key = "architect_approved" if stage == "approved" else "architect_discussion"
+                key = {
+                    "awaiting_questions": "architect_questions",
+                    "resolving_questions": "architect_resolving",
+                    "approved": "architect_approved",
+                }.get(stage, "architect_discussion")
                 return self.ROLE_OUTPUT_CONTRACTS[key]
             if seat == self.SEAT_CRITIC:
                 return self.ROLE_OUTPUT_CONTRACTS["critic_discussion"]
@@ -1620,29 +2225,77 @@ class Orchestrator:
             self._static_review_context(active_task) if seat == self.SEAT_CRITIC else ""
         )
 
+        # The question board. During resolving_questions this is exactly ONE question, so a
+        # model physically cannot re-litigate the whole plan in a turn; from awaiting_plan
+        # onward it is the settled decisions, so the plan is written against decisions
+        # rather than vibes. Discussion-phase only - in execution the plan is already made.
+        questions_context = (
+            self._build_questions_context() if current_phase != "execution" else ""
+        )
+
         # Prefix Cache Optimization: Put stable content FIRST (system prompt, task details, personal spec)
         # and volatile context LAST (shared memory summary, episodes, journal)
-        context_prompt = f"{sys_prompt}{task_context}{spec_context}{static_context}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{journal_context}"
+        context_prompt = f"{sys_prompt}{task_context}{spec_context}{static_context}{questions_context}\n\n### SHARED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{journal_context}"
 
-        # Check model token usage against limits - enforce context reset if exceeded to prevent degradation
-        tokens_used = self.memory_manager.state.get("tokens_used", {}).get(model_id, 0)
+        # Trim the prompt only when the PROMPT is actually big.
+        #
+        # This used to read `tokens_used > max_tokens * 0.75`, where `tokens_used` is a running
+        # total of the WORDS THIS MODEL HAS SPOKEN (see the update_token_usage call at the end
+        # of a turn) and `max_tokens` is the size of its context WINDOW. Those are unrelated
+        # quantities. The prompt is rebuilt from scratch every turn and every component of it
+        # is already capped - history to 3 messages at 300 chars, the memory digest to 10
+        # entries, episodes to 3, file contents to 3000 chars - so measured prompts sit flat
+        # around 10-14% of an 8k window no matter how long the room runs. Context pressure
+        # never actually changed; only how much the model had talked. The trim therefore fired
+        # on whichever model had been most productive, at a moment unrelated to anything.
+        #
+        # Measure the real thing: the prompt token count llama.cpp reported for this model's
+        # last generation. With the caps above this should essentially never fire. That is the
+        # point - it is a safety valve for a prompt that grew unexpectedly (a huge task
+        # description, a pathological file), not a routine maintenance event.
+        try:
+            last_prompt_tokens = int(self.model_manager.last_prompt_tokens.get(model_id, 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            # A stubbed, mocked or non-GGUF ModelManager has no real measurement to give.
+            # No number means no evidence of pressure, so do not trim: a missing metric must
+            # never be the reason a model gets a degraded prompt.
+            last_prompt_tokens = 0
         max_tokens = model_cfg.get("max_context_tokens", 4096)
+        trim_threshold = int(max_tokens * 0.75)
         context_was_reset = False
-        if tokens_used > (max_tokens * 0.75):
-            # Record automatic LLM-driven/rule self-journal and reset token counter for model
-            auto_journal = f"Context refresh checkpoint for {model_cfg['name']} ({model_cfg['role']}): Active project '{self.memory_manager.get_project_id()}'. Current task: '{active_task['title'] if active_task else 'General Discussion'}'. Key contributions logged to shared memory."
-            self.memory_manager.record_model_nap(model_id, auto_journal)
-            self.memory_manager.state["tokens_used"][model_id] = 0
-            self.memory_manager.save_memory()
+        if last_prompt_tokens > trim_threshold:
+            logger.warning(
+                "Trimming context for %s: last prompt was %d tokens, over the %d threshold for "
+                "a %d-token window",
+                model_id, last_prompt_tokens, trim_threshold, max_tokens
+            )
+            self.memory_manager.record_model_nap(
+                model_id,
+                f"Context trimmed for {model_cfg['name']} ({model_cfg['role']}): last prompt "
+                f"was {last_prompt_tokens} tokens against a {max_tokens}-token window. "
+                f"Project-wide history dropped for this turn; task context kept."
+            )
             context_was_reset = True
 
-            # Construct ~50-token high-level project summary
-            proj_summary_50_tokens = (
-                f"PROJECT INDEX ({self.memory_manager.get_project_id()}): "
-                f"Phase: {current_phase.upper()}. Task: {active_task['title'] if active_task else 'General Alignment'}. "
-                f"Goal: Execute requirements with full audit trail, indexed memory logging, and zero context bloat."
+            # What survives a trim is the SPECIFIC context, never the diffuse context.
+            #
+            # The old version did precisely the opposite: it dropped the task details, the
+            # model's own spec notebook and the Critic's ruff findings, and KEPT the
+            # project-wide memory digest and episode checkpoints - the two most general and
+            # least actionable blocks in the prompt. For a <=5B model that is the worst
+            # possible trade. Small models do their best work with a narrow scope, an explicit
+            # goal and specific context; a project-wide digest is the first thing they should
+            # lose, not the last. So: keep the task, keep the lint evidence, drop the history.
+            context_prompt = (
+                # The question board survives a trim: it IS the specific context. Dropping
+                # the settled decisions is how a room forgets what it just decided and asks
+                # the same question again.
+                f"{sys_prompt}{task_context}{static_context}{questions_context}"
+                f"\n\n### CONTEXT TRIMMED\n"
+                f"Your last prompt exceeded {trim_threshold} tokens, so project-wide memory and "
+                f"episode history have been dropped for this turn. Everything you need is above. "
+                f"Work from the task, not from recollection."
             )
-            context_prompt = f"{sys_prompt}\n\n### 📌 HIGH-LEVEL PROJECT INDEX (~50 TOKENS):\n{proj_summary_50_tokens}\n\n### SHARED INDEXED MEMORY SUMMARY:\n{memory_summary}{ep_summary}{task_context}\n\n### 🔄 REFRESHED CONTEXT SAVE FILE:\n{auto_journal}\nPlease continue your concise contribution."
 
         if context_was_reset or current_phase == "execution":
             # Clean context refresh mode: minimal message context to prevent token overload.
@@ -1751,7 +2404,10 @@ class Orchestrator:
                         "content": "[A critique was received but cited no verifiable evidence - no traceback, test output, or line reference. Disregard it and continue with your prior plan unless a follow-up critique cites concrete evidence.]"
                     })
                     continue
-                clean_c = sanitize_message_content(m["content"])
+                # `model_visible`, not `content` - see add_chat_message. This is the one-way
+                # boundary: chat narration is written for the Admin and must never become
+                # model input. Falls back to `content` for messages recorded before the split.
+                clean_c = sanitize_message_content(m.get("model_visible") or m.get("content", ""))
                 if len(clean_c) > 300:
                     clean_c = clean_c[:300] + "... [truncated]"
                 role = "user" if m["is_admin"] else "assistant"
@@ -1919,6 +2575,9 @@ class Orchestrator:
                     model_id=model_id
                 )
 
+        # Cumulative words this model has SPOKEN. A usage statistic for the UI only - it is
+        # not a context measurement and nothing may gate on it. Context pressure is measured
+        # from `model_manager.last_prompt_tokens`, which is what llama.cpp actually reported.
         self.memory_manager.update_token_usage(model_id, len(response_text.split()))
 
         # Process structured JSON actions first
@@ -2226,13 +2885,17 @@ class Orchestrator:
 
         self._log_raw_turn(model_cfg, current_phase, response_text)
         display_content = self._build_chat_display_text(response_text, model_cfg, code_file_updates)
+        narrated = self._narrate_turn(seat, code_file_updates, response_text, display_content)
 
         msg = self.add_chat_message(
             sender=model_cfg["name"],
             role=model_cfg["role"],
-            content=display_content,
+            content=narrated,
             is_admin=False,
-            model_id=model_id
+            model_id=model_id,
+            # The un-narrated reflection is what teammates may read. Byte-identical to what
+            # every model saw before narration existed.
+            model_visible=display_content
         )
 
         self.last_speaker_id = model_id
@@ -2492,7 +3155,7 @@ class Orchestrator:
     # Internal action-tag names that must never leak into what the user/admin reads as chat.
     _DIRECTIVE_TAG_RE = re.compile(
         r"\[(READY_FOR_EXECUTION|REQUEST_DISCUSSION|REQUEST_NAP|LOG_TO_MEMORY|JOURNAL|"
-        r"UPDATE_CONFIG|UPDATE_SPEC|UPDATE_TASK|SEARCH_HF|SAVE_NOTE)(:[^\]]*)?\]",
+        r"UPDATE_CONFIG|UPDATE_SPEC|UPDATE_TASK|SEARCH_HF|SAVE_NOTE|QUESTION|ANSWER|VOTE)(:[^\]]*)?\]",
         re.IGNORECASE
     )
     # Leftover JSON-fragment / punctuation-only garbage a small model sometimes emits
@@ -2538,6 +3201,101 @@ class Orchestrator:
         head = text.strip()[:160].upper()
         return any(marker in head for marker in cls._PROMPT_ECHO_MARKERS)
 
+    @staticmethod
+    def _file_change_summary(code_file_updates: List[Dict[str, Any]]) -> str:
+        """Renders a plain file-change line from the diff - never from a model.
+
+        Example: Created `a.py` (+12). Updated `b.py` (+4/-1).
+        """
+        bits = []
+        for u in code_file_updates:
+            verb = "Created" if u["is_new"] else "Updated"
+            stat = f"+{u['added']}/-{u['removed']}" if not u["is_new"] else f"+{u['added']}"
+            bits.append(f"{verb} `{u['filename']}` ({stat})")
+        return " ".join(bits) + "." if bits else ""
+
+    # Narration vocabulary, one entry per seat. Deliberately a table and not a model: every
+    # line below is derived from a fact the pipeline already recorded (a diff, a directive, a
+    # verdict), so it cannot describe something that did not happen. A small model asked to
+    # paraphrase these would eventually announce that tests passed when they failed - and
+    # since this line is the Admin's only window unless they expand the block, a narrator that
+    # is occasionally wrong is worse than a terse one that is always right.
+    _SEAT_VERBS = {
+        "coder": "🔧 shipped",
+        "critic": "🔍 reviewed",
+        "architect": "🗂️ planned",
+        "tester": "🧪 tested",
+    }
+
+    @classmethod
+    def _status_headline(
+        cls,
+        seat: Optional[str],
+        code_file_updates: List[Dict[str, Any]],
+        raw_response: str
+    ) -> str:
+        """One scannable standup line for a turn, or "" when the turn produced no fact worth one."""
+        if seat == cls.SEAT_CRITIC:
+            # The verdict is the Critic's whole output as far as the pipeline is concerned.
+            tail = (raw_response or "").strip().upper()
+            target = code_file_updates[0]["filename"] if code_file_updates else None
+            named = f" `{target}`" if target else ""
+            if re.search(r"\bREJECT\b", tail):
+                return f"🔍 sent{named or ' the work'} back for changes."
+            if re.search(r"\bAPPROVE\b", tail):
+                return f"🔍 approved{named or ' the work'}."
+            return ""
+
+        if code_file_updates:
+            verb = cls._SEAT_VERBS.get(seat or "", "📄 updated")
+            names = ", ".join(f"`{u['filename']}`" for u in code_file_updates)
+            stats = ", ".join(
+                (f"+{u['added']}" if u["is_new"] else f"+{u['added']}/-{u['removed']}")
+                for u in code_file_updates
+            )
+            return f"{verb} {names} ({stats})."
+
+        # Deliberately no Architect headline. Its deliverable IS prose, so a headline either
+        # duplicates what the paragraph already says or - when built from
+        # _describe_directives - restates a sentence the garbage path already uses as the
+        # message body. A first pass lowercased that sentence's opening word to make it read
+        # as a clause and turned "Architect (Nemotron3-Nano-4B) took no chat action..." into
+        # "architect (nemotron3-nano-4b) took...". Headlines are for turns that produced an
+        # ARTIFACT: a file, or a verdict.
+        return ""
+
+    def _narrate_turn(
+        self,
+        seat: Optional[str],
+        code_file_updates: List[Dict[str, Any]],
+        raw_response: str,
+        display_text: str
+    ) -> str:
+        """Adds the Admin-facing standup headline on top of a turn's display text.
+
+        Presentation only. The result goes in a chat message's `content`; `model_visible`
+        keeps the un-narrated `display_text`, so nothing here can reach a model on a later
+        turn. Every headline is assembled from structured facts - the diff, the directive,
+        the verdict - so it costs no tokens and cannot invent an outcome.
+        """
+        headline = self._status_headline(seat, code_file_updates, raw_response)
+        if not headline:
+            return display_text
+
+        fences = re.findall(r"```[\s\S]*?```", display_text)
+        prose = re.sub(r"```[\s\S]*?```", "", display_text).strip()
+
+        # Drop the fallback summary when the headline already states the same diff - otherwise
+        # a turn with unusable prose reads the file change out twice.
+        if prose and prose == self._file_change_summary(code_file_updates):
+            prose = ""
+
+        parts = [headline]
+        if prose:
+            parts.append(prose)
+        parts.extend(fences)
+        return "\n\n".join(parts).strip()
+
     def _build_chat_display_text(
         self,
         raw_response: str,
@@ -2558,12 +3316,7 @@ class Orchestrator:
 
         if self._looks_like_garbage(prose_only) or self._is_prompt_echo(prose_only):
             if code_file_updates:
-                bits = []
-                for u in code_file_updates:
-                    verb = "Created" if u["is_new"] else "Updated"
-                    stat = f"+{u['added']}/-{u['removed']}" if not u["is_new"] else f"+{u['added']}"
-                    bits.append(f"{verb} `{u['filename']}` ({stat})")
-                prose_only = " ".join(bits) + "."
+                prose_only = self._file_change_summary(code_file_updates)
             else:
                 # A turn whose entire content was action tags (very common for the Architect,
                 # whose job is to emit [UPDATE_TASK: ...]) strips down to an empty string and
@@ -2645,6 +3398,9 @@ class Orchestrator:
         "SAVE_NOTE": "saved an indexed note",
         "JOURNAL": "wrote a journal checkpoint",
         "SEARCH_HF": "searched Hugging Face",
+        "QUESTION": "put an open question on the board",
+        "ANSWER": "settled the pinned question",
+        "VOTE": "cast a ballot on a parked question",
         "READY_FOR_EXECUTION": "declared the team ready for execution",
         "REQUEST_DISCUSSION": "asked to return to discussion",
         "REQUEST_NAP": "took a context nap",
@@ -2671,12 +3427,18 @@ class Orchestrator:
 
     @staticmethod
     def _directive_payload(response_text: str, opening_token: str) -> Optional[str]:
-        """Extracts an inline directive's payload, or None when the directive is unterminated."""
-        start = response_text.find(opening_token) + len(opening_token)
-        end = response_text.find("]", start)
-        if end == -1:
-            return None
-        return response_text[start:end].strip()
+        """Extracts an inline directive's payload, or None when the directive is unterminated.
+
+        Delegates to backend.directives so every directive in the app is cut on the same
+        bracket-MATCHED boundary - a payload that itself contains `[` / `]` is no longer
+        truncated at the first closing bracket it happens to contain."""
+        return find_payload(response_text, opening_token)
+
+    @staticmethod
+    def _directive_payloads(response_text: str, opening_token: str) -> List[Optional[str]]:
+        """Every payload for a directive that may legitimately appear more than once in one
+        turn (the question list, ballots). `None` entries are unterminated directives."""
+        return find_payloads(response_text, opening_token)
 
     def _report_directive_failure(self, directive: str, model_cfg: Dict[str, Any], reason: str):
         """Announces a dropped directive so an unapplied instruction is never invisible."""
@@ -2741,30 +3503,22 @@ class Orchestrator:
 
     def _apply_task_directive(self, model_id: str, model_cfg: Dict[str, Any], payload: str):
         """Applies an [UPDATE_TASK: key=value, ...] directive, updating an existing task or creating one."""
-        # Split on ", key=" boundaries rather than on every comma. Naive comma-splitting
-        # made the directive unusable for its single most important field: any description
-        # written as real English ("...a flag to include whitespace, handling empty strings")
-        # contains commas, so the whole directive was rejected and the Architect's plan
-        # thrown away - the model was doing its job and the parser was discarding it.
+        # Fields split on separators that introduce a RECOGNISED key at bracket depth zero,
+        # never on every comma. Naive comma-splitting made the directive unusable for its
+        # single most important field: a description written as real English ("...a flag to
+        # include whitespace, handling empty strings") contains commas, and a signature like
+        # `char_count(text, strip)` contains one too - so the directive was either rejected
+        # outright or cut mid-signature into the task `Implement char_count(text`. The model
+        # was doing its job and the parser was discarding it. See backend/directives.py.
         known_keys = ("id", "title", "description", "priority", "status", "assigned_model")
-        key_pattern = r"(?:^|,)\s*(" + "|".join(known_keys) + r")\s*="
-        matches = list(re.finditer(key_pattern, payload, flags=re.IGNORECASE))
-
-        kwargs: Dict[str, str] = {}
-        if matches:
-            for idx, m in enumerate(matches):
-                key = m.group(1).strip().lower()
-                start = m.end()
-                end = matches[idx + 1].start() if idx + 1 < len(matches) else len(payload)
-                kwargs[key] = payload[start:end].strip().strip(",").strip()
-        else:
-            # No recognised key at all - fall back to the original strict parse so a
-            # genuinely malformed directive still reports a clear error.
-            for part in [p.strip() for p in payload.split(",") if p.strip()]:
-                if "=" not in part:
-                    raise DirectiveParseError(f"segment '{part}' is not a key=value pair")
-                k, v = (t.strip() for t in part.split("=", 1))
-                kwargs[k] = v
+        kwargs = parse_fields(payload, known_keys)
+        if not kwargs:
+            # No recognised key at all - fall back to a strict parse so a genuinely
+            # malformed directive still reports a clear, specific error.
+            try:
+                kwargs = parse_strict_pairs(payload)
+            except ValueError as e:
+                raise DirectiveParseError(str(e)) from e
 
         if not kwargs:
             raise DirectiveParseError("no task fields were provided")
@@ -2772,6 +3526,10 @@ class Orchestrator:
         task_id = kwargs.get("id")
         if task_id and any(t["id"] == task_id for t in self.memory_manager.get_task_itinerary()):
             updates = {k: v for k, v in kwargs.items() if k != "id"}
+            if updates.get("title"):
+                updates["title"], overflow = split_title(updates["title"], updates.get("description", ""))
+                if overflow:
+                    updates["description"] = overflow
             self.memory_manager.update_itinerary_task(task_id, updates)
             self.memory_manager.add_entry(
                 model_cfg["name"],
@@ -2782,11 +3540,17 @@ class Orchestrator:
         if task_id:
             raise DirectiveParseError(f"itinerary task '{task_id}' does not exist")
 
-        title = kwargs.get("title", kwargs.get("description", "New Task"))
+        # A title that ran on into a whole description block is trimmed back to its first
+        # sentence and the remainder pushed into the description, instead of being kept as a
+        # 900-character "title" that every list in the UI renders unreadably.
+        title, description = split_title(
+            kwargs.get("title", kwargs.get("description", "New Task")),
+            kwargs.get("description", ""),
+        )
         status = kwargs.get("status", "pending")
         created = self.memory_manager.add_itinerary_task(
             title=title,
-            description=kwargs.get("description", title),
+            description=description or title,
             priority=kwargs.get("priority", "medium"),
             assigned_model=kwargs.get("assigned_model", model_id)
         )
@@ -2897,6 +3661,15 @@ class Orchestrator:
         Ensures active speaker, upcoming roster models, and Moderator are prioritized in VRAM based on who is expected to be needed next.
         Offloads remaining models to RAM if VRAM headroom is tight.
         """
+        # Safety net for anything resident that the room no longer knows about: a model
+        # kicked by an older build, a roster rebuild, a project switch. Reconciling here
+        # costs nothing when the sets already match and is the difference between a slow
+        # leak and a steady state.
+        try:
+            self.model_manager.unload_orphaned_gguf_models(keep_ids=list(self.models.keys()))
+        except Exception as e:
+            logger.warning("Orphaned-model reconcile skipped: %s", e)
+
         hw = self.model_manager.get_hardware_info()
         has_gpu = bool(hw.get("gpu_name") or hw.get("vram_total_gb", 0) > 0)
         if not has_gpu:
